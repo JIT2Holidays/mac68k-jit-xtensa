@@ -7,7 +7,7 @@
  * bit ops, MULU/MULS/DIVU/DIVS, MOVEM, LEA/PEA, EXT/SWAP/LINK/UNLK,
  * NEG/NEGX/NOT/CLR/TST/TAS, TRAP/exceptions and autovector interrupts.
  *
- * Not modelled: BCD (ABCD/SBCD/NBCD), MOVEP, the 68010+ additions. Those
+ * Not modelled: the 68010+ additions. Those
  * decode to an illegal-instruction exception.
  *
  * Cycle counts are approximate (good enough to pace the ~60 Hz VBL); the
@@ -246,6 +246,67 @@ static void set_flags_cmp(m68k_cpu *cpu, int sz, u32 s, u32 d, u32 r) {
     if (s > d) c |= CCR_C;
     if (((s ^ d) & (d ^ r)) & msb) c |= CCR_V;
     m68k_set_ccr(cpu, c);
+}
+
+/* ---- BCD instructions (ABCD / SBCD / NBCD) ----------------------------
+ * Packed binary-coded-decimal byte arithmetic. Ported from mini vMac's
+ * MINEM68K.c so that the officially-undefined N and V flags match a real
+ * 68000 — the Mac ROM's date/time routines (reached from the Control
+ * Panel) depend on the exact behaviour. Z is only ever cleared, never
+ * set, so multi-byte BCD chains work. */
+static u8 bcd_abcd(m68k_cpu *cpu, u8 src, u8 dst) {
+    u8 ccr = m68k_get_ccr(cpu);
+    int x = (ccr & CCR_X) ? 1 : 0;
+    int flgs = (src & 0x80) != 0, flgo = (dst & 0x80) != 0;
+    u16 lo = (u16)((src & 0x0F) + (dst & 0x0F) + x);
+    u16 hi = (u16)((src & 0xF0) + (dst & 0xF0));
+    if (lo > 9) lo = (u16)(lo + 6);
+    u16 v = (u16)(hi + lo);
+    int carry = (v & 0x1F0) > 0x90;
+    if (carry) v = (u16)(v + 0x60);
+    u8 res = (u8)v, c = (u8)(ccr & CCR_Z);
+    if (carry)    c |= CCR_C | CCR_X;
+    if (res != 0) c &= (u8)~CCR_Z;
+    int N = (res & 0x80) != 0;
+    if (N) c |= CCR_N;
+    if ((flgs != flgo) && (N != flgo)) c |= CCR_V;
+    m68k_set_ccr(cpu, c);
+    return res;
+}
+static u8 bcd_sbcd(m68k_cpu *cpu, u8 src, u8 dst) {
+    u8 ccr = m68k_get_ccr(cpu);
+    int x = (ccr & CCR_X) ? 1 : 0;
+    int flgs = (src & 0x80) != 0, flgo = (dst & 0x80) != 0;
+    u16 lo = (u16)((dst & 0x0F) - (src & 0x0F) - x);
+    u16 hi = (u16)((dst & 0xF0) - (src & 0xF0));
+    if (lo > 9) { lo = (u16)(lo - 6); hi = (u16)(hi - 0x10); }
+    u16 v = (u16)(hi + (lo & 0x0F));
+    int carry = (hi & 0x1F0) > 0x90;
+    if (carry) v = (u16)(v - 0x60);
+    u8 res = (u8)v, c = (u8)(ccr & CCR_Z);
+    if (carry)    c |= CCR_C | CCR_X;
+    if (res != 0) c &= (u8)~CCR_Z;
+    int N = (res & 0x80) != 0;
+    if (N) c |= CCR_N;
+    if ((flgs != flgo) && (N != flgo)) c |= CCR_V;
+    m68k_set_ccr(cpu, c);
+    return res;
+}
+static u8 bcd_nbcd(m68k_cpu *cpu, u8 dst) {
+    u8 ccr = m68k_get_ccr(cpu);
+    int x = (ccr & CCR_X) ? 1 : 0;
+    u16 lo = (u16)(0 - (dst & 0x0F) - x);
+    u16 hi = (u16)(0 - (dst & 0xF0));
+    if (lo > 9) { lo = (u16)(lo - 6); hi = (u16)(hi - 0x10); }
+    u16 v = (u16)(hi + (lo & 0x0F));
+    int carry = (hi & 0x1F0) > 0x90;
+    if (carry) v = (u16)(v - 0x60);
+    u8 res = (u8)v, c = (u8)(ccr & CCR_Z);
+    if (carry)      c |= CCR_C | CCR_X;
+    if (res != 0)   c &= (u8)~CCR_Z;
+    if (res & 0x80) c |= CCR_N;
+    m68k_set_ccr(cpu, c);
+    return res;
 }
 
 /* ---- condition codes -------------------------------------------------- */
@@ -685,9 +746,13 @@ void m68k_step(m68k_cpu *cpu) {
             }
             return;
         }
-        if ((op & 0xFF00) == 0x4800 && ((op >> 6) & 3) != 3 && (op & 0x0040) == 0 && ((op>>6)&3)==0) {
-            /* NBCD — not modelled. */
-            illegal(cpu, op); return;
+        if ((op & 0xFFC0) == 0x4800) {                       /* NBCD <ea> */
+            int mode = (op >> 3) & 7, reg = op & 7;
+            ea_t e = ea_decode(cpu, mode, reg, 1);
+            u8 d = (u8)ea_read(cpu, &e, 1);
+            ea_write(cpu, &e, 1, bcd_nbcd(cpu, d));
+            cpu->cycles += 6;
+            return;
         }
         /* JMP / JSR / PEA — selector in bits 11..6. */
         if ((op & 0xFFC0) == 0x4EC0) {                       /* JMP */
@@ -922,6 +987,22 @@ void m68k_step(m68k_cpu *cpu) {
             cpu->cycles += 140;
             return;
         }
+        /* SBCD: 1000 ddd 1 0000 m rrr */
+        if ((op & 0x01F0) == 0x0100) {
+            int sx = op & 7, dx = (op >> 9) & 7;
+            if ((op >> 3) & 1) {                /* -(Ay),-(Ax) */
+                ea_t se = ea_decode(cpu, 4, sx, 1);
+                u8 s = (u8)ea_read(cpu, &se, 1);
+                ea_t de = ea_decode(cpu, 4, dx, 1);
+                u8 d = (u8)ea_read(cpu, &de, 1);
+                ea_write(cpu, &de, 1, bcd_sbcd(cpu, s, d));
+            } else {                            /* Dy,Dx */
+                u8 r = bcd_sbcd(cpu, (u8)cpu->d[sx], (u8)cpu->d[dx]);
+                cpu->d[dx] = (cpu->d[dx] & ~0xFFu) | r;
+            }
+            cpu->cycles += 6;
+            return;
+        }
         int sz = szf == 0 ? 1 : szf == 1 ? 2 : 4;
         bool to_ea = (op >> 8) & 1;
         ea_t e = ea_decode(cpu, mode, reg, sz);
@@ -1064,6 +1145,22 @@ void m68k_step(m68k_cpu *cpu) {
             cpu->d[dn] = r;
             set_flags_logic(cpu, 4, r);
             cpu->cycles += 70;
+            return;
+        }
+        /* ABCD: 1100 ddd 1 0000 m rrr */
+        if ((op & 0x01F0) == 0x0100) {
+            int sx = op & 7, dx = (op >> 9) & 7;
+            if ((op >> 3) & 1) {                /* -(Ay),-(Ax) */
+                ea_t se = ea_decode(cpu, 4, sx, 1);
+                u8 s = (u8)ea_read(cpu, &se, 1);
+                ea_t de = ea_decode(cpu, 4, dx, 1);
+                u8 d = (u8)ea_read(cpu, &de, 1);
+                ea_write(cpu, &de, 1, bcd_abcd(cpu, s, d));
+            } else {                            /* Dy,Dx */
+                u8 r = bcd_abcd(cpu, (u8)cpu->d[sx], (u8)cpu->d[dx]);
+                cpu->d[dx] = (cpu->d[dx] & ~0xFFu) | r;
+            }
+            cpu->cycles += 6;
             return;
         }
         /* EXG: opcode bits 8..3 select mode. */

@@ -121,12 +121,10 @@ static void cp_write_watch(void *ctx, u32 addr) {
     /* dump full register state for the first writes by the dominant
      * band-writer (PC ~0x40AC3C) */
     static int dumped;
-    if (dumped < 12 && (pc >= 0x40AC00 && pc <= 0x40AC80)) {
+    if (dumped < 4 && (pc >= 0x40AC00 && pc <= 0x40AC80)) {
         dumped++;
-        fprintf(stderr, "[bw] pc=%06X addr=%06X row=%u  "
-                "A0=%08X A1=%08X A2=%08X A3=%08X D2=%08X D3=%08X\n",
-                pc, addr, row, c->a[0], c->a[1], c->a[2], c->a[3],
-                c->d[2], c->d[3]);
+        fprintf(stderr, "[bw] cyc=%llu pc=%06X addr=%06X row=%u A3=%08X\n",
+                (unsigned long long)c->cycles, pc, addr, row, c->a[3]);
     }
     for (int i = 0; i < g_wpc_n; i++)
         if (g_wpc[i].pc == pc) { g_wpc[i].n++; return; }
@@ -155,9 +153,37 @@ static void cp_trap_hook(m68k_cpu *cpu, u16 trap) {
             srcBits, srcBase, srcRB, t, l, b, r, cpu->a[6]);
 }
 
+/* Dump a full machine snapshot (registers + RAM + patched ROM) for the
+ * mini vMac differential harness. */
+static void write_snapshot(mac_mem *m, m68k_cpu *cpu, const char *path) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    u32 hdr[24];
+    hdr[0] = 0x4D414331;                       /* 'MAC1' */
+    for (int i = 0; i < 8; i++) hdr[1 + i]  = cpu->d[i];
+    for (int i = 0; i < 8; i++) hdr[9 + i]  = cpu->a[i];
+    hdr[17] = cpu->pc;
+    hdr[18] = cpu->sr;
+    hdr[19] = cpu->usp;
+    hdr[20] = cpu->ssp;
+    hdr[21] = hdr[22] = hdr[23] = 0;
+    fwrite(hdr, 4, 24, f);
+    fwrite(&m->ram_size, 4, 1, f);
+    fwrite(m->ram, 1, m->ram_size, f);
+    fwrite(&m->rom_size, 4, 1, f);
+    fwrite(m->rom, 1, m->rom_size, f);
+    fclose(f);
+    fprintf(stderr, "[cpdebug] snapshot written: %s (pc=%06X cyc=%llu)\n",
+            path, cpu->pc, (unsigned long long)cpu->cycles);
+}
+
 static int scripted_debug_run(mac_mem *m, m68k_cpu *cpu) {
     m->serial_sink = NULL;
     m68k_trap_hook = cp_trap_hook;
+    const char *snap = getenv("MAC68K_SNAP");
+    u64 snap_cyc = getenv("MAC68K_SNAP_CYCLE")
+                 ? strtoull(getenv("MAC68K_SNAP_CYCLE"), NULL, 0) : 0;
+    bool snapped = false;
     int item_y = getenv("MAC68K_CP_ITEMY") ? atoi(getenv("MAC68K_CP_ITEMY"))
                                            : 98;
     u64 boot = 900000000ull;
@@ -176,6 +202,10 @@ static int scripted_debug_run(mac_mem *m, m68k_cpu *cpu) {
     fprintf(stderr, "[cpdebug] running, item_y=%d\n", item_y);
     while (!cpu->halted && cpu->cycles < end) {
         m68k_run_until(cpu, cpu->cycles + 200000);
+        if (snap && !snapped && cpu->cycles >= snap_cyc) {
+            snapped = true;
+            write_snapshot(m, cpu, snap);
+        }
         while (next < nev && cpu->cycles >= script[next].cyc) {
             mac_set_mouse(m, script[next].x, script[next].y,
                           script[next].btn != 0);
