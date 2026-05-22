@@ -280,6 +280,9 @@ static bool cond_true(m68k_cpu *cpu, int cc) {
 u32 m68k_exc_log[64][3];   /* {vector, faulting pc, count-at} */
 u32 m68k_exc_n;
 
+/* Optional debug hook, called for every line-A (Toolbox trap). */
+void (*m68k_trap_hook)(m68k_cpu *cpu, u16 trap);
+
 void m68k_exception(m68k_cpu *cpu, u32 vector) {
     m68k_exc_log[m68k_exc_n & 63][0] = vector;
     m68k_exc_log[m68k_exc_n & 63][1] = cpu->pc;
@@ -1135,6 +1138,7 @@ void m68k_step(m68k_cpu *cpu) {
 
     /* ---- 1010: line-A emulator (Macintosh Toolbox/OS traps) ---------- */
     case 0xA:
+        if (m68k_trap_hook) m68k_trap_hook(cpu, op);
         m68k_unimpl(cpu, op_pc, 10);   /* vector 10 @ 0x28 */
         return;
 

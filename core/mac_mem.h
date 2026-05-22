@@ -63,6 +63,7 @@ typedef struct via6522 {
     u8  acr, pcr;          /* auxiliary / peripheral control    */
     u8  ifr, ier;          /* interrupt flag / enable           */
     u8  sr;                /* shift register (keyboard)         */
+    u8  icb2;              /* CB2 line — keyboard data          */
     u16 t1c, t1l;          /* timer 1 counter / latch           */
     u16 t2c;               /* timer 2 counter                   */
     u8  t2l_lo;            /* timer 2 low latch                 */
@@ -123,8 +124,10 @@ typedef struct mac_iwm {
 
 /* --- SCC (Zilog 8530) — reduced model ---------------------------------- */
 typedef struct mac_scc {
-    u8  reg_ptr[2];        /* selected register, per channel    */
-    u8  wr[2][16];
+    u8   wr_ptr;           /* control-port register pointer     */
+    bool irq_on;           /* guest enabled SCC interrupts (WR9 MIE) —
+                            * the Mac Plus mouse rides the SCC IRQ, so
+                            * this gates host mouse injection */
 } mac_scc;
 
 struct m68k_cpu;
@@ -178,5 +181,15 @@ void mac_write16(mac_mem *m, u32 addr, u16 v);
 void mac_write32(mac_mem *m, u32 addr, u32 v);
 
 void mac_mem_tick(mac_mem *m, u64 cycles);
+
+/* Recompute the VIA IRQ summary and cpu->pending_irq. Public so the
+ * keyboard code (core/mac_input.c) can raise the shift-register IRQ. */
+void mac_via_recalc_irq(mac_mem *m);
+
+/* True once the guest has enabled SCC interrupts — the cue that the OS
+ * is up and ready for mouse input. */
+static inline bool mac_mouse_enabled(const mac_mem *m) {
+    return m->scc.irq_on;
+}
 
 #endif

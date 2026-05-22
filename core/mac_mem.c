@@ -10,6 +10,7 @@
 #include "mac_mem.h"
 #include "mac_iwm.h"
 #include "sony.h"
+#include "mac_input.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -47,6 +48,7 @@ void mac_mem_init(mac_mem *m, u32 ram_size) {
     m->mouse_btn = 1;          /* not pressed */
     iwm_init(&m->iwm);
     sony_init(m);
+    mac_input_init(m);
 }
 
 void mac_mem_free(mac_mem *m) {
@@ -84,7 +86,7 @@ bool mac_insert_disk(mac_mem *m, const u8 *img, u32 len, bool wprot) {
 
 /* --- VIA --------------------------------------------------------------- */
 
-static void via_recalc_irq(mac_mem *m) {
+void mac_via_recalc_irq(mac_mem *m) {
     via6522 *v = &m->via;
     bool active = (v->ifr & v->ier & 0x7Fu) != 0;
     if (active) v->ifr |= VIA_IRQ_ANY;
@@ -118,31 +120,31 @@ static u8 via_read(mac_mem *m, u32 addr) {
     switch (via_reg(addr)) {
         case 0:                                          /* ORB/IRB */
             v->ifr &= (u8)~(VIA_IRQ_CB1 | VIA_IRQ_CB2);
-            via_recalc_irq(m);
+            mac_via_recalc_irq(m);
             return via_read_pb(m);
         case 1: case 15:                                 /* ORA/IRA */
             if (via_reg(addr) == 1) {
                 v->ifr &= (u8)~(VIA_IRQ_CA1 | VIA_IRQ_CA2);
-                via_recalc_irq(m);
+                mac_via_recalc_irq(m);
             }
             return via_read_pa(m);
         case 2:  return v->ddrb;
         case 3:  return v->ddra;
         case 4:                                          /* T1C-L: clears T1 IRQ */
             v->ifr &= (u8)~VIA_IRQ_T1;
-            via_recalc_irq(m);
+            mac_via_recalc_irq(m);
             return (u8)(v->t1c & 0xFF);
         case 5:  return (u8)(v->t1c >> 8);
         case 6:  return (u8)(v->t1l & 0xFF);
         case 7:  return (u8)(v->t1l >> 8);
         case 8:                                          /* T2C-L: clears T2 IRQ */
             v->ifr &= (u8)~VIA_IRQ_T2;
-            via_recalc_irq(m);
+            mac_via_recalc_irq(m);
             return (u8)(v->t2c & 0xFF);
         case 9:  return (u8)(v->t2c >> 8);
         case 10:                                         /* SR */
             v->ifr &= (u8)~VIA_IRQ_SR;
-            via_recalc_irq(m);
+            mac_via_recalc_irq(m);
             return v->sr;
         case 11: return v->acr;
         case 12: return v->pcr;
@@ -157,7 +159,7 @@ static void via_write(mac_mem *m, u32 addr, u8 val) {
     switch (via_reg(addr)) {
         case 0:                                          /* ORB */
             v->ifr &= (u8)~(VIA_IRQ_CB1 | VIA_IRQ_CB2);
-            via_recalc_irq(m);
+            mac_via_recalc_irq(m);
             rtc_via_write(&m->rtc, val);                 /* PB0/1/2 -> RTC */
             v->orb = val;
             break;
@@ -166,7 +168,7 @@ static void via_write(mac_mem *m, u32 addr, u8 val) {
             /* PA4 = ROM overlay. The ROM clears it once RAM is ready. */
             if (via_reg(addr) == 1) {
                 v->ifr &= (u8)~(VIA_IRQ_CA1 | VIA_IRQ_CA2);
-                via_recalc_irq(m);
+                mac_via_recalc_irq(m);
             }
             m->overlay = (val & 0x10) != 0;
             /* PA5 is the floppy drive SEL line, read by the IWM. */
@@ -183,7 +185,7 @@ static void via_write(mac_mem *m, u32 addr, u8 val) {
             v->t1c = v->t1l;
             v->t1_irq_armed = true;
             v->ifr &= (u8)~VIA_IRQ_T1;
-            via_recalc_irq(m);
+            mac_via_recalc_irq(m);
             break;
         case 6:  v->t1l = (u16)((v->t1l & 0xFF00u) | val); break;
         case 7:  v->t1l = (u16)((v->t1l & 0x00FFu) | ((u16)val << 8)); break;
@@ -191,19 +193,20 @@ static void via_write(mac_mem *m, u32 addr, u8 val) {
         case 9:                                          /* T2C-H: load + start */
             v->t2c = (u16)((v->t2l_lo) | ((u16)val << 8));
             v->ifr &= (u8)~VIA_IRQ_T2;
-            via_recalc_irq(m);
+            mac_via_recalc_irq(m);
             break;
-        case 10: v->sr = val; break;
-        case 11: v->acr = val; break;
+        case 10: v->sr = val; mac_kbd_sr_written(m); break;
+        case 11: { u8 old = v->acr; v->acr = val;
+               mac_kbd_acr_written(m, old); } break;
         case 12: v->pcr = val; break;
         case 13:                                         /* IFR: write-1-clears */
             v->ifr &= (u8)~(val & 0x7Fu);
-            via_recalc_irq(m);
+            mac_via_recalc_irq(m);
             break;
         case 14:                                         /* IER */
             if (val & 0x80u) v->ier |= (u8)(val & 0x7Fu);
             else             v->ier &= (u8)~(val & 0x7Fu);
-            via_recalc_irq(m);
+            mac_via_recalc_irq(m);
             break;
         default: break;
     }
@@ -220,7 +223,16 @@ static u8 scc_read(mac_mem *m, u32 addr) {
     return 0;
 }
 static void scc_write(mac_mem *m, u32 addr, u8 v) {
-    (void)m; (void)addr; (void)v;
+    (void)addr;
+    /* Follow the 8530 control-port register-pointer protocol just far
+     * enough to spot WR9 with the master-interrupt-enable bit — the OS
+     * sets that when it is ready for mouse/serial interrupts. */
+    if (m->scc.wr_ptr == 0) {
+        m->scc.wr_ptr = v & 0x0Fu;          /* register select */
+    } else {
+        if (m->scc.wr_ptr == 9 && (v & 0x08u)) m->scc.irq_on = true;
+        m->scc.wr_ptr = 0;
+    }
 }
 
 /* --- SCSI (reduced) ---------------------------------------------------- */
@@ -407,5 +419,8 @@ void mac_mem_tick(mac_mem *m, u64 cycles) {
         sony_tick();
     }
 
-    if (irq_changed) via_recalc_irq(m);
+    if (irq_changed) mac_via_recalc_irq(m);
+
+    /* Service the keyboard's timed shift-register events. */
+    mac_kbd_tick(m, cycles);
 }

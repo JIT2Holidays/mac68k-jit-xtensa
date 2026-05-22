@@ -7,12 +7,18 @@
 #include "m68k_cpu.h"
 #include "m68k_interp.h"
 #include "mac_mem.h"
+#include "mac_input.h"
 #include "demo_rom.h"
 #include "dispatcher.h"
+#include "protocol.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <sys/socket.h>
 
 /* Write the 512x342 1bpp Mac framebuffer as an 8-bit grayscale BMP so the
  * boot screen can be inspected. Mac convention: a set bit is a black pixel. */
@@ -46,6 +52,237 @@ static void write_screen_bmp(const mac_mem *m, const char *path) {
     }
     free(ln);
     fclose(f);
+}
+
+/* --- GUI server mode --------------------------------------------------
+ * Runs the Mac and speaks the GUI wire protocol (gui/protocol.h) over
+ * stdin/stdout: framebuffer packets out, mouse/key packets in. The SDL
+ * GUI spawns this with pipes. */
+
+static double mono_seconds(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec + (double)t.tv_nsec / 1e9;
+}
+
+/* Write the whole buffer, looping over partial writes — a short write
+ * here would desync the protocol stream permanently. */
+static int write_all(const u8 *buf, u32 len) {
+    u32 off = 0;
+    while (off < len) {
+        ssize_t n = write(1, buf + off, len - off);
+        if (n < 0) { if (errno == EINTR) continue; return -1; }
+        if (n == 0) return -1;
+        off += (u32)n;
+    }
+    return 0;
+}
+
+static void send_packet(u8 type, const u8 *payload, u32 len) {
+    u8 hdr[4] = { type, (u8)len, (u8)(len >> 8), (u8)(len >> 16) };
+    if (write_all(hdr, 4) != 0) return;
+    if (len) write_all(payload, len);
+}
+
+static void server_apply_packet(mac_mem *m, u8 type, const u8 *p, u32 len) {
+    if (type == MACGUI_PKT_MOUSE && len >= 5) {
+        i16 x = (i16)(p[0] | (p[1] << 8));
+        i16 y = (i16)(p[2] | (p[3] << 8));
+        mac_set_mouse(m, x, y, p[4] != 0);
+    } else if (type == MACGUI_PKT_KEY && len >= 2) {
+        mac_key_event(m, p[0], p[1] != 0);
+    }
+}
+
+/* --- scripted debug run ----------------------------------------------
+ * Boots the Mac unpaced (fast) and replays a fixed mouse script that
+ * opens the Apple-menu Control Panel, dumping the framebuffer along the
+ * way — to reproduce the Control Panel rendering bug deterministically.
+ * Enabled with the MAC68K_CPDEBUG env var. */
+
+typedef struct { u64 cyc; int x, y, btn; } script_ev;
+
+/* Write-watch: while armed, tallies which PC writes into the two
+ * corrupted framebuffer bands of the Control Panel. */
+static struct { u32 pc, n; } g_wpc[512];
+static int  g_wpc_n;
+static bool g_watch_armed;
+
+static void cp_write_watch(void *ctx, u32 addr) {
+    if (!g_watch_armed) return;
+    mac_mem *m = (mac_mem *)ctx;
+    u32 fb = m->fb_base;
+    if (addr < fb) return;
+    u32 row = (addr - fb) / 64;
+    /* the two garbage bands (Mac screen rows) */
+    if (!((row >= 138 && row <= 168) || (row >= 200 && row <= 235))) return;
+    m68k_cpu *c = m->cpu;
+    u32 pc = c->pc;
+    /* dump full register state for the first writes by the dominant
+     * band-writer (PC ~0x40AC3C) */
+    static int dumped;
+    if (dumped < 12 && (pc >= 0x40AC00 && pc <= 0x40AC80)) {
+        dumped++;
+        fprintf(stderr, "[bw] pc=%06X addr=%06X row=%u  "
+                "A0=%08X A1=%08X A2=%08X A3=%08X D2=%08X D3=%08X\n",
+                pc, addr, row, c->a[0], c->a[1], c->a[2], c->a[3],
+                c->d[2], c->d[3]);
+    }
+    for (int i = 0; i < g_wpc_n; i++)
+        if (g_wpc[i].pc == pc) { g_wpc[i].n++; return; }
+    if (g_wpc_n < 512) { g_wpc[g_wpc_n].pc = pc; g_wpc[g_wpc_n].n = 1;
+                         g_wpc_n++; }
+}
+
+/* Log _CopyBits calls — the QuickDraw blit (trap 0xA8EC). The corrupt
+ * bands are 68k code drawn as a bitmap, so a CopyBits is sourcing from a
+ * bad address; this prints each call's source bitmap and dest rect. */
+static void cp_trap_hook(m68k_cpu *cpu, u16 trap) {
+    if (!g_watch_armed || trap != 0xA8EC) return;
+    mac_mem *m = cpu->mem;
+    u32 sp = cpu->a[7];
+    u32 srcBits = mac_read32(m, sp + 18);
+    u32 dstRect = mac_read32(m, sp + 6);
+    u32 srcBase = mac_read32(m, srcBits);
+    u16 srcRB   = mac_read16(m, srcBits + 4);
+    int t = (i16)mac_read16(m, dstRect),     l = (i16)mac_read16(m, dstRect+2);
+    int b = (i16)mac_read16(m, dstRect + 4), r = (i16)mac_read16(m, dstRect+6);
+    /* Flag CopyBits whose source base address is not a sane 24-bit
+     * pointer — those are the corrupting blits. */
+    bool bad = (srcBase >> 24) != 0;
+    fprintf(stderr, "[cp]%s CopyBits bitmap@%06X base=%08X rb=%u "
+            "dst=(t%d l%d b%d r%d) caller-a6=%06X\n", bad ? " *BAD*" : "",
+            srcBits, srcBase, srcRB, t, l, b, r, cpu->a[6]);
+}
+
+static int scripted_debug_run(mac_mem *m, m68k_cpu *cpu) {
+    m->serial_sink = NULL;
+    m68k_trap_hook = cp_trap_hook;
+    int item_y = getenv("MAC68K_CP_ITEMY") ? atoi(getenv("MAC68K_CP_ITEMY"))
+                                           : 98;
+    u64 boot = 900000000ull;
+    script_ev script[] = {
+        { boot,               14, 10, 0 },
+        { boot +  20000000,   14, 10, 1 },   /* press — menu drops      */
+        { boot +  60000000,   30, 40, 1 },   /* drag down into the menu */
+        { boot + 100000000,   40, item_y, 1},/* onto Control Panel      */
+        { boot + 150000000,   40, item_y, 1},
+        { boot + 170000000,   40, item_y, 0},/* release — open it       */
+    };
+    int nev = (int)(sizeof(script) / sizeof(script[0])), next = 0;
+    u64 end = boot + 600000000ull, last_dump = 0;
+    int frame = 0;
+
+    fprintf(stderr, "[cpdebug] running, item_y=%d\n", item_y);
+    while (!cpu->halted && cpu->cycles < end) {
+        m68k_run_until(cpu, cpu->cycles + 200000);
+        while (next < nev && cpu->cycles >= script[next].cyc) {
+            mac_set_mouse(m, script[next].x, script[next].y,
+                          script[next].btn != 0);
+            fprintf(stderr, "[cpdebug] ev%d cyc=%llu mouse=(%d,%d) btn=%d\n",
+                    next, (unsigned long long)cpu->cycles, script[next].x,
+                    script[next].y, script[next].btn);
+            next++;
+        }
+        /* Arm the write-watch once the Control Panel starts opening. */
+        if (!g_watch_armed && next >= nev) {
+            g_watch_armed = true;
+            mac_write_watch = cp_write_watch;
+            mac_write_watch_ctx = m;
+            fprintf(stderr, "[cpdebug] write-watch armed at %llu\n",
+                    (unsigned long long)cpu->cycles);
+        }
+        if (cpu->cycles >= boot && cpu->cycles - last_dump >= 20000000ull) {
+            last_dump = cpu->cycles;
+            char path[64];
+            snprintf(path, sizeof(path), "/tmp/cpf_%03d.bmp", frame++);
+            write_screen_bmp(m, path);
+        }
+    }
+    /* Report the PCs that wrote into the corrupted bands, most-frequent
+     * first. */
+    for (int i = 0; i < g_wpc_n; i++)
+        for (int j = i + 1; j < g_wpc_n; j++)
+            if (g_wpc[j].n > g_wpc[i].n) {
+                u32 tp = g_wpc[i].pc, tn = g_wpc[i].n;
+                g_wpc[i] = g_wpc[j];
+                g_wpc[j].pc = tp; g_wpc[j].n = tn;
+            }
+    fprintf(stderr, "[cpdebug] band writers (top PCs):\n");
+    for (int i = 0; i < g_wpc_n && i < 16; i++)
+        fprintf(stderr, "  pc=%06X  writes=%u\n", g_wpc[i].pc, g_wpc[i].n);
+    fprintf(stderr, "[cpdebug] done at cycle %llu\n",
+            (unsigned long long)cpu->cycles);
+    return 0;
+}
+
+static int server_loop(mac_mem *m, m68k_cpu *cpu) {
+    if (getenv("MAC68K_CPDEBUG")) return scripted_debug_run(m, cpu);
+    /* stdin and stdout are the SAME socket (the GUI dup'd one socketpair
+     * end onto both). So we must NOT set O_NONBLOCK on the descriptor —
+     * that would also make our frame writes non-blocking and tear them.
+     * Input is polled per-call with recv(MSG_DONTWAIT); output writes
+     * stay blocking so whole packets always go out intact. */
+    m->serial_sink = NULL;     /* stdout is the protocol stream now */
+
+    u8 hello[4] = { (u8)MACGUI_SCREEN_W, (u8)(MACGUI_SCREEN_W >> 8),
+                    (u8)MACGUI_SCREEN_H, (u8)(MACGUI_SCREEN_H >> 8) };
+    send_packet(MACGUI_PKT_HELLO, hello, 4);
+
+    static u8 inbuf[512];
+    int inlen = 0;
+    static u8 prevfb[MACGUI_FB_BYTES];
+    static u8 fbcopy[MACGUI_FB_BYTES];
+    static u8 rle[MACGUI_FB_BYTES * 2];
+    memset(prevfb, 0x55, sizeof(prevfb));     /* force the first frame */
+
+    double t0 = mono_seconds(), last_frame = 0, last_log = 0;
+    fprintf(stderr, "[server] running — protocol on stdin/stdout\n");
+
+    while (!cpu->halted) {
+        double now = mono_seconds() - t0;
+        /* Pace the Mac to real time (7.8336 MHz). */
+        u64 target = (u64)(now * 7833600.0);
+        if (cpu->cycles < target) m68k_run_until(cpu, target);
+        if (now - last_log >= 3.0) {
+            last_log = now;
+            fprintf(stderr, "[server] t=%.0fs cycles=%llu pc=%06X\n",
+                    now, (unsigned long long)cpu->cycles, cpu->pc);
+        }
+
+        /* Drain any input packets (per-call non-blocking). */
+        ssize_t n = recv(0, inbuf + inlen, sizeof(inbuf) - (size_t)inlen,
+                         MSG_DONTWAIT);
+        if (n == 0) break;                    /* GUI closed the pipe */
+        if (n > 0) {
+            inlen += (int)n;
+            int off = 0;
+            while (inlen - off >= 4) {
+                u32 plen = inbuf[off+1] | (inbuf[off+2] << 8) | (inbuf[off+3] << 16);
+                if ((u32)(inlen - off - 4) < plen) break;
+                server_apply_packet(m, inbuf[off], inbuf + off + 4, plen);
+                off += 4 + (int)plen;
+            }
+            if (off > 0) { memmove(inbuf, inbuf + off, (size_t)(inlen - off));
+                           inlen -= off; }
+        }
+
+        /* Emit a framebuffer packet ~30x/second when it changed. */
+        if (now - last_frame >= 0.033) {
+            last_frame = now;
+            for (u32 i = 0; i < MACGUI_FB_BYTES; i++)
+                fbcopy[i] = m->ram[(m->fb_base + i) % m->ram_size];
+            if (memcmp(fbcopy, prevfb, MACGUI_FB_BYTES) != 0) {
+                size_t rl = macgui_rle_encode(fbcopy, MACGUI_FB_BYTES, rle);
+                send_packet(MACGUI_PKT_FRAME, rle, (u32)rl);
+                memcpy(prevfb, fbcopy, MACGUI_FB_BYTES);
+                if (getenv("MAC_SERVER_DUMP"))
+                    write_screen_bmp(m, getenv("MAC_SERVER_DUMP"));
+            }
+        }
+        usleep(2000);
+    }
+    return 0;
 }
 
 static void serial_cb(void *ctx, u8 b) {
@@ -93,10 +330,12 @@ int main(int argc, char **argv) {
     const char *rom_path = NULL;
     const char *disk_path = NULL;
     const char *shot_path = NULL;
+    bool server = false;
 
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "--interp")) use_jit = false;
         else if (!strcmp(argv[i], "--jit"))    use_jit = true;
+        else if (!strcmp(argv[i], "--server")) server = true;
         else if (!strcmp(argv[i], "--rom"))    is_rom = true;
         else if (!strcmp(argv[i], "--disk") && i + 1 < argc)
             disk_path = argv[++i];
@@ -157,7 +396,13 @@ int main(int argc, char **argv) {
     m68k_cpu cpu;
     m68k_reset(&cpu, &mem);
     fprintf(stderr, "[host] reset: PC=0x%06X SSP=0x%06X  mode=%s\n",
-            cpu.pc, cpu.a[7], use_jit ? "JIT" : "interp");
+            cpu.pc, cpu.a[7], server ? "server" : use_jit ? "JIT" : "interp");
+
+    if (server) {
+        int rc = server_loop(&mem, &cpu);
+        mac_mem_free(&mem);
+        return rc;
+    }
 
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);

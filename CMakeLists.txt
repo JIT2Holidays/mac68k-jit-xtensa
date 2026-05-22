@@ -20,6 +20,7 @@ add_library(mac68k_core STATIC
     core/m68k_interp.c
     core/mac_mem.c
     core/mac_iwm.c
+    core/mac_input.c
     core/sony.c
     core/demo_rom.c
 )
@@ -39,7 +40,11 @@ target_link_libraries(mac68k_jit PUBLIC mac68k_core)
 
 # Host CLI driver.
 add_executable(mac68k_host port/host/main.c)
+target_include_directories(mac68k_host PRIVATE gui)
 target_link_libraries(mac68k_host PRIVATE mac68k_jit)
 
 enable_testing()
 add_subdirectory(tests)
+
+# Optional SDL front-end (gui/). Skipped automatically if SDL2 is absent.
+add_subdirectory(gui)

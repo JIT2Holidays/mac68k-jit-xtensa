@@ -9,6 +9,7 @@ idf_component_register(
         "${MAC68K_ROOT}/core/m68k_interp.c"
         "${MAC68K_ROOT}/core/mac_mem.c"
         "${MAC68K_ROOT}/core/mac_iwm.c"
+        "${MAC68K_ROOT}/core/mac_input.c"
         "${MAC68K_ROOT}/core/sony.c"
         "${MAC68K_ROOT}/core/demo_rom.c"
         "${MAC68K_ROOT}/jit/emit_xtensa.c"

@@ -39,4 +39,10 @@ typedef struct m68k_decoded {
 
 m68k_decoded m68k_decode_at(m68k_cpu *cpu, u32 pc);
 
+/* CPU exception ring log {vector, faulting pc, cycle} and a debug hook
+ * invoked on every line-A (Toolbox) trap. */
+extern u32 m68k_exc_log[64][3];
+extern u32 m68k_exc_n;
+extern void (*m68k_trap_hook)(m68k_cpu *cpu, u16 trap);
+
 #endif
