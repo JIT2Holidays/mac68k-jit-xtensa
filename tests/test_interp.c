@@ -50,8 +50,61 @@ static int test_arith(void) {
     return 0;
 }
 
+/* ADDX/SUBX/NEGX condition codes. These X-form ("extended") ops differ
+ * from plain ADD/SUB/NEG in three ways the mini vMac differential caught
+ * while running Speedometer's benchmarks:
+ *   1. Z is sticky — cleared on a nonzero result, left UNCHANGED on a
+ *      zero result (so Z stays valid across a multi-precision op).
+ *   2. carry/borrow (and hence X) must include the X input.
+ *   3. NEGX must compute V (overflow), which it was omitting entirely.
+ * Each case below checks the full 5-bit CCR after one instruction. */
+static int test_xform_flags(void) {
+    mac_mem mem;
+    mac_mem_init(&mem, 64 * 1024);
+    mem.overlay = false;                  /* plain RAM at low addresses */
+    mac_write16(&mem, 0x100, 0xD182);     /* ADDX.L D2,D0 */
+    mac_write16(&mem, 0x102, 0x9182);     /* SUBX.L D2,D0 */
+    mac_write16(&mem, 0x104, 0x4080);     /* NEGX.L D0    */
+    m68k_cpu cpu;
+    int rc = 0;
+
+    struct { const char *name; u16 pc; u32 d0, d2; u8 ccr_in, ccr_out; } cs[] = {
+        /* sticky Z: zero result keeps the incoming Z either way */
+        { "ADDX 0+0,    Z=1",   0x100, 0, 0, CCR_Z,         CCR_Z },
+        { "ADDX 0+0,    Z=0",   0x100, 0, 0, 0,             0 },
+        { "ADDX nonzero,Z=1",   0x100, 1, 0, CCR_Z,         0 },
+        /* carry must include X: 0xFFFFFFFF+0+X wraps to 0, sets C|X */
+        { "ADDX FFFF.+X,Z=1",   0x100, 0xFFFFFFFF, 0, CCR_X|CCR_Z,
+                                                 CCR_Z|CCR_C|CCR_X },
+        /* borrow must include X: 0-0-X = -1, borrow sets C|X, N set */
+        { "SUBX 0-0-X",         0x102, 0, 0, CCR_X,         CCR_N|CCR_C|CCR_X },
+        { "SUBX 0-0,    Z=1",   0x102, 0, 0, CCR_Z,         CCR_Z },
+        /* NEGX of the most-negative value overflows: V must be set */
+        { "NEGX 80000000",      0x104, 0x80000000, 0, 0,
+                                            CCR_N|CCR_V|CCR_C|CCR_X },
+        { "NEGX 0,      Z=1",   0x104, 0, 0, CCR_Z,         CCR_Z },
+    };
+    for (int i = 0; i < (int)(sizeof cs / sizeof cs[0]); i++) {
+        memset(&cpu, 0, sizeof cpu);
+        cpu.mem = &mem; mem.cpu = &cpu;
+        cpu.pc = cs[i].pc; cpu.d[0] = cs[i].d0; cpu.d[2] = cs[i].d2;
+        cpu.sr = (u16)(SR_S | cs[i].ccr_in);
+        m68k_step(&cpu);
+        u8 got = (u8)(cpu.sr & 0x1F);
+        if (got != cs[i].ccr_out) {
+            printf("xform-flags: %s -> CCR=%02X want %02X\n",
+                   cs[i].name, got, cs[i].ccr_out);
+            rc = 1;
+        }
+    }
+    mac_mem_free(&mem);
+    if (!rc) printf("  ADDX/SUBX/NEGX condition codes OK\n");
+    return rc;
+}
+
 int main(void) {
     if (test_arith()) return fail("arith snippet");
+    if (test_xform_flags()) return fail("X-form condition codes");
 
     mac_mem mem;
     mac_mem_init(&mem, 1024 * 1024);

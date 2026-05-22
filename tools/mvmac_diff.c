@@ -32,6 +32,22 @@ static void devq_log(mac_mem *m, u32 addr, u32 val, int is_write, int size) {
     g_devq_tail = (g_devq_tail + 1) & 63;
 }
 
+/* --- RAM-write tracking ----------------------------------------------
+ * Comparing the whole 1 MB of RAM after every instruction is far too
+ * slow to run Speedometer's benchmarks through the differential. Instead
+ * record the RAM offsets this project's CPU writes (via mac_write_watch)
+ * and compare only those — O(writes) instead of O(ram_size). A periodic
+ * full sweep is the backstop for the rare mini-vMac-only write. */
+static u32  g_woff[256];
+static int  g_woff_n;
+static bool g_woff_of;            /* write buffer overflowed this step */
+
+static void woff_log(void *ctx, u32 ra) {
+    (void)ctx;
+    if (g_woff_n < 256) g_woff[g_woff_n++] = ra;
+    else g_woff_of = true;
+}
+
 unsigned mvdiff_dev_read(unsigned addr, int is_word) {
     (void)addr;
     unsigned v = 0;
@@ -94,6 +110,7 @@ int main(int argc, char **argv) {
     cA.mem = &mA;
     mA.cpu = &cA;
     mac_mmio_log = devq_log;          /* capture this CPU's device reads */
+    mac_write_watch = woff_log;       /* capture this CPU's RAM writes  */
 
     /* --- mini vMac CPU --- */
     unsigned char *ramB = malloc(ram_size); memcpy(ramB, ram_snap, ram_size);
@@ -113,7 +130,8 @@ int main(int argc, char **argv) {
         unsigned op = mac_read16(&mA, pc_before);
 
         g_devq_head = g_devq_tail = 0;     /* fresh per instruction */
-        m68k_step(&cA);                    /* records device reads */
+        g_woff_n = 0; g_woff_of = false;
+        m68k_step(&cA);                    /* records device reads + writes */
         MNVM_step();                       /* replays them         */
 
         unsigned rB[16];
@@ -128,17 +146,35 @@ int main(int argc, char **argv) {
         if ((cA.sr & 0x1F) != (srB & 0x1F)) bad = 1;   /* condition codes */
 
         /* memory divergence — the instruction just executed stored a
-         * different value (registers can still match). */
-        if (!bad && memcmp(mA.ram, ramB, ram_size) != 0) {
-            for (unsigned a = 0; a < ram_size; a++)
-                if (mA.ram[a] != ramB[a]) {
-                    printf("\n*** MEMORY DIVERGENCE at step %ld ***\n", step);
-                    printf("instruction: PC=%06X  opcode=%04X\n",
-                           pc_before, op);
-                    printf("  RAM[%06X]: this project=%02X  mini vMac=%02X\n",
-                           a, mA.ram[a], ramB[a]);
-                    return 3;
+         * different value (registers can still match). Check only the
+         * bytes this CPU wrote; sweep all of RAM periodically as a
+         * backstop, and whenever the write buffer overflowed. */
+        if (!bad) {
+            long md = -1;
+            if (g_woff_of || (step & 0x3FFFF) == 0) {
+                for (unsigned a = 0; a < ram_size; a++)
+                    if (mA.ram[a] != ramB[a]) { md = (long)a; break; }
+            } else {
+                for (int i = 0; i < g_woff_n && md < 0; i++) {
+                    u32 a = g_woff[i];
+                    if (a < ram_size && mA.ram[a] != ramB[a]) md = (long)a;
                 }
+            }
+            if (md >= 0) {
+                printf("\n*** MEMORY DIVERGENCE at step %ld ***\n", step);
+                printf("instruction: PC=%06X  opcode=%04X\n",
+                       pc_before, op);
+                printf("  RAM[%06lX]: this project=%02X  mini vMac=%02X\n",
+                       md, mA.ram[md], ramB[md]);
+                for (int i = 0; i < 8; i++)
+                    printf("  D%d=%08X  A%d=%08X\n", i, cA.d[i], i, cA.a[i]);
+                printf("  PC=%06X  SR=%04X  this CPU wrote %d byte(s):",
+                       cA.pc, cA.sr & 0xFFFF, g_woff_n);
+                for (int i = 0; i < g_woff_n; i++)
+                    printf(" %06X", g_woff[i]);
+                printf("\n");
+                return 3;
+            }
         }
 
         if (bad) {

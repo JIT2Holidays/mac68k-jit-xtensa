@@ -842,16 +842,20 @@ void m68k_step(m68k_cpu *cpu) {
                     set_flags_sub(cpu, sz, d, 0, r);
                 } else if (sel == 0x0) {                     /* NEGX */
                     bool X = m68k_get_ccr(cpu) & CCR_X;
-                    r = (u32)(0 - d - (X ? 1 : 0));
+                    bool zold = m68k_get_ccr(cpu) & CCR_Z;
+                    r = (u32)(0 - d - (X ? 1u : 0u));
                     ea_write(cpu, &e, sz, r);
-                    u8 c = 0;
                     u32 mask = size_mask(sz), msb = size_msb(sz);
-                    if ((r & mask) & msb) c |= CCR_N;
-                    if ((r & mask) != 0 && (m68k_get_ccr(cpu) & CCR_Z))
-                        c |= CCR_Z;
-                    else if ((r & mask) == 0 && (m68k_get_ccr(cpu) & CCR_Z))
-                        c |= CCR_Z;
-                    if (d != 0 || X) c |= CCR_C | CCR_X;
+                    u32 dm = d & mask, rm = r & mask;
+                    u8 c = 0;
+                    if (rm & msb)        c |= CCR_N;
+                    /* X-form Z is sticky: cleared on a nonzero result,
+                     * left unchanged on a zero result. */
+                    if (zold && rm == 0) c |= CCR_Z;
+                    if (dm != 0 || X)    c |= CCR_C | CCR_X;
+                    /* Overflow: operand and result both negative — i.e.
+                     * negating the most-negative value. */
+                    if ((dm & rm) & msb) c |= CCR_V;
                     m68k_set_ccr(cpu, c);
                 } else if (sel == 0x6) {                     /* NOT */
                     r = ~d;
@@ -1039,6 +1043,7 @@ void m68k_step(m68k_cpu *cpu) {
         /* ADDX/SUBX: to_ea form with mode 0 or 1 (Dn,Dn or -(An),-(An)). */
         if (to_ea && (mode == 0 || mode == 1)) {
             bool X = m68k_get_ccr(cpu) & CCR_X;
+            bool zold = m68k_get_ccr(cpu) & CCR_Z;
             u32 s, d, r;
             if (mode == 0) {
                 s = cpu->d[reg] & size_mask(sz);
@@ -1052,11 +1057,33 @@ void m68k_step(m68k_cpu *cpu) {
                 d = (sz==1)?mac_read8(cpu->mem,cpu->a[dn]):
                     (sz==2)?mac_read16(cpu->mem,cpu->a[dn]):mac_read32(cpu->mem,cpu->a[dn]);
             }
-            if (is_add) { r = d + s + (X?1:0); set_flags_add(cpu, sz, s, d, r); }
-            else        { r = d - s - (X?1:0); set_flags_sub(cpu, sz, s, d, r); }
-            /* X-form leaves Z sticky: only clears on nonzero, never sets. */
-            if ((r & size_mask(sz)) != 0)
-                m68k_set_ccr(cpu, (u8)(m68k_get_ccr(cpu) & ~CCR_Z));
+            /* ADDX/SUBX flags differ from plain ADD/SUB in two ways, so
+             * they are computed here rather than via set_flags_add/sub:
+             *   - carry/borrow (and hence X) must include the X input;
+             *   - Z is sticky: cleared on a nonzero result, left
+             *     unchanged on a zero result. */
+            {
+                u32 mask = size_mask(sz), msb = size_msb(sz);
+                u32 sm, dm, rm;
+                bool carry, ovfl;
+                if (is_add) {
+                    r = d + s + (X ? 1u : 0u);
+                    sm = s & mask; dm = d & mask; rm = r & mask;
+                    carry = ((u64)sm + (u64)dm + (X ? 1u : 0u)) > mask;
+                    ovfl  = (((sm ^ rm) & (dm ^ rm)) & msb) != 0;
+                } else {
+                    r = d - s - (X ? 1u : 0u);
+                    sm = s & mask; dm = d & mask; rm = r & mask;
+                    carry = ((u64)sm + (X ? 1u : 0u)) > (u64)dm;
+                    ovfl  = (((sm ^ dm) & (dm ^ rm)) & msb) != 0;
+                }
+                u8 c = 0;
+                if (rm & msb)        c |= CCR_N;
+                if (zold && rm == 0) c |= CCR_Z;       /* sticky Z */
+                if (carry)           c |= CCR_C | CCR_X;
+                if (ovfl)            c |= CCR_V;
+                m68k_set_ccr(cpu, c);
+            }
             if (mode == 0)
                 cpu->d[dn] = (cpu->d[dn] & ~size_mask(sz)) | (r & size_mask(sz));
             else
