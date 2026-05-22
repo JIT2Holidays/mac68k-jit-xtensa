@@ -35,6 +35,10 @@ bool sony_patch_rom(struct mac_mem *m);
 /* Provide a logical-sector floppy image to the emulated drive. */
 bool sony_insert_disk(struct mac_mem *m, const u8 *img, u32 len, bool wprot);
 
+/* As above, but into a specific drive (0-based; the Mac Plus has two). */
+bool sony_insert_disk_drive(struct mac_mem *m, int drive, const u8 *img,
+                            u32 len, bool wprot);
+
 /* Handle a word write to the extension trap window (offset 0..0x1F). */
 void sony_extn_write(u32 offset, u32 data);
 

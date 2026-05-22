@@ -202,9 +202,10 @@ void sony_init(mac_mem *m) {
     S.vm = m;
 }
 
-bool sony_insert_disk(mac_mem *m, const u8 *img, u32 len, bool wprot) {
+bool sony_insert_disk_drive(mac_mem *m, int d, const u8 *img, u32 len,
+                            bool wprot) {
     (void)m;
-    int d = 0;
+    if (d < 0 || d >= NUM_DRIVES) return false;
     free(S.image[d]);
     S.image[d] = (u8 *)malloc(len);
     if (!S.image[d]) return false;
@@ -214,6 +215,10 @@ bool sony_insert_disk(mac_mem *m, const u8 *img, u32 len, bool wprot) {
     S.mounted[d] = false;
     S.wprot[d] = wprot;
     return true;
+}
+
+bool sony_insert_disk(mac_mem *m, const u8 *img, u32 len, bool wprot) {
+    return sony_insert_disk_drive(m, 0, img, len, wprot);
 }
 
 bool sony_patch_rom(mac_mem *m) {

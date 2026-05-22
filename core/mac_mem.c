@@ -84,6 +84,11 @@ bool mac_insert_disk(mac_mem *m, const u8 *img, u32 len, bool wprot) {
     return sony_insert_disk(m, img, len, wprot);
 }
 
+bool mac_insert_disk_drive(mac_mem *m, int drive, const u8 *img, u32 len,
+                           bool wprot) {
+    return sony_insert_disk_drive(m, drive, img, len, wprot);
+}
+
 /* --- VIA --------------------------------------------------------------- */
 
 void mac_via_recalc_irq(mac_mem *m) {

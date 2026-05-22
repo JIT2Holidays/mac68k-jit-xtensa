@@ -173,6 +173,10 @@ void mac_load_ram_image(mac_mem *m, u32 addr, const u8 *img, u32 len);
 /* Insert a logical-sector-order floppy image into the IWM (drive 0). */
 bool mac_insert_disk(mac_mem *m, const u8 *img, u32 len, bool write_protected);
 
+/* As above, but into a specific drive (0-based). The Mac Plus has two. */
+bool mac_insert_disk_drive(mac_mem *m, int drive, const u8 *img, u32 len,
+                           bool write_protected);
+
 u8  mac_read8 (mac_mem *m, u32 addr);
 u16 mac_read16(mac_mem *m, u32 addr);
 u32 mac_read32(mac_mem *m, u32 addr);

@@ -246,7 +246,119 @@ static int scripted_debug_run(mac_mem *m, m68k_cpu *cpu) {
     return 0;
 }
 
+/* --- generic mouse-script run ----------------------------------------
+ * Boots the Mac unpaced and replays a mouse script loaded from the file
+ * named by MAC68K_MOUSESCRIPT. Each non-blank, non-'#' line is
+ *   <cycle> <x> <y> <btn>
+ * Frames are dumped as BMPs into MAC68K_FRAMEDIR (default /tmp/spd) every
+ * MAC68K_FRAME_EVERY cycles. Snapshots: if MAC68K_SNAP is set and
+ * MAC68K_SNAP_EVERY is set, periodic <MAC68K_SNAP>.NNN snapshots are
+ * written; otherwise a single snapshot at MAC68K_SNAP_CYCLE. The run
+ * ends at MAC68K_END_CYCLE. This is the harness used to drive third-
+ * party apps (e.g. Speedometer) for the mini vMac differential. */
+static int read_file(const char *path, u8 **out, u32 *len);
+
+/* --- drive-2 "hard disk" post-boot insert ----------------------------
+ * The second disk (e.g. the Infinite HD) is inserted into drive 2 a
+ * while after boot, not at reset: a disk present at reset mounts at the
+ * .Sony level but the Finder — not yet running — never shows its icon.
+ * Inserting it once the desktop is up delivers a real disk-inserted
+ * event, exactly as if the user had connected an external drive. The
+ * path is resolved in main(); g_hd_cycle is when to insert it. */
+static const char *g_hd_path;
+static u64  g_hd_cycle = 1000000000ull;
+static bool g_hd_inserted;
+
+static void service_hd_insert(mac_mem *m, m68k_cpu *cpu) {
+    if (!g_hd_path || g_hd_inserted || cpu->cycles < g_hd_cycle) return;
+    g_hd_inserted = true;
+    u8 *d = NULL; u32 dl = 0;
+    if (read_file(g_hd_path, &d, &dl) == 0
+        && mac_insert_disk_drive(m, 1, d, dl, false))
+        fprintf(stderr, "[host] inserted %s into drive 2 (%u bytes)\n",
+                g_hd_path, dl);
+    else
+        fprintf(stderr, "[host] failed to insert drive-2 disk %s\n",
+                g_hd_path);
+    free(d);
+}
+
+static int scripted_run_file(mac_mem *m, m68k_cpu *cpu, const char *spath) {
+    m->serial_sink = NULL;
+    static script_ev script[256];
+    int nev = 0;
+    FILE *sf = fopen(spath, "r");
+    if (!sf) { fprintf(stderr, "[script] cannot open %s\n", spath); return 1; }
+    char line[256];
+    while (nev < 256 && fgets(line, sizeof(line), sf)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '#' || *p == '\n' || *p == '\0') continue;
+        unsigned long long c; int x, y, b;
+        if (sscanf(p, "%llu %d %d %d", &c, &x, &y, &b) == 4) {
+            script[nev].cyc = c; script[nev].x = x;
+            script[nev].y = y;   script[nev].btn = b;
+            nev++;
+        }
+    }
+    fclose(sf);
+
+    const char *fdir  = getenv("MAC68K_FRAMEDIR") ? getenv("MAC68K_FRAMEDIR")
+                                                  : "/tmp/spd";
+    u64 frame_every = getenv("MAC68K_FRAME_EVERY")
+                    ? strtoull(getenv("MAC68K_FRAME_EVERY"), NULL, 0)
+                    : 20000000ull;
+    const char *snap = getenv("MAC68K_SNAP");
+    u64 snap_every = getenv("MAC68K_SNAP_EVERY")
+                   ? strtoull(getenv("MAC68K_SNAP_EVERY"), NULL, 0) : 0;
+    u64 snap_cyc = getenv("MAC68K_SNAP_CYCLE")
+                 ? strtoull(getenv("MAC68K_SNAP_CYCLE"), NULL, 0) : 0;
+    u64 end = getenv("MAC68K_END_CYCLE")
+            ? strtoull(getenv("MAC68K_END_CYCLE"), NULL, 0)
+            : (nev ? script[nev - 1].cyc + 400000000ull : 1500000000ull);
+
+    int next = 0, frame = 0, snapn = 0;
+    u64 last_dump = 0, last_snap = 0;
+    fprintf(stderr, "[script] %d events from %s, end=%llu, framedir=%s\n",
+            nev, spath, (unsigned long long)end, fdir);
+
+    while (!cpu->halted && cpu->cycles < end) {
+        m68k_run_until(cpu, cpu->cycles + 50000);   /* fine event timing */
+        service_hd_insert(m, cpu);
+        while (next < nev && cpu->cycles >= script[next].cyc) {
+            mac_set_mouse(m, script[next].x, script[next].y,
+                          script[next].btn != 0);
+            fprintf(stderr, "[script] ev%d cyc=%llu mouse=(%d,%d) btn=%d\n",
+                    next, (unsigned long long)cpu->cycles, script[next].x,
+                    script[next].y, script[next].btn);
+            next++;
+        }
+        if (cpu->cycles - last_dump >= frame_every) {
+            last_dump = cpu->cycles;
+            char path[256];
+            snprintf(path, sizeof(path), "%s/frame_%03d.bmp", fdir, frame++);
+            write_screen_bmp(m, path);
+        }
+        if (snap) {
+            if (snap_every && cpu->cycles - last_snap >= snap_every) {
+                last_snap = cpu->cycles;
+                char path[256];
+                snprintf(path, sizeof(path), "%s.%03d", snap, snapn++);
+                write_snapshot(m, cpu, path);
+            } else if (!snap_every && snapn == 0 && cpu->cycles >= snap_cyc) {
+                snapn = 1;
+                write_snapshot(m, cpu, snap);
+            }
+        }
+    }
+    fprintf(stderr, "[script] done at cycle %llu (halted=%d)\n",
+            (unsigned long long)cpu->cycles, cpu->halted);
+    return 0;
+}
+
 static int server_loop(mac_mem *m, m68k_cpu *cpu) {
+    if (getenv("MAC68K_MOUSESCRIPT"))
+        return scripted_run_file(m, cpu, getenv("MAC68K_MOUSESCRIPT"));
     if (getenv("MAC68K_CPDEBUG")) return scripted_debug_run(m, cpu);
     /* stdin and stdout are the SAME socket (the GUI dup'd one socketpair
      * end onto both). So we must NOT set O_NONBLOCK on the descriptor —
@@ -274,6 +386,7 @@ static int server_loop(mac_mem *m, m68k_cpu *cpu) {
         /* Pace the Mac to real time (7.8336 MHz). */
         u64 target = (u64)(now * 7833600.0);
         if (cpu->cycles < target) m68k_run_until(cpu, target);
+        service_hd_insert(m, cpu);
         if (now - last_log >= 3.0) {
             last_log = now;
             fprintf(stderr, "[server] t=%.0fs cycles=%llu pc=%06X\n",
@@ -327,7 +440,9 @@ static int read_file(const char *path, u8 **out, u32 *len) {
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
     fseek(f, 0, SEEK_SET);
-    if (sz <= 0 || sz > 4 * 1024 * 1024) { fclose(f); return -2; }
+    /* Large enough for a hard-disk image (e.g. a ~1 GB Infinite HD), not
+     * just a floppy; a bad ROM is caught separately by mac_load_rom. */
+    if (sz <= 0 || sz > 1280L * 1024 * 1024) { fclose(f); return -2; }
     u8 *buf = (u8 *)malloc((size_t)sz);
     if (fread(buf, 1, (size_t)sz, f) != (size_t)sz) { free(buf); fclose(f); return -3; }
     fclose(f);
@@ -343,7 +458,11 @@ static void usage(const char *a0) {
         "  --jit           run with the JIT (via the host Xtensa simulator)\n"
         "  --rom           load `file` as a Macintosh ROM (mapped at 0x400000,\n"
         "                  overlaid at 0x0 for boot) instead of a raw RAM image\n"
-        "  --disk D        insert raw 800K floppy image D into the IWM drive\n"
+        "  --disk D        disk image D (repeatable, up to 2). The first\n"
+        "                  is the boot drive; the second is drive 2,\n"
+        "                  inserted after boot. If only one is given,\n"
+        "                  an 'InfiniteHD6.dsk' next to it is used as\n"
+        "                  drive 2 automatically (disable: MAC68K_NO_HD).\n"
         "  --screenshot P  write the 512x342 framebuffer to BMP file P at exit\n"
         "  --max-cycles N  stop after N cycles (default 200M)\n"
         "  --ram-mb M      RAM size in MiB (default 1)\n"
@@ -358,7 +477,8 @@ int main(int argc, char **argv) {
     u64 max_cycles = 200000000ull;
     u32 ram_mb = 1;
     const char *rom_path = NULL;
-    const char *disk_path = NULL;
+    const char *disk_path[2] = { NULL, NULL };
+    int  n_disks = 0;
     const char *shot_path = NULL;
     bool server = false;
 
@@ -367,8 +487,10 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--jit"))    use_jit = true;
         else if (!strcmp(argv[i], "--server")) server = true;
         else if (!strcmp(argv[i], "--rom"))    is_rom = true;
-        else if (!strcmp(argv[i], "--disk") && i + 1 < argc)
-            disk_path = argv[++i];
+        else if (!strcmp(argv[i], "--disk") && i + 1 < argc) {
+            if (n_disks < 2) disk_path[n_disks++] = argv[++i];
+            else { fprintf(stderr, "at most 2 --disk images\n"); return 1; }
+        }
         else if (!strcmp(argv[i], "--screenshot") && i + 1 < argc)
             shot_path = argv[++i];
         else if (!strcmp(argv[i], "--max-cycles") && i + 1 < argc)
@@ -404,17 +526,39 @@ int main(int argc, char **argv) {
                     rom_path, rlen);
         }
         free(rom);
-        if (disk_path) {
+        /* Drive 1 (the boot disk) goes in at reset. */
+        if (n_disks >= 1) {
             u8 *disk = NULL; u32 dlen = 0;
-            if (read_file(disk_path, &disk, &dlen) != 0) {
-                fprintf(stderr, "failed to read disk %s\n", disk_path);
+            if (read_file(disk_path[0], &disk, &dlen) != 0) {
+                fprintf(stderr, "failed to read disk %s\n", disk_path[0]);
                 return 2;
             }
-            if (mac_insert_disk(&mem, disk, dlen, false))
-                fprintf(stderr, "[host] inserted floppy %s (%u bytes)\n",
-                        disk_path, dlen);
+            if (mac_insert_disk_drive(&mem, 0, disk, dlen, false))
+                fprintf(stderr, "[host] inserted floppy %s into drive 1 "
+                        "(%u bytes)\n", disk_path[0], dlen);
             free(disk);
         }
+        /* Resolve the drive-2 disk (inserted after boot — see
+         * service_hd_insert): an explicit 2nd --disk / MAC68K_DISK2 /
+         * MAC68K_HD, else an "InfiniteHD6.dsk" sitting next to the boot
+         * disk. Disable the auto-detect with MAC68K_NO_HD. */
+        if (getenv("MAC68K_DISK2"))    g_hd_path = getenv("MAC68K_DISK2");
+        else if (n_disks >= 2)         g_hd_path = disk_path[1];
+        else if (getenv("MAC68K_HD"))  g_hd_path = getenv("MAC68K_HD");
+        else if (!getenv("MAC68K_NO_HD") && n_disks >= 1) {
+            static char hd[1100];
+            const char *slash = strrchr(disk_path[0], '/');
+            int dl = slash ? (int)(slash - disk_path[0]) + 1 : 0;
+            snprintf(hd, sizeof(hd), "%.*sInfiniteHD6.dsk",
+                     dl, disk_path[0]);
+            FILE *t = fopen(hd, "rb");
+            if (t) { fclose(t); g_hd_path = hd; }
+        }
+        if (getenv("MAC68K_DISK2_CYCLE"))
+            g_hd_cycle = strtoull(getenv("MAC68K_DISK2_CYCLE"), NULL, 0);
+        if (g_hd_path)
+            fprintf(stderr, "[host] drive 2 = %s (inserted after boot)\n",
+                    g_hd_path);
     } else {
         u8 img[DEMO_ROM_MAX];
         u32 len = demo_rom_build(img, mem.fb_base);
@@ -438,14 +582,17 @@ int main(int argc, char **argv) {
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
     m68k_dispatcher disp;
-    if (use_jit) {
-        if (!m68k_dispatcher_init(&disp, &cpu)) {
-            fprintf(stderr, "JIT init failed\n");
-            return 4;
-        }
-        m68k_dispatcher_run_until(&disp, max_cycles);
-    } else {
-        m68k_run_until(&cpu, max_cycles);
+    if (use_jit && !m68k_dispatcher_init(&disp, &cpu)) {
+        fprintf(stderr, "JIT init failed\n");
+        return 4;
+    }
+    /* Run in chunks so the drive-2 disk can be inserted after boot. */
+    while (cpu.cycles < max_cycles && !cpu.halted) {
+        u64 next = cpu.cycles + 4000000ull;
+        if (next > max_cycles) next = max_cycles;
+        if (use_jit) m68k_dispatcher_run_until(&disp, next);
+        else         m68k_run_until(&cpu, next);
+        service_hd_insert(&mem, &cpu);
     }
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
