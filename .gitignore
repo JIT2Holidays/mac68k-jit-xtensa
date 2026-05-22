@@ -1,0 +1,22 @@
+# Host build
+/build/
+
+# ESP-IDF build artifacts
+/port/esp32s3/build/
+/port/esp32s3/sdkconfig
+/port/esp32s3/sdkconfig.old
+/port/esp32s3/dependencies.lock
+/port/esp32s3/managed_components/
+
+# Copyrighted ROM / disk images — not distributed with the project
+/roms/*.ROM
+/roms/*.bin
+/roms/disks/
+
+# Editor / OS
+.DS_Store
+.cache/
+compile_commands.json
+*.o
+*.a
+*.bmp

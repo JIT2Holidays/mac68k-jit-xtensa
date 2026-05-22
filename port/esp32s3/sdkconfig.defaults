@@ -1,0 +1,22 @@
+# mac68k-jit-xtensa — ESP32-S3 target defaults.
+CONFIG_IDF_TARGET="esp32s3"
+
+# Console on UART0 — qemu-system-xtensa wires this to stdio via -serial.
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+
+# -O2 for the interpreter + JIT hot paths.
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# The JIT codecache lives in IRAM and is allocated MALLOC_CAP_EXEC; keep
+# the memory-protection feature off so executing from that heap is allowed
+# (also required for the EXEC allocation to succeed under qemu).
+CONFIG_ESP_SYSTEM_MEMPROT_FEATURE=n
+
+# The dispatcher's run loop has no yield points — disable both watchdogs.
+CONFIG_ESP_INT_WDT=n
+CONFIG_ESP_TASK_WDT_EN=n
+
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=12288
+
+# Run at the rated 240 MHz.
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y

@@ -1,0 +1,6 @@
+CompileFlags:
+  Add:
+    - "-I/Users/yukidama/github/mac68k-jit-xtensa/include"
+    - "-I/Users/yukidama/github/mac68k-jit-xtensa/core"
+    - "-I/Users/yukidama/github/mac68k-jit-xtensa/jit"
+    - "-xc"

@@ -1,0 +1,42 @@
+#ifndef M68K_INTERP_H
+#define M68K_INTERP_H
+
+#include "m68k_types.h"
+#include "m68k_cpu.h"
+
+/* Reference Motorola 68000 interpreter.
+ *
+ * This is the correctness oracle: the JIT's differential test runs guest
+ * code under both this interpreter and the JIT and diffs the register
+ * file. It is also the JIT's fallback — gbjit-style, the JIT emits a
+ * CALLX0 to m68k_step for any instruction it does not translate inline. */
+
+/* Execute exactly one instruction at cpu->pc. Advances pc and cycles.
+ * Does NOT poll for interrupts — the run loop / dispatcher owns that so a
+ * JIT block can call this per-instruction without surprise control flow. */
+void m68k_step(m68k_cpu *cpu);
+
+/* Run the pure interpreter until cpu->cycles >= until or the CPU halts.
+ * Polls interrupts and ticks the peripherals between instructions. */
+void m68k_run_until(m68k_cpu *cpu, u64 until);
+
+/* Service a pending interrupt if its level outranks the SR mask. Returns
+ * true if an interrupt was taken. The dispatcher calls this between
+ * blocks; m68k_run_until calls it between instructions. */
+bool m68k_poll_interrupts(m68k_cpu *cpu);
+
+/* Raise a CPU exception: push the frame and vector through (vector*4). */
+void m68k_exception(m68k_cpu *cpu, u32 vector);
+
+/* Decode just enough of the instruction at `pc` to drive the JIT's basic-
+ * block discovery: total length in bytes, and whether it ends a block
+ * (any branch / jump / return / trap / stop). */
+typedef struct m68k_decoded {
+    u32  length;       /* instruction size in bytes (>=2) */
+    bool ends_block;   /* control-flow instruction — terminates the block */
+    u16  opcode;       /* the first instruction word */
+} m68k_decoded;
+
+m68k_decoded m68k_decode_at(m68k_cpu *cpu, u32 pc);
+
+#endif
