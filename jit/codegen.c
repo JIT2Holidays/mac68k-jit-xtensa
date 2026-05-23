@@ -785,6 +785,74 @@ static void emit_immlogic_bw_dn(xt_emit *e, int dn, u32 imm, int size,
     emit_advance(e, 4, 8);
 }
 
+/* Number of bytes the helper-path Bcc tail (emit_cond + branchless tail)
+ * emits, used to pre-compute the beqz skip distance in fused CMP arms.
+ * Must match the actual emit byte-for-byte. */
+static u32 fused_helper_bcc_tail_size(int cc) {
+    u32 cond_size;
+    switch (cc) {
+        case 13: cond_size = 9;  break;  /* BLT: extui V + extui N + xor */
+        case 15: cond_size = 15; break;  /* BLE: extui V + extui Z + extui N + xor + or */
+        default: return 0;
+    }
+    /* emit_bcc_branchless_tail: 22 ops × 3 = 66 bytes (when disp i8 + base_cyc i8). */
+    return cond_size + 66;
+}
+
+/* CMP+Bcc fused condition compute. Given s/d/r registers (shifted-to-high
+ * for .W compares, so bit 31 is the sign/result-of-interest), produces
+ * `cond` (0 or 1) in a8 without writing R_SR. Saves the ~12 ops of
+ * emit_addsub_flags_long_masked's pack/mask + the 3-5 ops of emit_cond's
+ * R_SR extraction. Clobbers a8, a11, a12. */
+static void emit_cmp_cond_fused(xt_emit *e, int cc, u8 s, u8 d, u8 r) {
+    /* For .W CMP, the operands are shifted to bit 31 = high bit, so:
+     *   V at bit 31 = (s^d) & (d^r)
+     *   N at bit 31 = r itself
+     *   Z = (r == 0)
+     * BLT (13) = N^V; BLE (15) = Z | (N^V). */
+    xt_xor (e, 11, s, d);
+    xt_xor (e, 12, d, r);
+    xt_and (e, 11, 11, 12);            /* bit 31 = V */
+    xt_xor (e, 11, 11, r);             /* bit 31 = N^V */
+    xt_extui(e, 8, 11, 31, 0);         /* a8 = N^V (0 or 1) */
+    if (cc == 15) {                    /* BLE — OR in Z */
+        xt_bnez(e, r, 6);              /* skip movi if r != 0 */
+        xt_movi(e, 8, 1);              /* a8 = 1 (Z is set; cond = 1) */
+    }
+    sext_memo_invalidate();
+}
+
+/* Bcc.S branchless PC + cycle update. Pre-condition: a8 = cond (0 or 1).
+ * Writes cpu->pc = (cond ? taken : ft) and cpu->cycles += base_cyc + cond*2.
+ * `ft` is the fall-through PC, `disp` is the i8 displacement from the Bcc,
+ * `base_cyc` is the not-taken cycle cost folded with any prior absorbed
+ * cycles (e.g. a fused CMP's 8 + Bcc's 12 = 20). Clobbers a8..a13. */
+static void emit_bcc_branchless_tail(xt_emit *e, u32 ft, i32 disp, i32 base_cyc) {
+    xt_movi(e, 10, 0);
+    xt_sub (e, 9, 10, 8);                       /* a9 = mask = 0 - cond */
+    emit_load_imm32(e, 10, 11, ft);             /* a10 = ft */
+    if (disp >= -128 && disp <= 127) {
+        xt_addi(e, 12, 10, disp);               /* a12 = ft + disp = taken */
+    } else {
+        u32 taken = ft + (u32)disp;
+        emit_load_imm32(e, 12, 11, taken);
+    }
+    xt_xor (e, 13, 10, 12);
+    xt_and (e, 13, 13, 9);
+    xt_xor (e, 10, 10, 13);                     /* pc = ft ^ (diff & mask) */
+    xt_s32i(e, 10, R_CPU, OFF_PC);
+    xt_l32i(e, 11, R_CPU, OFF_CYCLES);
+    if (base_cyc >= -128 && base_cyc <= 127) {
+        xt_addi(e, 11, 11, base_cyc);
+    } else {
+        emit_load_imm(e, 10, 12, (u32)base_cyc);
+        xt_add(e, 11, 11, 10);
+    }
+    xt_slli(e, 8, 8, 1);
+    xt_add (e, 11, 11, 8);
+    xt_s32i(e, 11, R_CPU, OFF_CYCLES);
+}
+
 /* Compute the 68000 condition `cc` (2..15) as a 0/1 boolean into a8.
  * Clobbers a9..a12. CCR bits in cpu->sr (cached in R_SR): C=0, V=1, Z=2, N=3. */
 static void emit_cond(xt_emit *e, int cc) {
@@ -849,31 +917,8 @@ static void emit_branch(xt_emit *e, u32 op_pc, u16 w) {
         return;
     }
     emit_cond(e, cc);                           /* a8 = cond (0/1) */
-    xt_movi(e, 10, 0);
-    xt_sub (e, 9, 10, 8);                       /* a9 = mask = 0 - cond */
-    emit_load_imm32(e, 10, 11, ft);             /* a10 = fall-through */
-    /* taken = ft + disp; if disp fits in 8-bit signed (Bcc.S always does),
-     * derive a12 via a single xt_addi instead of a 4-op emit_load_imm32. */
-    if (disp >= -128 && disp <= 127) {
-        xt_addi(e, 12, 10, disp);               /* a12 = ft + disp = taken */
-    } else {
-        emit_load_imm32(e, 12, 11, taken);
-    }
-    xt_xor (e, 13, 10, 12);                     /* diff = ft ^ taken */
-    xt_and (e, 13, 13, 9);                      /* diff & mask */
-    xt_xor (e, 10, 10, 13);                     /* pc = ft ^ (diff & mask) */
-    xt_s32i(e, 10, R_CPU, OFF_PC);
-    xt_l32i(e, 11, R_CPU, OFF_CYCLES);          /* cycles += 12 + cond*2 + extra */
-    i32 base_cyc = 12 + extra_cyc;
-    if (base_cyc >= -128 && base_cyc <= 127) {
-        xt_addi(e, 11, 11, base_cyc);
-    } else {
-        emit_load_imm(e, 10, 12, (u32)base_cyc);
-        xt_add(e, 11, 11, 10);
-    }
-    xt_slli(e, 8, 8, 1);
-    xt_add (e, 11, 11, 8);
-    xt_s32i(e, 11, R_CPU, OFF_CYCLES);
+    emit_bcc_branchless_tail(e, ft, disp, 12 + extra_cyc);
+    (void)taken;
 }
 
 /* ADDQ.W / SUBQ.W #imm,Dn — modify the low 16 bits of Dn, full CCR.
@@ -1502,11 +1547,38 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             /* CMP.W (d16,An),Dn — bench-hot 0xBC6D (~6.8 %).
              *   EA = a[an] + sext16(d16); read .W; sext to 32; compare
              *   against d[dn].W shifted to high 16 via the existing
-             *   shift trick; emit_addsub_flags_long(sub, keep_x). */
+             *   shift trick; emit_addsub_flags_long(sub, keep_x).
+             *
+             * CMP+Bcc fusion: when followed by Bcc.S LT (the bench tail
+             * pattern at 0x03DF58 / 0x03DF5E), skip the R_SR write and
+             * compute the condition bit directly from (s, d, r). Saves
+             * ~10 ops per fast-path execution. */
             int dn = (w >> 9) & 7;
             int an = w & 7;
             u16 ext = mac_read16(cpu->mem, op_pc[i] + 2);
             i32 d16 = (i16)ext;
+
+            /* Fusion eligibility — next op is Bcc.S BLT/BLE with i8 disp. */
+            bool fuse = false;
+            int fuse_cc = 0;
+            i32 fuse_disp = 0;
+            u32 fuse_ft = 0;
+            if (i + 1 < n_ops) {
+                u16 nw = op_word[i + 1];
+                if ((nw >> 12) == 0x6) {
+                    int cc = (nw >> 8) & 0xF;
+                    i32 disp = (i8)(nw & 0xFF);
+                    /* BLT (cc=13) — bench's 0x03DF58 / 0x03DF5E.
+                     * BLE (cc=15) — bench's 0x03DF40 (paired with the other
+                     *               CMP arm but BLE also possible here). */
+                    if ((cc == 13 || cc == 15) && disp != 0 && disp != -1) {
+                        fuse = true;
+                        fuse_cc = cc;
+                        fuse_disp = disp;
+                        fuse_ft = op_pc[i + 1] + 2;
+                    }
+                }
+            }
 
             emit_advance_flush(&e);                  /* before An read */
             emit_read_g(&e, &rc, G_A(an), 8);
@@ -1518,9 +1590,24 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             xt_and  (&e, 10, 8, 9);
             emit_cache_flush(&e, &rc);   /* before conditional helper */
             i32 op_pc_cwd = 4, op_cyc_cwd = 8;
-            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_cwd, op_cyc_cwd)));
+            u32 helper_skip = helper_step_after_flush_undo_size(&rc, op_pc_cwd, op_cyc_cwd);
+            u32 helper_bcc_tail_size = fuse ? fused_helper_bcc_tail_size(fuse_cc) : 0;
+            xt_beqz (&e, 10, (i32)(6u + helper_skip + helper_bcc_tail_size));
             emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
                                               entry_off, &rc, op_pc_cwd, op_cyc_cwd);
+            if (fuse) {
+                /* Helper-path Bcc tail. The bridge already reloaded R_SR
+                 * (CMP wrote it), so emit_cond reads CMP's flags. The
+                 * bridge also undid m68k_step's natural advance, so the
+                 * accumulator is 0; we fold CMP's 8 + Bcc's 12 into 20. */
+                u32 before = e.len;
+                emit_cond(&e, fuse_cc);
+                emit_bcc_branchless_tail(&e, fuse_ft, fuse_disp, 20);
+                /* Sanity: must match the size promised to xt_beqz above. */
+                if (e.len - before != helper_bcc_tail_size) {
+                    e.overflow = true;   /* abort compile, dispatcher falls back */
+                }
+            }
             u32 jcwd_pos = e.len;
             xt_j(&e, 4);
             /* fast path */
@@ -1535,8 +1622,13 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             emit_read_g(&e, &rc, G_D(dn), 9);
             xt_slli (&e, 9, 9, 16);          /* a9 = d shifted */
             xt_sub  (&e, 10, 9, 8);
-            emit_addsub_flags_long_masked(&e, true, true, 8, 9, 10, flags_needed[i]);
-            emit_advance(&e, op_pc_cwd, op_cyc_cwd);
+            if (fuse) {
+                emit_cmp_cond_fused(&e, fuse_cc, 8, 9, 10);
+                emit_bcc_branchless_tail(&e, fuse_ft, fuse_disp, 20);
+            } else {
+                emit_addsub_flags_long_masked(&e, true, true, 8, 9, 10, flags_needed[i]);
+                emit_advance(&e, op_pc_cwd, op_cyc_cwd);
+            }
 
             u32 cwd_here = e.len;
             i32 cwd_off = (i32)(cwd_here - jcwd_pos) - 4;
@@ -1544,6 +1636,15 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + jcwd_pos    ] = (u8)cww;
             base[entry_off + jcwd_pos + 1] = (u8)(cww >> 8);
             base[entry_off + jcwd_pos + 2] = (u8)(cww >> 16);
+
+            if (fuse) {
+                /* Bcc.S has set cpu->pc directly and absorbed all cycles —
+                 * reset accumulator so any subsequent ops (none expected,
+                 * Bcc ends the block) don't double-account. */
+                g_pc_acc = 0;
+                g_cyc_acc = 0;
+                i++;   /* skip the Bcc.S we just fused away */
+            }
 
             inline_ops++; done = true;
         } else if (top == 0xB && szf == 1 && ((w >> 8) & 1) == 0 && mode == 2) {
@@ -1554,6 +1655,26 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             int dn = (w >> 9) & 7;
             int an = w & 7;
 
+            /* Fusion eligibility (BLT/BLE.S) — bench's 0x03DF40 ends with
+             * CMP.W (A2),D5 + BLE.S +6 (cc=15, 405 K hits). */
+            bool fuse = false;
+            int fuse_cc = 0;
+            i32 fuse_disp = 0;
+            u32 fuse_ft = 0;
+            if (i + 1 < n_ops) {
+                u16 nw = op_word[i + 1];
+                if ((nw >> 12) == 0x6) {
+                    int cc = (nw >> 8) & 0xF;
+                    i32 disp = (i8)(nw & 0xFF);
+                    if ((cc == 13 || cc == 15) && disp != 0 && disp != -1) {
+                        fuse = true;
+                        fuse_cc = cc;
+                        fuse_disp = disp;
+                        fuse_ft = op_pc[i + 1] + 2;
+                    }
+                }
+            }
+
             emit_advance_flush(&e);                  /* before An read */
             emit_read_g(&e, &rc, G_A(an), 8);
             emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
@@ -1561,10 +1682,22 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             xt_and  (&e, 10, 8, 9);
             emit_cache_flush(&e, &rc);   /* before conditional helper */
             i32 op_pc_cw = 2, op_cyc_cw = 8;
-            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_cw, op_cyc_cw)));
+            u32 helper_skip_cw = helper_step_after_flush_undo_size(&rc, op_pc_cw, op_cyc_cw);
+            u32 helper_bcc_tail_cw = fuse ? fused_helper_bcc_tail_size(fuse_cc) : 0;
+            xt_beqz (&e, 10, (i32)(6u + helper_skip_cw + helper_bcc_tail_cw));
             /* helper */
             emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
                                               entry_off, &rc, op_pc_cw, op_cyc_cw);
+            if (fuse) {
+                u32 before = e.len;
+                emit_cond(&e, fuse_cc);
+                /* op_pc_cw = 2 (CMP.W (An),Dn is 2 bytes), op_cyc_cw = 8.
+                 * Bcc.S base 12 cycles. Fold: 8 + 12 = 20. */
+                emit_bcc_branchless_tail(&e, fuse_ft, fuse_disp, 20);
+                if (e.len - before != helper_bcc_tail_cw) {
+                    e.overflow = true;
+                }
+            }
             /* j over fast — backpatched below. */
             u32 j_pos = e.len;
             xt_j    (&e, 4);   /* placeholder */
@@ -1580,8 +1713,13 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             emit_read_g(&e, &rc, G_D(dn), 9);
             xt_slli (&e, 9, 9, 16);            /* a9 = d shifted */
             xt_sub  (&e, 10, 9, 8);            /* a10 = r shifted */
-            emit_addsub_flags_long_masked(&e, true, true, 8, 9, 10, flags_needed[i]);
-            emit_advance(&e, op_pc_cw, op_cyc_cw);
+            if (fuse) {
+                emit_cmp_cond_fused(&e, fuse_cc, 8, 9, 10);
+                emit_bcc_branchless_tail(&e, fuse_ft, fuse_disp, 20);
+            } else {
+                emit_addsub_flags_long_masked(&e, true, true, 8, 9, 10, flags_needed[i]);
+                emit_advance(&e, op_pc_cw, op_cyc_cw);
+            }
             /* backpatch the j-over-helper to land here. */
             u32 here = e.len;
             i32 j_off = (i32)(here - j_pos) - 4;
@@ -1589,6 +1727,12 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + j_pos    ] = (u8)jw;
             base[entry_off + j_pos + 1] = (u8)(jw >> 8);
             base[entry_off + j_pos + 2] = (u8)(jw >> 16);
+
+            if (fuse) {
+                g_pc_acc = 0;
+                g_cyc_acc = 0;
+                i++;
+            }
 
             inline_ops++; done = true;
         } else if (top == 0x3 && ((w >> 6) & 7) == 0 && mode == 6) {

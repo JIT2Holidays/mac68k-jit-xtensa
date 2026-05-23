@@ -171,7 +171,9 @@ instr/cyc on the target; helper-cost proxy `M68K_JIT_HELPER_LX7_COST = 64`).
 | JIT M6.23 (sext memoization extended to LEA + MOVE.W (d8,An,Xn)) | 1.778 | 17.23 × | 4.552 | 6.73 × |
 | JIT M6.25 (Bcc.S taken = ft + disp via addi) | 1.653 | 18.53 × | 4.453 | 6.88 × |
 | JIT M6.26 (emit_cond extracts only the CCR bits the cc actually reads) | 1.632 | 18.77 × | 4.429 | 6.92 × |
-| **JIT M6.27 (current — MOVE.W (As),(Ad) skip .W assembly when flags_dead)** | **1.625** | **18.85 ×** | **4.429** | **6.92 ×** |
+| JIT M6.27 (MOVE.W (As),(Ad) skip .W assembly when flags_dead) | 1.625 | 18.85 × | 4.429 | 6.92 × |
+| JIT M6.28 (CMP.W (d16,An),Dn + BLT.S fusion) | 1.550 | 19.76 × | 4.429 | 6.92 × |
+| **JIT M6.29 (current — fusion extended to BLE.S and CMP.W (An),Dn)** | **1.455** | **21.05 ×** | **4.429** | **6.92 ×** |
 | Goal: 5 × interp on bench       | 1.32            | **23.2 ×**       | 1.18           | **25.9 ×**      |
 
 **Mac Plus speed already cleared** (>1 ×) by the interpreter alone —
@@ -1012,15 +1014,85 @@ Cumulative session win **M6.2 → M6.27**:
 * Bench `4.008 → 1.625 lx7/cyc` (**+59.5 %**), 7.64 × → **18.85 × Mac Plus**.
 * Boot  `5.376 → 4.429 lx7/cyc` (**+17.6 %**), 5.70 × → **6.92 × Mac Plus**.
 
-**Next target (M6.28+): CMP+Bcc fusion for the bench tail.** The hot
-loop ends with CMP.W (An),Dn + BLE / CMP.W (d16,An),Dn + BLT — the
-CMP writes ~11 ops to update R_SR via the bits-needed mask, then the
-Bcc reads R_SR via emit_cond (4 ops) and computes the condition bit
-(1–2 ops). If the CMP arm sees a following Bcc.S of a compatible cc,
-it can skip the R_SR write entirely and compute the condition bit
-straight from the (s, d, r) operands already in registers, saving
-roughly 10 ops per execution on the 809 K bench tail Bccs. Expected
-drop: 1.625 → ~1.49 lx7/cyc, ~20.5 × Mac Plus.
+**M6.28 — CMP.W (d16,An),Dn + BLT.S fusion (delivered).** Bench's
+hot blocks 0x03DF58 (212 K hits) and 0x03DF5E (192 K hits) both end
+with CMP.W (d16,A5),D6 followed by BLT.S −38 — the loop terminator.
+Previously: the CMP emits emit_addsub_flags_long_masked (~12 ops for
+the N|V mask), then the Bcc.S emits emit_cond (3 ops to extract V,N
+and xor) + branchless tail (22 ops). Total 37 ops per fast path.
+
+Fused: the CMP arm peeks at op[i+1]. If it's Bcc.S BLT (cc=13) with
+an i8 disp, it computes the condition bit (N XOR V = bit 31 of
+`(s^d)&(d^r)^r`) directly from the (s, d, r) registers already in
+hand, extracts to a8 (5 ops), and emits the standard branchless tail
+(22 ops, with base_cyc = 8 CMP + 12 Bcc = 20). Helper path is
+unchanged structurally — bridge reloads R_SR with CMP's flags, then
+emit_cond + branchless tail run as if the Bcc were emitted separately,
+but inlined into the same arm (saves a redundant emit_advance write).
+
+Refactored emit_branch to call a shared `emit_bcc_branchless_tail`
+helper so the new fused tail emits identical code to the old Bcc.S
+tail (cycle count and PC computation are byte-for-byte equivalent
+when base_cyc = 12 + extra). The helper-path tail in the fused arm
+emits exactly 25 ops × 3 = 75 bytes; the beqz skip distance is
+pre-computed from `helper_step_size + 75 + 6` so no back-patching is
+needed.
+
+Savings: 10 ops per fast-path execution. With ~404 K BLT execs in
+bench's hot loop, ~4 M LX7 ops shaved; `xt_instrs` dropped 92.42 M →
+87.94 M (−4.86 %), bench `lx7/cyc` 1.625 → **1.550 (−4.6 %)**, boot
+unchanged (no boot blocks match this fusion pattern).
+
+| Engine | M6.27   | **M6.28**   | × Mac Plus    | delta |
+|--------|--------:|------------:|--------------:|------:|
+| Bench  | 1.625   | **1.550**   | **19.76 ×**   | **+4.6 %** |
+| Boot   | 4.429   | **4.429**   | **6.92 ×**    | unchanged |
+
+`--diff-jit-trace` matches baseline through step 544. ctest 3/3.
+
+Cumulative session win **M6.2 → M6.28**:
+* Bench `4.008 → 1.550 lx7/cyc` (**+61.3 %**), 7.64 × → **19.76 × Mac Plus**.
+* Boot  `5.376 → 4.429 lx7/cyc` (**+17.6 %**), 5.70 × → **6.92 × Mac Plus**.
+
+**M6.29 — fusion extended to BLE.S and CMP.W (An),Dn (delivered).**
+The (An),Dn arm gets the same `fuse` peek and dual-path emit; BLE
+(cc=15) computes the Z bit branchlessly via `bnez r, +6 / movi a8, 1`
+(2 ops to OR in Z to the already-computed N^V). Both CMP.W arms now
+handle BLT/BLE end-of-block fusion, plus the bench's 0x03DF40 (the
+biggest single hot block at 405 K hits) is fully fused.
+
+Factored out two helpers — `fused_helper_bcc_tail_size(cc)` and
+`emit_cmp_cond_fused(cc, s, d, r)` — so the per-cc emit byte counts
+stay declarative and easy to audit.
+
+Savings: 10 ops per fast-path execution × ~810 K BLT+BLE bench execs
+= ~8 M LX7 ops; `xt_instrs` 87.94 M → 82.24 M (−6.5 %), bench
+`lx7/cyc` 1.550 → **1.455 (−6.1 %)**, boot unchanged. Long-run bench
+(300 M cycles, full Speedometer post-hot-loop tail) stays stable; long
+boot completes 300 M cycles with 1118 arena resets (normal).
+
+| Engine | M6.28   | **M6.29**   | × Mac Plus    | delta |
+|--------|--------:|------------:|--------------:|------:|
+| Bench  | 1.550   | **1.455**   | **21.05 ×**   | **+6.1 %** |
+| Boot   | 4.429   | **4.429**   | **6.92 ×**    | unchanged |
+
+`--diff-jit-trace` matches baseline through step 544. ctest 3/3.
+
+Cumulative session win **M6.2 → M6.29**:
+* Bench `4.008 → 1.455 lx7/cyc` (**+63.7 %**), 7.64 × → **21.05 × Mac Plus**.
+* Boot  `5.376 → 4.429 lx7/cyc` (**+17.6 %**), 5.70 × → **6.92 × Mac Plus**.
+
+**Goal**: 5 × interp = 23.2 × Mac Plus = 1.32 lx7/cyc.
+Remaining gap: 1.455 → 1.32 = 0.135 (9.3 %). Single-digit % away from
+the 5 × target on bench.
+
+**Next target (M6.30+):** Further fusion candidates: CMPA.W (d16,An),An
++ Bcc (bench's 0xBC6D arm), CMP.L Dm,Dn + Bcc.S, plus extending the
+CMP+Bcc cc coverage to the four remaining sign comparisons (BEQ/BNE
+cc=6/7 — Z only; BGE/BGT cc=12/14). The Z-only ones are cheap (1 op
+vs 5–7 currently). Also worth profiling: the prologue's
+`emit_sr_reload` skip when the block doesn't read R_SR (saves 1 op
+per execution × all blocks).
 
 Profiled bench's hot-block distribution (per `block_executed`):
 
