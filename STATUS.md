@@ -206,13 +206,14 @@ instr/cyc on the target; helper-cost proxy `M68K_JIT_HELPER_LX7_COST = 64`).
 | JIT M6.47 (MOVE.W (An)+,Dn fast helper for MMIO reads) | 1.289 | 23.76 × | 1.721 | 17.80 × |
 | JIT M6.48 (MOVE.L Dn,-(An) push pattern) | 1.289 | 23.76 × | 1.721 | 17.80 × |
 | JIT M6.49 (MOVE.L push/pop extended to An source) | 1.287 | 23.80 × | 1.721 | 17.80 × |
-| **JIT M6.50 (current — inline RTS — return from subroutine)** | **1.281** | **23.91 ×** | **1.721** | **17.80 ×** |
+| JIT M6.50 (inline RTS — return from subroutine) | 1.281 | 23.91 × | 1.721 | 17.80 × |
+| **JIT M6.51 (current — inline JMP (xxx).L)** | **1.279** | **23.95 ×** | **1.721** | **17.80 ×** |
 
 ### Real-cost view (from M6.41's `real_lx7_per_cyc`)
 
-| Engine | M6.40 | M6.45 | M6.47 | M6.49 | M6.50 | M6.50 × Mac Plus |
+| Engine | M6.40 | M6.45 | M6.47 | M6.49 | M6.51 | M6.51 × Mac Plus |
 |--------|------:|------:|------:|------:|------:|-----------------:|
-| Bench  | 1.293 | 1.289 | 1.289 | 1.288 | **1.282** | **23.89 ×**       |
+| Bench  | 1.293 | 1.289 | 1.289 | 1.288 | **1.279** | **23.95 ×**       |
 | Boot   | 3.092 | 1.945 | 1.727 | 1.727 | **1.727** | **17.74 ×** 🎯    |
 
 The displayed metric is now diverging from real cost. Boot displayed
