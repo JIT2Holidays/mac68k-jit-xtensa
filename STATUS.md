@@ -185,14 +185,25 @@ instr/cyc on the target; helper-cost proxy `M68K_JIT_HELPER_LX7_COST = 64`).
 | JIT M6.40 (inline MOVEM family with size gating) 🚀 | 1.289 | 23.76 × | 1.756 | 17.44 × |
 | JIT M6.41 (diagnostic: print real helper count from cpu->instrs) | 1.289 | 23.76 × | 1.756 | 17.44 × |
 | JIT M6.42 (fast-path MMIO helper for ORI.B (d16,An)) ✨ | 1.289 | 23.76 × | 1.734 | 17.66 × |
-| **JIT M6.43 (current — fast-path MMIO helper for BTST (d16,An))** ✨ | **1.289** | **23.76 ×** | **1.723** | **17.78 ×** |
+| JIT M6.43 (fast-path MMIO helper for BTST (d16,An)) ✨ | 1.289 | 23.76 × | 1.723 | 17.78 × |
+| **JIT M6.44 (current — MOVEM fast helpers, large-reglist arms only)** | **1.289** | **23.76 ×** | **1.723** | **17.78 ×** |
 
 ### Real-cost view (from M6.41's `real_lx7_per_cyc`)
 
-| Engine | M6.40 real lx7/cyc | M6.42 real | M6.43 real | M6.43 × Mac Plus |
-|--------|-------------------:|-----------:|-----------:|-----------------:|
-| Bench  | 1.293              | 1.293      | 1.293      | **23.69 ×**       |
-| Boot   | 3.092              | 2.599      | **2.358**  | **12.99 ×**       |
+| Engine | M6.40 real | M6.42 real | M6.43 real | M6.44 real | M6.44 × Mac Plus |
+|--------|-----------:|-----------:|-----------:|-----------:|-----------------:|
+| Bench  | 1.293      | 1.293      | 1.293      | 1.293      | **23.69 ×**       |
+| Boot   | 3.092      | 2.599      | 2.358      | **2.358**  | **12.99 ×**       |
+
+**M6.44 note**: The fast helpers (one each for MOVEM.L (An)+, .L/-(An),
+and .W (An)) are wired up and ~150 large-reglist MOVEMs route through
+them at runtime. But the bulk of boot's 524 K MOVEM helper executions
+turn out to be from the **small-N inline arms' conditional bounds-
+fail bridges** hitting MMIO targets, *not* the large-N fallthrough.
+
+Next iteration: redirect those bounds-fail bridges from `m68k_step`
+to the fast helpers, which should capture ~500 K m68k_step calls per
+60 M-cycle boot run.
 | Goal: 5 × interp on bench       | 1.32            | **23.2 ×**       | 1.18           | **25.9 ×**      |
 
 **Mac Plus speed already cleared** (>1 ×) by the interpreter alone —
