@@ -2773,7 +2773,7 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             if (!flags_dead[i]) {
                 emit_addsub_flags_long(&e, is_sub, false);
             }
-            emit_advance(&e, 2, 4);
+            emit_advance(&e, 2, 8);   /* m68k_step base 4 + handler 4 = 8 */
             inline_ops++; done = true;
         } else if (top == 0x4 && ((w >> 8) & 0xF) == 0xA && szf == 2 && mode == 0) {
             /* TST.L Dn — bench-warm 0x4A80/0x4A81 (~4 K). N/Z from Dn,
