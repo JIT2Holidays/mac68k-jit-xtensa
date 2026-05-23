@@ -15,6 +15,20 @@ does not beat the interpreter: every non-inlined opcode is a `CALLX0`
 into `m68k_step`, and a block pays a full dispatch round-trip per
 iteration. The work below closes that gap.
 
+### Session result — M6.2 → M6.49 (real-cost basis, post-M6.41 metric correction)
+
+| Engine | Start (M6.2) | Current (M6.49) | Ratio | × Mac Plus | × Interp |
+|--------|-------------:|----------------:|------:|-----------:|---------:|
+| Bench  | 4.008 lx7/cyc | **1.288 lx7/cyc** | **3.11 ×** | **23.78 ×** | **5.13 ×** ✅ |
+| Boot   | 5.376 lx7/cyc | **1.727 lx7/cyc** | **3.11 ×** | **17.74 ×** | **3.43 ×** |
+
+Both engines coincidentally tripled in real performance. Bench cleared
+the user's 5×-interp goal at M6.31 (M6.49 stretches it to 5.13 ×).
+Boot's gains came from a sequence of inline expansions and finally a
+specialised "fast-path MMIO helper" framework (M6.42–M6.47) that
+bypasses `m68k_step`'s decode overhead for the common VIA-register
+read/write paths.
+
 ## Benchmark
 
 The optimisation loop measures the JIT on two workloads:
