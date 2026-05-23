@@ -1354,6 +1354,8 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             b1 |= (top == 0x9 && sf == 2 && !((w >> 8) & 1) && mm == 0);  /* SUB.L Dm,Dn */
             b1 |= (top == 0xC && sf == 2 && !((w >> 8) & 1) && mm == 0);  /* AND.L Dm,Dn */
             b1 |= (top == 0x8 && sf == 2 && !((w >> 8) & 1) && mm == 0);  /* OR.L Dm,Dn */
+            b1 |= ((top == 0xD || top == 0x9) && sf == 1 && !((w >> 8) & 1) && mm == 0); /* ADD.W/SUB.W Dm,Dn */
+            b1 |= (top == 0x4 && ((w >> 8) & 0xF) == 0xA && sf == 2 && mm == 0); /* TST.L Dn */
             b1 |= (top == 0xB && sf == 2 && ((w >> 8) & 1) && mm == 0);   /* EOR.L Dn,Dm */
             b1 |= (top == 0x0 && !((w >> 8) & 1) && sf == 2 && mm == 0
                    && rr != 4 && rr != 7);                                 /* ORI/ANDI/ADDI/SUBI/EORI.L #imm32,Dn */
@@ -2333,6 +2335,36 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             xt_s32i(&e, 11, R_CPU, OFF_CYCLES);
 
             sext_memo_invalidate();
+            inline_ops++; done = true;
+        } else if ((top == 0xD || top == 0x9) && szf == 1
+                   && !((w >> 8) & 1) && mode == 0) {
+            /* ADD.W / SUB.W Dm,Dn — boot-warm 0xD441 (~9 K). */
+            bool is_sub = (top == 0x9);
+            int dn = (w >> 9) & 7;
+            int dm = w & 7;
+            emit_read_g(&e, &rc, G_D(dm), 8);
+            emit_read_g(&e, &rc, G_D(dn), 11);
+            xt_slli(&e, 8, 8, 16);
+            xt_slli(&e, 9, 11, 16);
+            if (is_sub) xt_sub(&e, 10, 9, 8);
+            else        xt_add(&e, 10, 9, 8);
+            xt_srli(&e, 11, 11, 16);
+            xt_slli(&e, 11, 11, 16);
+            xt_extui(&e, 12, 10, 16, 15);
+            xt_or  (&e, 11, 11, 12);
+            emit_write_g(&e, &rc, G_D(dn), 11);
+            if (!flags_dead[i]) {
+                emit_addsub_flags_long(&e, is_sub, false);
+            }
+            emit_advance(&e, 2, 4);
+            inline_ops++; done = true;
+        } else if (top == 0x4 && ((w >> 8) & 0xF) == 0xA && szf == 2 && mode == 0) {
+            /* TST.L Dn — bench-warm 0x4A80/0x4A81 (~4 K). N/Z from Dn,
+             * V=C=0, X preserved. */
+            int dn = w & 7;
+            emit_read_g(&e, &rc, G_D(dn), 8);
+            if (!flags_dead[i]) emit_logic_flags(&e, 8);
+            emit_advance(&e, 2, 4);
             inline_ops++; done = true;
         } else if (top == 0xB && szf == 2 && !((w >> 8) & 1) && mode == 0) {
             /* CMP.L Dm,Dn */
