@@ -1602,6 +1602,65 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + jmm_pos + 2] = (u8)(mmw >> 16);
 
             inline_ops++; done = true;
+        } else if (top == 0x3 && ((w >> 6) & 7) == 0 && mode == 3) {
+            /* MOVE.W (An)+,Dn — boot-hot 0x3018 (~65 K). Same shape as
+             * the .W (An),Dn arm but with An post-increment by 2. */
+            int dn = (w >> 9) & 7;        /* dst Dn */
+            int an = w & 7;               /* src An (post-incr) */
+
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(an), 8);
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_wp = 2, op_cyc_wp = 8;
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_wp, op_cyc_wp)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_wp, op_cyc_wp);
+            u32 jwp_pos = e.len;
+            xt_j    (&e, 4);
+            /* Fast path: read 2 BE bytes into a10 (.W value). */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);
+            xt_l8ui (&e, 10, 9, 0);
+            xt_l8ui (&e, 11, 9, 1);
+            xt_slli (&e, 10, 10, 8);
+            xt_or   (&e, 10, 10, 11);                    /* a10 = .W */
+            {
+                int dn_xt = cache_lookup(&rc, G_D(dn));
+                u8 dn_reg = (dn_xt >= 0) ? (u8)dn_xt : 11;
+                if (dn_xt < 0) {
+                    emit_read_g(&e, &rc, G_D(dn), 11);
+                }
+                xt_srli(&e, dn_reg, dn_reg, 16);
+                xt_slli(&e, dn_reg, dn_reg, 16);
+                xt_or  (&e, dn_reg, dn_reg, 10);
+                if (dn_xt >= 0) {
+                    for (int s = 0; s < rc.active; s++)
+                        if (rc.guest[s] == (u8)G_D(dn)) { rc.dirty |= (u16)(1u << s); break; }
+                } else {
+                    emit_write_g(&e, &rc, G_D(dn), 11);
+                }
+            }
+            /* Post-increment An by 2. */
+            xt_addi (&e, 8, 8, 2);
+            emit_write_g(&e, &rc, G_A(an), 8);
+            if (!flags_dead[i]) {
+                xt_slli(&e, 8, 10, 16);
+                emit_logic_flags(&e, 8);
+            }
+            emit_advance(&e, op_pc_wp, op_cyc_wp);
+
+            u32 here_wp = e.len;
+            i32 jo_wp = (i32)(here_wp - jwp_pos) - 4;
+            u32 jwwp = ((u32)((u32)jo_wp & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jwp_pos    ] = (u8)jwwp;
+            base[entry_off + jwp_pos + 1] = (u8)(jwwp >> 8);
+            base[entry_off + jwp_pos + 2] = (u8)(jwwp >> 16);
+
+            inline_ops++; done = true;
         } else if (top == 0x2 && ((w >> 6) & 7) == 0 && mode == 3) {
             /* MOVE.L (An)+,Dn — common pair to the 0x20C1 store pattern.
              * Bounds-check the An address; on fast path read 4 BE bytes
