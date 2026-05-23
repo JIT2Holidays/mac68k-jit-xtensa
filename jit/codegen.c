@@ -348,14 +348,27 @@ static void emit_jit_fast_helper(xt_emit *e, u8 a8_arg1_reg, i32 imm2,
     emit_cache_reload(e, rc);
 }
 
+/* Size of an emit_load_imm(list) + emit_jit_fast_helper sequence —
+ * what the MOVEM small-N arms use to replace their m68k_step bridge
+ * with a fast-helper bridge. */
+static u32 emit_movem_fast_bridge_size(u32 list, const regcache *rc);
+
 /* Size in bytes (must match emit_jit_fast_helper exactly). */
-__attribute__((unused))
 static u32 emit_jit_fast_helper_size(const regcache *rc) {
     u32 sz = 3u /*s32i arg1*/ + 3u /*movi*/ + 3u /*s32i arg2*/
            + 3u /*mov R_ARG*/ + 3u /*l32r*/ + 3u /*callx0*/
            + 3u /*sr_reload*/;
     if (g_sr_dirty) sz += 3u;
     if (rc) sz += (u32)rc->active * 3u;
+    return sz;
+}
+
+static u32 emit_movem_fast_bridge_size(u32 list, const regcache *rc) {
+    u32 sz = 0;
+    i32 sv = (i32)list;
+    if (sv >= -2048 && sv <= 2047) sz += 3u;  /* xt_movi */
+    else sz += 30u;                            /* emit_load_imm32: 10 ops */
+    sz += emit_jit_fast_helper_size(rc);
     return sz;
 }
 
@@ -2289,9 +2302,21 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                 xt_and (&e, 10, 10, 9);
                 emit_cache_flush(&e, &rc);
                 i32 op_pc_msm = 4, op_cyc_msm = 20;
-                xt_beqz(&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_msm, op_cyc_msm)));
-                emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
-                                                  entry_off, &rc, op_pc_msm, op_cyc_msm);
+                /* Helper bridge: route MMIO bounds-fail to the fast helper.
+                 * Only .W has a fast helper (m68k_jit_movem_w_to_mem); for
+                 * .L (An) we keep m68k_step. */
+                if (sz == 2) {
+                    u32 msm_bridge_size = emit_movem_fast_bridge_size((u32)list, &rc);
+                    xt_beqz(&e, 10, (i32)(6u + msm_bridge_size));
+                    emit_load_imm(&e, 8, 9, (u32)list);
+                    emit_jit_fast_helper(&e, 8, an,
+                                         lit_off[HELPER_JIT_MOVEM_W_TO_MEM],
+                                         entry_off, &rc);
+                } else {
+                    xt_beqz(&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_msm, op_cyc_msm)));
+                    emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                                      entry_off, &rc, op_pc_msm, op_cyc_msm);
+                }
                 u32 jmsm_pos = e.len;
                 xt_j(&e, 4);
                 /* Fast path: write each reg as sz BE bytes. */
@@ -2360,9 +2385,21 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                 xt_and (&e, 10, 10, 9);
                 emit_cache_flush(&e, &rc);
                 i32 op_pc_pdm = 4, op_cyc_pdm = 20;
-                xt_beqz(&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_pdm, op_cyc_pdm)));
-                emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
-                                                  entry_off, &rc, op_pc_pdm, op_cyc_pdm);
+                /* Helper bridge: route MMIO bounds-fail to the fast helper.
+                 * Only .L has a fast helper (m68k_jit_movem_l_predec_from_regs);
+                 * for .W -(An) we keep m68k_step. */
+                if (sz == 4) {
+                    u32 pdm_bridge_size = emit_movem_fast_bridge_size((u32)list, &rc);
+                    xt_beqz(&e, 10, (i32)(6u + pdm_bridge_size));
+                    emit_load_imm(&e, 8, 9, (u32)list);
+                    emit_jit_fast_helper(&e, 8, an,
+                                         lit_off[HELPER_JIT_MOVEM_L_PREDEC],
+                                         entry_off, &rc);
+                } else {
+                    xt_beqz(&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_pdm, op_cyc_pdm)));
+                    emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                                      entry_off, &rc, op_pc_pdm, op_cyc_pdm);
+                }
                 u32 jpdm_pos = e.len;
                 xt_j(&e, 4);
                 /* Fast path: iterate bits high-to-low (= regs low-to-high
@@ -2438,12 +2475,19 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                 xt_and (&e, 10, 10, 9);
                 emit_cache_flush(&e, &rc);
                 i32 op_pc_mvm = 4, op_cyc_mvm = 20;
-                xt_beqz(&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_mvm, op_cyc_mvm)));
-                emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
-                                                  entry_off, &rc, op_pc_mvm, op_cyc_mvm);
+                /* Helper bridge: route MMIO bounds-fail to the fast
+                 * MOVEM helper instead of m68k_step (saves ~50 LX7 per
+                 * VIA-targeted MOVEM in boot). */
+                u32 mvm_bridge_size = emit_movem_fast_bridge_size((u32)list, &rc);
+                xt_beqz(&e, 10, (i32)(6u + mvm_bridge_size));
+                emit_load_imm(&e, 8, 9, (u32)list);
+                emit_jit_fast_helper(&e, 8, an,
+                                     lit_off[HELPER_JIT_MOVEM_L_POSTINC],
+                                     entry_off, &rc);
                 u32 jmvm_pos = e.len;
                 xt_j(&e, 4);
-                /* Fast path. */
+                /* Fast path. a8 still = An (the beqz skipped past the
+                 * bridge that would have clobbered it). */
                 emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
                              entry_off + e.len);
                 xt_add(&e, 9, 9, 8);                  /* a9 = ram + addr */
