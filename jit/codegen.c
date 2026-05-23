@@ -2231,6 +2231,76 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
               base[entry_off + jad_pos + 2] = (u8)(jw >> 16); }
 
             inline_ops++; done = true;
+        } else if (top == 0x4 && (w & 0xFB80) == 0x4880
+                   && ((w >> 10) & 1) == 1 && (w & 0x40) != 0 && mode == 3) {
+            /* MOVEM.L (An)+,<reglist> — boot's 0x4CD8 at 262 K execs.
+             *
+             * Inline-gated by popcount(list) <= 4 to keep emit size under
+             * the helper's effective cost (helper = 64 LX7, per-reg
+             * inline body = 11 ops × 3 bytes). Larger reglists fall
+             * through to the helper for break-even.
+             *
+             * Length = 4 (opcode + list word). Cycles = 16 + m68k_step
+             * base 4 = 20 (matches interp; constant regardless of N). */
+            int an = w & 7;
+            u16 list = mac_read16(cpu->mem, op_pc[i] + 2);
+            int n_regs = __builtin_popcount(list);
+
+            if (n_regs >= 1 && n_regs <= 4) {
+                emit_advance_flush(&e);
+                emit_read_g(&e, &rc, G_A(an), 8);    /* a8 = An (start) */
+                emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                             entry_off + e.len);
+                /* OR-bounds-check: a8 | (a8 + N*4 - 1). Both must be in RAM
+                 * → result & RAM_BOUNDS == 0. */
+                xt_addi(&e, 12, 8, n_regs * 4 - 1);
+                xt_or  (&e, 10, 8, 12);
+                xt_and (&e, 10, 10, 9);
+                emit_cache_flush(&e, &rc);
+                i32 op_pc_mvm = 4, op_cyc_mvm = 20;
+                xt_beqz(&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_mvm, op_cyc_mvm)));
+                emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                                  entry_off, &rc, op_pc_mvm, op_cyc_mvm);
+                u32 jmvm_pos = e.len;
+                xt_j(&e, 4);
+                /* Fast path. */
+                emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                             entry_off + e.len);
+                xt_add(&e, 9, 9, 8);                  /* a9 = ram + addr */
+                int byte_off = 0;
+                for (int b = 0; b < 16; b++) {
+                    if (!(list & (1 << b))) continue;
+                    /* Read 4 BE bytes from a9+byte_off into a10. */
+                    xt_l8ui (&e, 11, 9, (u8)(byte_off + 0));
+                    xt_l8ui (&e, 12, 9, (u8)(byte_off + 1));
+                    xt_slli (&e, 10, 11, 24);
+                    xt_slli (&e, 12, 12, 16);
+                    xt_or   (&e, 10, 10, 12);
+                    xt_l8ui (&e, 11, 9, (u8)(byte_off + 2));
+                    xt_l8ui (&e, 12, 9, (u8)(byte_off + 3));
+                    xt_slli (&e, 11, 11, 8);
+                    xt_or   (&e, 10, 10, 11);
+                    xt_or   (&e, 10, 10, 12);
+                    int g_reg = (b < 8) ? G_D(b) : G_A(b - 8);
+                    emit_write_g(&e, &rc, g_reg, 10);
+                    byte_off += 4;
+                }
+                /* An += N * 4. */
+                xt_addi(&e, 8, 8, n_regs * 4);
+                emit_write_g(&e, &rc, G_A(an), 8);
+                emit_advance(&e, op_pc_mvm, op_cyc_mvm);
+
+                u32 here_mvm = e.len;
+                i32 jo_mvm = (i32)(here_mvm - jmvm_pos) - 4;
+                u32 jw_mvm = ((u32)((u32)jo_mvm & 0x3FFFFu) << 6) | 0x06u;
+                base[entry_off + jmvm_pos    ] = (u8)jw_mvm;
+                base[entry_off + jmvm_pos + 1] = (u8)(jw_mvm >> 8);
+                base[entry_off + jmvm_pos + 2] = (u8)(jw_mvm >> 16);
+
+                sext_memo_invalidate();
+                inline_ops++; done = true;
+            }
+            /* else: large reglist — fall through to helper. */
         } else if (top == 0x4 && ((w >> 6) & 7) == 7
                    && (mode == 2 || mode == 5 || mode == 6
                        || (mode == 7 && (w & 7) <= 1))) {
