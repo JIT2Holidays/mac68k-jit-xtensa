@@ -1785,12 +1785,13 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + jlL_pos + 2] = (u8)(jwL >> 16);
 
             inline_ops++; done = true;
-        } else if (top == 0x2 && ((w >> 6) & 7) == 4 && mode == 0) {
-            /* MOVE.L Dn,-(An) — pre-decrement push pattern (boot 0x24C3
-             * ~5 K, bench 0x2F08 ~2 K). Same shape as MOVE.L Dn,(An)+
-             * but with An decremented by 4 before the write. */
+        } else if (top == 0x2 && ((w >> 6) & 7) == 4 && (mode == 0 || mode == 1)) {
+            /* MOVE.L Dn|Am,-(An) — pre-decrement push pattern (boot 0x24C3
+             * MOVE.L D3,-(A2) ~5 K, bench 0x2F08 MOVE.L A0,-(SP) ~2 K).
+             * Mirrors MOVE.L Dn,(An)+ but with An decremented by 4. */
             int an = (w >> 9) & 7;
             int dm = w & 7;
+            int g_src = (mode == 1) ? G_A(dm) : G_D(dm);
 
             emit_advance_flush(&e);
             emit_read_g(&e, &rc, G_A(an), 8);
@@ -1805,7 +1806,7 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                                               entry_off, &rc, op_pc_pdl, op_cyc_pdl);
             u32 jpdl_pos = e.len;
             xt_j    (&e, 4);
-            emit_read_g(&e, &rc, G_D(dm), 10);
+            emit_read_g(&e, &rc, g_src, 10);
             emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
                          entry_off + e.len);
             xt_add  (&e, 9, 9, 8);
@@ -1825,12 +1826,13 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + jpdl_pos + 2] = (u8)(jw >> 16);
 
             inline_ops++; done = true;
-        } else if (top == 0x2 && ((w >> 6) & 7) == 3 && mode == 0) {
-            /* MOVE.L Dn,(An)+ — boot-hot 0x20C1 at 262 K execs / 60 M cycles.
+        } else if (top == 0x2 && ((w >> 6) & 7) == 3 && (mode == 0 || mode == 1)) {
+            /* MOVE.L Dn|Am,(An)+ — boot-hot 0x20C1 at 262 K execs / 60 M cycles.
              * Bounds check the An address; on fast path do 4 byte writes
              * (BE), post-increment An by 4, emit logic flags if needed. */
             int an = (w >> 9) & 7;        /* dst An (post-incr) */
-            int dm = w & 7;               /* src Dn */
+            int dm = w & 7;               /* src reg */
+            int g_src = (mode == 1) ? G_A(dm) : G_D(dm);
 
             emit_advance_flush(&e);
             emit_read_g(&e, &rc, G_A(an), 8);            /* a8 = An */
@@ -1844,8 +1846,8 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                                               entry_off, &rc, op_pc_lp, op_cyc_lp);
             u32 jlp_pos = e.len;
             xt_j    (&e, 4);
-            /* Fast path: load Dn, write 4 BE bytes, post-incr An. */
-            emit_read_g(&e, &rc, G_D(dm), 10);           /* a10 = Dn */
+            /* Fast path: load src reg, write 4 BE bytes, post-incr An. */
+            emit_read_g(&e, &rc, g_src, 10);             /* a10 = Dn or Am */
             emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
                          entry_off + e.len);
             xt_add  (&e, 9, 9, 8);                       /* a9 = ram + An */
