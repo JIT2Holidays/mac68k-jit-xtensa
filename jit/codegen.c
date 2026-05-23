@@ -2215,6 +2215,57 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             int size = (szf == 0) ? 1 : 2;
             emit_immarith_bw_dn(&e, w & 7, imm, size, (w >> 9) & 7, &rc);
             inline_ops++; done = true;
+        } else if (top == 0x0 && !((w >> 8) & 1) && ((w >> 9) & 7) == 4
+                   && szf == 0 && mode == 5) {
+            /* BTST #imm,(d16,An) — boot-hot 0x082D at 214 K execs.
+             * Byte EA: bit & 7 selects the bit to test. Sets only Z.
+             * Length = 6 (opcode + imm word + d16 word), cycles = 8. */
+            int an = w & 7;
+            u16 imm_word = mac_read16(cpu->mem, op_pc[i] + 2);
+            int bit = imm_word & 7;
+            i16 d16 = (i16)mac_read16(cpu->mem, op_pc[i] + 4);
+
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(an), 8);
+            if (d16 >= -128 && d16 <= 127) {
+                xt_addi(&e, 8, 8, d16);
+            } else {
+                emit_load_imm32(&e, 11, 12, (u32)(i32)d16);
+                xt_add(&e, 8, 8, 11);
+            }
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and(&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_bt = 6, op_cyc_bt = 8;
+            xt_beqz(&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_bt, op_cyc_bt)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_bt, op_cyc_bt);
+            u32 jbt_pos = e.len;
+            xt_j(&e, 4);
+            /* Fast path: read byte, extract bit, update Z. */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add(&e, 9, 9, 8);
+            xt_l8ui(&e, 10, 9, 0);                  /* a10 = byte */
+            xt_extui(&e, 11, 10, (u8)bit, 0);       /* a11 = (byte >> bit) & 1 */
+            /* Clear R_SR.Z (bit 2), then OR in Z if a11 == 0. */
+            xt_movi(&e, 12, -5);                    /* ~0x04 (sign-extended) */
+            xt_and(&e, R_SR, R_SR, 12);
+            xt_movi(&e, 12, 0x04);
+            xt_bnez(&e, 11, 6);                     /* if bit set, skip OR */
+            xt_or(&e, R_SR, R_SR, 12);
+            g_sr_dirty = true;
+            sext_memo_invalidate();
+            emit_advance(&e, op_pc_bt, op_cyc_bt);
+            u32 here_bt = e.len;
+            i32 jo_bt = (i32)(here_bt - jbt_pos) - 4;
+            u32 jw_bt = ((u32)((u32)jo_bt & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jbt_pos    ] = (u8)jw_bt;
+            base[entry_off + jbt_pos + 1] = (u8)(jw_bt >> 8);
+            base[entry_off + jbt_pos + 2] = (u8)(jw_bt >> 16);
+
+            inline_ops++; done = true;
         } else if (top == 0x0 && !((w >> 8) & 1) && szf == 0 && mode == 5
                    && ((w >> 9) & 7) == 0) {
             /* ORI.B #imm8,(d16,An) — boot-hot 0x002C at 408 K execs.
