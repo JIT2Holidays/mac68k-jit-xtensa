@@ -1557,6 +1557,52 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
         } else if (w == 0x4E71) {          /* NOP */
             emit_advance(&e, 2, 4);
             inline_ops++; done = true;
+        } else if (w == 0x4E75) {
+            /* RTS — pop 32-bit PC from stack, set cpu->pc, SP += 4.
+             * Block terminator. Bench-hot (7K). Cycles = 16 = 4 + 12. */
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(7), 8);              /* a8 = SP */
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_rts = 0;        /* m68k_step's RTS handler sets pc directly */
+            i32 op_cyc_rts = 16;      /* full m68k_step adds: 4 base + 12 handler */
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_rts, op_cyc_rts)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_rts, op_cyc_rts);
+            u32 jrts_pos = e.len;
+            xt_j    (&e, 4);
+            /* Fast path: read 4 BE bytes from mem[SP] into a10, write to
+             * cpu->pc, post-increment SP by 4. Cycles handled by the
+             * emit_advance(0, 16) below + block-end flush. */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);                        /* a9 = ram + SP */
+            xt_l8ui (&e, 10, 9, 0);
+            xt_l8ui (&e, 11, 9, 1);
+            xt_slli (&e, 10, 10, 24);
+            xt_slli (&e, 11, 11, 16);
+            xt_or   (&e, 10, 10, 11);
+            xt_l8ui (&e, 11, 9, 2);
+            xt_l8ui (&e, 12, 9, 3);
+            xt_slli (&e, 11, 11, 8);
+            xt_or   (&e, 10, 10, 11);
+            xt_or   (&e, 10, 10, 12);                     /* a10 = popped pc */
+            xt_s32i (&e, 10, R_CPU, OFF_PC);
+            xt_addi (&e, 8, 8, 4);
+            emit_write_g(&e, &rc, G_A(7), 8);
+            emit_advance(&e, 0, 16);
+
+            u32 here_rts = e.len;
+            i32 jo_rts = (i32)(here_rts - jrts_pos) - 4;
+            u32 jw_rts = ((u32)((u32)jo_rts & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jrts_pos    ] = (u8)jw_rts;
+            base[entry_off + jrts_pos + 1] = (u8)(jw_rts >> 8);
+            base[entry_off + jrts_pos + 2] = (u8)(jw_rts >> 16);
+
+            sext_memo_invalidate();
+            inline_ops++; done = true;
         } else if (top == 0xD && szf == 2 && !((w >> 8) & 1) && mode == 0) {
             /* ADD.L Dm,Dn */
             emit_add_l_dd(&e, (w >> 9) & 7, w & 7, flags_dead[i], &rc);
