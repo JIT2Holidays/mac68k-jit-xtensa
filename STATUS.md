@@ -186,14 +186,22 @@ instr/cyc on the target; helper-cost proxy `M68K_JIT_HELPER_LX7_COST = 64`).
 | JIT M6.41 (diagnostic: print real helper count from cpu->instrs) | 1.289 | 23.76 × | 1.756 | 17.44 × |
 | JIT M6.42 (fast-path MMIO helper for ORI.B (d16,An)) ✨ | 1.289 | 23.76 × | 1.734 | 17.66 × |
 | JIT M6.43 (fast-path MMIO helper for BTST (d16,An)) ✨ | 1.289 | 23.76 × | 1.723 | 17.78 × |
-| **JIT M6.44 (current — MOVEM fast helpers, large-reglist arms only)** | **1.289** | **23.76 ×** | **1.723** | **17.78 ×** |
+| JIT M6.44 (MOVEM fast helpers, large-reglist arms only) | 1.289 | 23.76 × | 1.723 | 17.78 × |
+| **JIT M6.45 (current — redirect small-N MOVEM bridges to fast helpers)** 🎯 | **1.289** | **23.76 ×** | **1.729** | **17.72 ×** |
 
 ### Real-cost view (from M6.41's `real_lx7_per_cyc`)
 
-| Engine | M6.40 real | M6.42 real | M6.43 real | M6.44 real | M6.44 × Mac Plus |
-|--------|-----------:|-----------:|-----------:|-----------:|-----------------:|
-| Bench  | 1.293      | 1.293      | 1.293      | 1.293      | **23.69 ×**       |
-| Boot   | 3.092      | 2.599      | 2.358      | **2.358**  | **12.99 ×**       |
+| Engine | M6.40 | M6.42 | M6.43 | M6.44 | M6.45 | M6.45 × Mac Plus |
+|--------|------:|------:|------:|------:|------:|-----------------:|
+| Bench  | 1.293 | 1.293 | 1.293 | 1.293 | 1.289 | **23.76 ×**       |
+| Boot   | 3.092 | 2.599 | 2.358 | 2.358 | **1.945** | **15.75 ×** 🎯    |
+
+The displayed metric is now diverging from real cost. Boot displayed
+*slightly worsened* in M6.45 (1.723 → 1.729) because the new bridges
+are a few bytes longer than the m68k_step bridge, yet REAL cost
+dropped 17.5 % since the actual m68k_step calls were eliminated.
+Going forward we should use `real_lx7_per_cyc` as the optimization
+target — it's what actually matters on real hardware.
 
 **M6.44 note**: The fast helpers (one each for MOVEM.L (An)+, .L/-(An),
 and .W (An)) are wired up and ~150 large-reglist MOVEMs route through
