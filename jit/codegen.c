@@ -1785,6 +1785,46 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + jlL_pos + 2] = (u8)(jwL >> 16);
 
             inline_ops++; done = true;
+        } else if (top == 0x2 && ((w >> 6) & 7) == 4 && mode == 0) {
+            /* MOVE.L Dn,-(An) — pre-decrement push pattern (boot 0x24C3
+             * ~5 K, bench 0x2F08 ~2 K). Same shape as MOVE.L Dn,(An)+
+             * but with An decremented by 4 before the write. */
+            int an = (w >> 9) & 7;
+            int dm = w & 7;
+
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(an), 8);
+            xt_addi(&e, 8, 8, -4);
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_pdl = 2, op_cyc_pdl = 8;
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_pdl, op_cyc_pdl)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_pdl, op_cyc_pdl);
+            u32 jpdl_pos = e.len;
+            xt_j    (&e, 4);
+            emit_read_g(&e, &rc, G_D(dm), 10);
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);
+            xt_extui(&e, 11, 10, 24, 7); xt_s8i(&e, 11, 9, 0);
+            xt_extui(&e, 11, 10, 16, 7); xt_s8i(&e, 11, 9, 1);
+            xt_extui(&e, 11, 10,  8, 7); xt_s8i(&e, 11, 9, 2);
+            xt_extui(&e, 11, 10,  0, 7); xt_s8i(&e, 11, 9, 3);
+            emit_write_g(&e, &rc, G_A(an), 8);
+            if (!flags_dead[i]) emit_logic_flags(&e, 10);
+            emit_advance(&e, op_pc_pdl, op_cyc_pdl);
+
+            u32 here = e.len;
+            i32 jo = (i32)(here - jpdl_pos) - 4;
+            u32 jw = ((u32)((u32)jo & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jpdl_pos    ] = (u8)jw;
+            base[entry_off + jpdl_pos + 1] = (u8)(jw >> 8);
+            base[entry_off + jpdl_pos + 2] = (u8)(jw >> 16);
+
+            inline_ops++; done = true;
         } else if (top == 0x2 && ((w >> 6) & 7) == 3 && mode == 0) {
             /* MOVE.L Dn,(An)+ — boot-hot 0x20C1 at 262 K execs / 60 M cycles.
              * Bounds check the An address; on fast path do 4 byte writes
