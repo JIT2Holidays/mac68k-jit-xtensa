@@ -52,6 +52,7 @@ static u32 helper_addr(literal_id id, void *user) {
         case HELPER_M68K_STEP:  return (u32)(uintptr_t)&m68k_step_call0;
         case ADDR_RAM_BASE:     return (u32)(uintptr_t)cpu->mem->ram;
         case LITERAL_RAM_BOUNDS:return ram_bounds_mask(cpu);
+        case HELPER_JIT_ORI_B_MMIO: return (u32)(uintptr_t)&m68k_jit_ori_b_mmio;
         default:                return 0;
     }
 #else
@@ -61,6 +62,7 @@ static u32 helper_addr(literal_id id, void *user) {
         case HELPER_M68K_STEP:  return (u32)HELPER_M68K_STEP;
         case ADDR_RAM_BASE:     return HOST_RAM_BASE;
         case LITERAL_RAM_BOUNDS:return ram_bounds_mask(cpu);
+        case HELPER_JIT_ORI_B_MMIO: return (u32)HELPER_JIT_ORI_B_MMIO;
         default:                return 0;
     }
 #endif
@@ -268,6 +270,8 @@ static void sim_call(xt_sim *s, u32 fn_token) {
     sim_ctx *c = (sim_ctx *)s->user;
     if ((literal_id)fn_token == HELPER_M68K_STEP) {
         m68k_step(c->cpu);
+    } else if ((literal_id)fn_token == HELPER_JIT_ORI_B_MMIO) {
+        m68k_jit_ori_b_mmio(c->cpu);
     }
 }
 

@@ -51,6 +51,13 @@ typedef struct m68k_cpu {
      * without modifying a1 (see jit/dispatcher.c — same trick as gbjit). */
     u32 jit_ret_pc;
 
+    /* JIT-helper argument slots. Custom fast-path helpers (e.g. the MMIO
+     * write path) read these instead of the (CALL0 ABI-conflicting) a3
+     * register. The JIT bridge stores its computed addr/imm here before
+     * the CALLX0. */
+    u32 jit_arg1;
+    u32 jit_arg2;
+
     struct mac_mem *mem;
 } m68k_cpu;
 

@@ -556,6 +556,28 @@ static void do_movem(m68k_cpu *cpu, u16 op) {
 u32 m68k_helper_histo[65536];
 #endif
 
+/* JIT custom helper: ORI.B #imm,(d16,An) for MMIO destinations.
+ *
+ * The ORI.B inline arm's fast path runs entirely in registers for RAM
+ * destinations. When the EA points to MMIO (e.g. VIA registers), the
+ * bounds check fails and we used to bridge to m68k_step — which re-
+ * fetches and re-decodes the op, ~64 LX7 of overhead. This helper does
+ * just the (read byte → OR → write byte → set N/Z) work; the JIT
+ * sets cpu->jit_arg1 = addr, cpu->jit_arg2 = imm before the CALLX0,
+ * and handles PC/cycle advance via its own accumulator (this helper
+ * touches neither pc nor cycles). */
+void m68k_jit_ori_b_mmio(m68k_cpu *cpu) {
+    u32 addr = cpu->jit_arg1;
+    u8 imm = (u8)cpu->jit_arg2;
+    u8 d = mac_read8(cpu->mem, addr);
+    u8 r = (u8)(d | imm);
+    mac_write8(cpu->mem, addr, r);
+    u8 ccr = m68k_get_ccr(cpu) & CCR_X;
+    if (r == 0)        ccr |= CCR_Z;
+    if (r & 0x80)      ccr |= CCR_N;
+    m68k_set_ccr(cpu, ccr);
+}
+
 void m68k_step(m68k_cpu *cpu) {
     /* Once the CPU has halted (e.g. the guest wrote the debug exit port),
      * further steps are no-ops. This keeps a JIT block — which may contain

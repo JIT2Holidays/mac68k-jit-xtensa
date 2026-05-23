@@ -16,6 +16,9 @@
  * JIT block can call this per-instruction without surprise control flow. */
 void m68k_step(m68k_cpu *cpu);
 
+/* JIT custom fast-path helpers — see definitions in m68k_interp.c. */
+void m68k_jit_ori_b_mmio(m68k_cpu *cpu);
+
 /* Run the pure interpreter until cpu->cycles >= until or the CPU halts.
  * Polls interrupts and ticks the peripherals between instructions. */
 void m68k_run_until(m68k_cpu *cpu, u64 until);

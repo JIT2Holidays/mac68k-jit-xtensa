@@ -41,6 +41,7 @@ typedef enum {
                           /* test for any out-of-RAM or odd address. */
     LITERAL_BCC_PC,       /* per-block: BRA.S taken or Bcc.S fall-through PC. */
                           /* Filled by codegen, not by the helper_addr cb. */
+    HELPER_JIT_ORI_B_MMIO,/* fast-path ORI.B (d16,An) helper for MMIO targets */
     LITERAL_COUNT
 } literal_id;
 

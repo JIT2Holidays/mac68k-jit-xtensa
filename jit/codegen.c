@@ -21,6 +21,8 @@
 #define OFF_SR       ((u32)offsetof(m68k_cpu, sr))
 #define OFF_CYCLES   ((u32)offsetof(m68k_cpu, cycles))   /* low 32 bits */
 #define OFF_JITRETPC ((u32)offsetof(m68k_cpu, jit_ret_pc))
+#define OFF_JIT_ARG1 ((u32)offsetof(m68k_cpu, jit_arg1))
+#define OFF_JIT_ARG2 ((u32)offsetof(m68k_cpu, jit_arg2))
 
 /* Xtensa registers reserved across a block. */
 #define R_ARG   2     /* CALLX0 first argument          */
@@ -2674,9 +2676,29 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             xt_and(&e, 10, 8, 9);
             emit_cache_flush(&e, &rc);
             i32 op_pc_oo = 6, op_cyc_oo = 8;
-            xt_beqz(&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_oo, op_cyc_oo)));
-            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
-                                              entry_off, &rc, op_pc_oo, op_cyc_oo);
+            /* Custom helper bridge size: sr_flush (0/3) + s32i addr (3) +
+             * movi imm (3) + s32i imm (3) + mov a2 (3) + l32r (3) +
+             * callx0 (3) + sr_reload (3) + cache_reload (3*N). The
+             * helper is m68k_jit_ori_b_mmio — it does just the byte
+             * read/OR/write/CCR work, no PC or cycle advance (the JIT
+             * supplies those via emit_advance below). */
+            u32 mmio_bridge_size = 3*7;  /* mov, l32r, callx0, sr_reload, 3 setup */
+            if (g_sr_dirty) mmio_bridge_size += 3;
+            mmio_bridge_size += (u32)rc.active * 3;
+            xt_beqz(&e, 10, (i32)(6u + mmio_bridge_size));
+            /* --- Custom MMIO ORI.B helper bridge (replaces emit_helper_step). --- */
+            sext_memo_invalidate();
+            emit_sr_flush(&e);
+            xt_s32i(&e, 8, R_CPU, OFF_JIT_ARG1);   /* arg1 = addr */
+            xt_movi(&e, 9, imm8);
+            xt_s32i(&e, 9, R_CPU, OFF_JIT_ARG2);   /* arg2 = imm */
+            xt_mov (&e, R_ARG, R_CPU);             /* a2 = cpu */
+            emit_l32r_at(&e, R_HELP, lit_off[HELPER_JIT_ORI_B_MMIO],
+                         entry_off + e.len);
+            xt_callx0(&e, R_HELP);
+            emit_sr_reload(&e);
+            emit_cache_reload(&e, &rc);
+            /* --- end custom bridge --- */
             u32 joo_pos = e.len;
             xt_j(&e, 4);
             /* Fast path */
