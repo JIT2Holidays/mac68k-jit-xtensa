@@ -1217,6 +1217,15 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                 g_pc_lit_val = pc_const;
                 g_pc_lit_valid = true;
             }
+        } else if ((last_op >> 12) == 0x5 && ((last_op >> 6) & 3) == 3
+                   && ((last_op >> 3) & 7) == 1) {
+            /* DBcc Dn, disp16 — fall-through PC is op_pc + 4 (skips the
+             * disp16 word). The inlined DBcc tail derives the taken target
+             * via xt_addi from this literal. */
+            u32 pc_const = op_pc[n_ops - 1] + 4;
+            *(u32 *)(base + lit_off[LITERAL_BCC_PC]) = pc_const;
+            g_pc_lit_val = pc_const;
+            g_pc_lit_valid = true;
         }
     }
 
@@ -1439,9 +1448,18 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
         if ((cls & 1u) && !flags_dead[k]) {
             block_needs_sr_load = true; break;
         }
-        /* CONS op reads R_SR. */
+        /* CONS op reads R_SR — but DBcc with cc∈{T,F} doesn't actually
+         * test CCR, only the inlined DBT/DBF paths run, so don't require
+         * the prologue load in that case. */
         if (cls & 2u) {
-            block_needs_sr_load = true; break;
+            bool is_dbcc = ((w >> 12) == 0x5) && (((w >> 6) & 3) == 3)
+                           && (((w >> 3) & 7) == 1);
+            int cc = (w >> 8) & 0xF;
+            if (is_dbcc && cc < 2) {
+                /* DBT/DBF — no R_SR read. */
+            } else {
+                block_needs_sr_load = true; break;
+            }
         }
         /* Bcc.S (cc != 0 BRA, != 1 BSR) reads R_SR via emit_cond. */
         if ((w >> 12) == 0x6) {
@@ -2231,6 +2249,90 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
              * dependent wait-loops never exit when re-entering the
              * dispatcher is skipped.) */
             emit_branch(&e, op_pc[i], w);
+            inline_ops++; done = true;
+        } else if (top == 0x5 && szf == 3 && mode == 1
+                   && (((w >> 8) & 0xF) == 1 || ((w >> 8) & 0xF) == 6)) {
+            /* DBF / DBNE Dn, disp16 — boot's two big DBcc helpers.
+             *   DBF (cc=1):   always decrement+branch.
+             *   DBNE (cc=6):  if Z==0 (NE true), fall through.
+             *                 Else (Z==1), decrement+branch.
+             *
+             *   if !cond_true: Dn.W = Dn.W - 1;
+             *                  pc = (Dn.W != -1) ? op_pc+2+disp16 : op_pc+4;
+             *   else:          pc = op_pc + 4;
+             *   cycles += 14 (unconditional). */
+            int cc = (w >> 8) & 0xF;
+            int dn = w & 7;
+            i16 disp16 = (i16)mac_read16(cpu->mem, op_pc[i] + 2);
+            u32 ft = op_pc[i] + 4;
+            i32 disp_for_tail = (i32)disp16 - 2;
+            bool is_dbne = (cc == 6);
+
+            i32 extra_cyc = g_cyc_acc;
+            g_pc_acc = 0;
+            g_cyc_acc = 0;
+
+            /* 1. Read Dn into a11 (always — needed for decrement and cond). */
+            emit_read_g(&e, &rc, G_D(dn), 11);
+            /* 2. Compute new_dn in a10 (= Dn with .W decremented). */
+            xt_addi (&e, 9, 11, -1);
+            xt_srli (&e, 10, 11, 16);
+            xt_slli (&e, 10, 10, 16);
+            xt_extui(&e, 12, 9, 0, 15);
+            xt_or   (&e, 10, 10, 12);
+            /* 3. For DBNE only: if Z=0 (NE true), restore a10 = Dn_old to skip dec. */
+            if (is_dbne) {
+                xt_extui(&e, 13, R_SR, 2, 0);   /* a13 = Z (0 or 1) */
+                xt_bnez (&e, 13, 6);            /* if Z != 0 (NE false), keep a10 */
+                xt_mov  (&e, 10, 11);           /* Z == 0 (NE true) → restore old */
+            }
+            /* 4. Write Dn from a10. */
+            emit_write_g(&e, &rc, G_D(dn), 10);
+            /* 5. Cond_branch compute:
+             *    DBF: cond = (old_dn.W != 0) ? 1 : 0.
+             *    DBNE: cond = (Z=1) AND (old_dn.W != 0). */
+            xt_extui(&e, 12, 11, 0, 15);        /* a12 = old_dn.W */
+            if (is_dbne) {
+                /* a13 still holds Z from step 3. */
+                xt_movi(&e, 8, 0);              /* default cond = 0 */
+                xt_beqz(&e, 13, 12);            /* Z==0 → cond stays 0 (skip 3 ops) */
+                xt_movi(&e, 8, 1);              /* Z=1 → assume cond = 1 */
+                xt_bnez(&e, 12, 6);             /* not done → skip */
+                xt_movi(&e, 8, 0);              /* done → cond = 0 */
+            } else {
+                xt_movi(&e, 8, 1);              /* default cond = 1 (not done) */
+                xt_bnez(&e, 12, 6);             /* if old_dn.W != 0, keep cond=1 */
+                xt_movi(&e, 8, 0);              /* old_dn.W == 0 → cond = 0 */
+            }
+            /* 6. Branchless PC + unconditional cycle update. */
+            xt_movi (&e, 10, 0);
+            xt_sub  (&e, 9, 10, 8);             /* mask = -cond */
+            if (g_pc_lit_valid && ft == g_pc_lit_val) {
+                emit_l32r_at(&e, 10, g_pc_lit_off, g_pc_lit_entry_off + e.len);
+            } else {
+                emit_load_imm32(&e, 10, 11, ft);
+            }
+            if (disp_for_tail >= -128 && disp_for_tail <= 127) {
+                xt_addi(&e, 12, 10, (i32)disp_for_tail);
+            } else {
+                u32 taken = ft + (u32)disp_for_tail;
+                emit_load_imm32(&e, 12, 11, taken);
+            }
+            xt_xor (&e, 13, 10, 12);
+            xt_and (&e, 13, 13, 9);
+            xt_xor (&e, 10, 10, 13);
+            xt_s32i(&e, 10, R_CPU, OFF_PC);
+            xt_l32i(&e, 11, R_CPU, OFF_CYCLES);
+            i32 db_base_cyc = 14 + extra_cyc;
+            if (db_base_cyc >= -128 && db_base_cyc <= 127) {
+                xt_addi(&e, 11, 11, db_base_cyc);
+            } else {
+                emit_load_imm(&e, 10, 12, (u32)db_base_cyc);
+                xt_add(&e, 11, 11, 10);
+            }
+            xt_s32i(&e, 11, R_CPU, OFF_CYCLES);
+
+            sext_memo_invalidate();
             inline_ops++; done = true;
         } else if (top == 0xB && szf == 2 && !((w >> 8) & 1) && mode == 0) {
             /* CMP.L Dm,Dn */

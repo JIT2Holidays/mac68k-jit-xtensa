@@ -552,6 +552,10 @@ static void do_movem(m68k_cpu *cpu, u16 op) {
 
 /* ---- the main step ---------------------------------------------------- */
 
+#ifdef JIT_HELPER_HISTO
+u32 m68k_helper_histo[65536];
+#endif
+
 void m68k_step(m68k_cpu *cpu) {
     /* Once the CPU has halted (e.g. the guest wrote the debug exit port),
      * further steps are no-ops. This keeps a JIT block — which may contain
@@ -561,6 +565,9 @@ void m68k_step(m68k_cpu *cpu) {
     cpu->instrs++;
     u32 op_pc = cpu->pc;
     u16 op = fetch16(cpu);
+#ifdef JIT_HELPER_HISTO
+    m68k_helper_histo[op]++;
+#endif
     cpu->cycles += 4;
     int top = (op >> 12) & 0xF;
 

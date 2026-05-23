@@ -179,7 +179,8 @@ instr/cyc on the target; helper-cost proxy `M68K_JIT_HELPER_LX7_COST = 64`).
 | JIT M6.32 (skip prologue R_SR reload + extend fusion to BEQ/BNE) | 1.303 | 23.51 × | 4.319 | 7.09 × |
 | JIT M6.33 (inline OR.L Dm,Dn — top-3 boot helper) | 1.303 | 23.51 × | 3.397 | 9.02 × |
 | JIT M6.34 (inline ADDA.W/SUBA.W #imm + MOVE.L (An)+ ⇄ Dn) | 1.299 | 23.58 × | 3.014 | 10.16 × ✅ |
-| **JIT M6.37 (current — inline ORI.B (d16,An) + BTST (d16,An) + MOVE.W (An)+,Dn)** | **1.299** | **23.58 ×** | **2.457** | **12.47 ×** |
+| JIT M6.37 (inline ORI.B (d16,An) + BTST (d16,An) + MOVE.W (An)+,Dn) | 1.299 | 23.58 × | 2.457 | 12.47 × |
+| **JIT M6.38 (current — inline DBF + DBNE with literal-pool ft and unconditional cycle)** | **1.298** | **23.60 ×** | **2.200** | **13.92 ×** |
 | Goal: 5 × interp on bench       | 1.32            | **23.2 ×**       | 1.18           | **25.9 ×**      |
 
 **Mac Plus speed already cleared** (>1 ×) by the interpreter alone —
@@ -1288,6 +1289,46 @@ Boot is now closing in on bench (interp baseline: bench 6.601, boot
 5.923 lx7/cyc). The JIT/interp ratio:
 * Bench: **5.08 ×** interp (was 1.65 × at M6.2).
 * Boot:  **2.41 ×** interp (was 1.10 × at M6.2).
+
+**M6.38 — inline DBF and DBNE (delivered).** DBcc is boot's biggest
+remaining helper class: DBF (cc=1) at 91 K execs + DBNE (cc=6) at
+214 K execs = 305 K helper calls. Inlined as a unified arm sharing
+the `Dn.W -= 1` decrement compute and branchless PC tail.
+
+Key bits:
+* Extended `LITERAL_BCC_PC` to also cover DBcc terminators: ft =
+  op_pc + 4, taken = ft + (disp16 − 2) via `xt_addi` when the
+  adjusted disp fits i8.
+* Extended the M6.32 prologue-R_SR-skip analysis to recognise that
+  DBcc with cc ∈ {T, F} doesn't actually read R_SR even though
+  classify_op marks it CONS.
+* For DBNE: read Z bit (`extui R_SR, 2, 0`); if Z==0 (NE true), use
+  `xt_mov` to restore Dn_old in place of Dn_new (skips decrement);
+  cond_branch = (Z==1) AND (old_dn.W != 0).
+* For DBF: cc_true never holds, so unconditionally decrement;
+  cond_branch = (old_dn.W != 0).
+* Cycle accounting is unconditional (14 cyc, matching interp's +4
+  m68k_step base + +10 handler), so the tail emits a plain
+  `xt_addi` instead of `xt_addx2` for the cycle update.
+
+| Engine | M6.37   | **M6.38**   | × Mac Plus    | delta |
+|--------|--------:|------------:|--------------:|------:|
+| Bench  | 1.299   | **1.298**   | **23.60 ×**   | unchanged |
+| Boot   | 2.457   | **2.200**   | **13.92 ×**   | **+10.5 %** |
+
+`helper_calls_total` dropped 882 K → 576 K (−34.7 %), with the bulk
+attributable to DBNE.
+
+`--diff-jit-trace` at step 84 in VIA timer state only — pre-existing.
+ctest 3/3.
+
+Cumulative session win **M6.2 → M6.38**:
+* Bench `4.008 → 1.298 lx7/cyc` (**+67.6 %**), 7.64 × → **23.60 × Mac Plus**.
+* Boot  `5.376 → 2.200 lx7/cyc` (**+59.1 %**), 5.70 × → **13.92 × Mac Plus**.
+
+JIT/interp ratio is now:
+* Bench: **5.09 ×** interp (was 1.65 × at M6.2).
+* Boot:  **2.69 ×** interp (was 1.10 × at M6.2).
 
 Profiled bench's hot-block distribution (per `block_executed`):
 
