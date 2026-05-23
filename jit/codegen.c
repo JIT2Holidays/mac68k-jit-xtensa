@@ -2215,6 +2215,54 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             int size = (szf == 0) ? 1 : 2;
             emit_immarith_bw_dn(&e, w & 7, imm, size, (w >> 9) & 7, &rc);
             inline_ops++; done = true;
+        } else if (top == 0x0 && !((w >> 8) & 1) && szf == 0 && mode == 5
+                   && ((w >> 9) & 7) == 0) {
+            /* ORI.B #imm8,(d16,An) — boot-hot 0x002C at 408 K execs.
+             * Length = 6 (opcode + imm word + d16). Cycles = 8. */
+            int an = w & 7;
+            u16 imm_word = mac_read16(cpu->mem, op_pc[i] + 2);
+            u8 imm8 = (u8)imm_word;
+            i16 d16 = (i16)mac_read16(cpu->mem, op_pc[i] + 4);
+
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(an), 8);
+            if (d16 >= -128 && d16 <= 127) {
+                xt_addi(&e, 8, 8, d16);
+            } else {
+                emit_load_imm32(&e, 11, 12, (u32)(i32)d16);
+                xt_add(&e, 8, 8, 11);
+            }
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and(&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_oo = 6, op_cyc_oo = 8;
+            xt_beqz(&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_oo, op_cyc_oo)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_oo, op_cyc_oo);
+            u32 joo_pos = e.len;
+            xt_j(&e, 4);
+            /* Fast path */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add(&e, 9, 9, 8);                    /* a9 = ram + addr */
+            xt_l8ui(&e, 10, 9, 0);                  /* a10 = byte */
+            xt_movi(&e, 11, imm8);
+            xt_or(&e, 10, 10, 11);
+            xt_s8i(&e, 10, 9, 0);
+            if (!flags_dead[i]) {
+                xt_slli(&e, 11, 10, 24);            /* byte → bits 31..24 for N/Z derive */
+                emit_logic_flags(&e, 11);
+            }
+            emit_advance(&e, op_pc_oo, op_cyc_oo);
+            u32 here_oo = e.len;
+            i32 jo_oo = (i32)(here_oo - joo_pos) - 4;
+            u32 jw_oo = ((u32)((u32)jo_oo & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + joo_pos    ] = (u8)jw_oo;
+            base[entry_off + joo_pos + 1] = (u8)(jw_oo >> 8);
+            base[entry_off + joo_pos + 2] = (u8)(jw_oo >> 16);
+
+            inline_ops++; done = true;
         }
 
         if (!done) {
