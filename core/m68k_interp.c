@@ -656,6 +656,23 @@ void m68k_jit_movem_l_to_mem(m68k_cpu *cpu) {
     /* (An) destination — no writeback of An. */
 }
 
+/* JIT custom helper: MOVE.W (An)+,Dn for MMIO destinations.
+ * Args: jit_arg2 packed = dn | (an << 4). jit_arg1 unused.
+ * Reads word from cpu->a[an], writes to low 16 of cpu->d[dn],
+ * post-increments An by 2, sets N/Z (V/C=0, X preserved). */
+void m68k_jit_move_w_postinc_to_dn(m68k_cpu *cpu) {
+    int dn = (int)(cpu->jit_arg2 & 7);
+    int an = (int)((cpu->jit_arg2 >> 4) & 7);
+    u32 addr = cpu->a[an];
+    u16 v = mac_read16(cpu->mem, addr);
+    cpu->d[dn] = (cpu->d[dn] & 0xFFFF0000u) | v;
+    cpu->a[an] = addr + 2;
+    u8 ccr = m68k_get_ccr(cpu) & CCR_X;
+    if (v == 0)        ccr |= CCR_Z;
+    if (v & 0x8000)    ccr |= CCR_N;
+    m68k_set_ccr(cpu, ccr);
+}
+
 void m68k_step(m68k_cpu *cpu) {
     /* Once the CPU has halted (e.g. the guest wrote the debug exit port),
      * further steps are no-ops. This keeps a JIT block — which may contain

@@ -58,6 +58,7 @@ static u32 helper_addr(literal_id id, void *user) {
         case HELPER_JIT_MOVEM_L_PREDEC:  return (u32)(uintptr_t)&m68k_jit_movem_l_predec_from_regs;
         case HELPER_JIT_MOVEM_W_TO_MEM:  return (u32)(uintptr_t)&m68k_jit_movem_w_to_mem;
         case HELPER_JIT_MOVEM_L_TO_MEM:  return (u32)(uintptr_t)&m68k_jit_movem_l_to_mem;
+        case HELPER_JIT_MOVE_W_POSTINC_TO_DN: return (u32)(uintptr_t)&m68k_jit_move_w_postinc_to_dn;
         default:                return 0;
     }
 #else
@@ -73,6 +74,7 @@ static u32 helper_addr(literal_id id, void *user) {
         case HELPER_JIT_MOVEM_L_PREDEC:  return (u32)HELPER_JIT_MOVEM_L_PREDEC;
         case HELPER_JIT_MOVEM_W_TO_MEM:  return (u32)HELPER_JIT_MOVEM_W_TO_MEM;
         case HELPER_JIT_MOVEM_L_TO_MEM:  return (u32)HELPER_JIT_MOVEM_L_TO_MEM;
+        case HELPER_JIT_MOVE_W_POSTINC_TO_DN: return (u32)HELPER_JIT_MOVE_W_POSTINC_TO_DN;
         default:                return 0;
     }
 #endif
@@ -286,6 +288,7 @@ static void sim_call(xt_sim *s, u32 fn_token) {
         case HELPER_JIT_MOVEM_L_PREDEC:  m68k_jit_movem_l_predec_from_regs(c->cpu); break;
         case HELPER_JIT_MOVEM_W_TO_MEM:  m68k_jit_movem_w_to_mem(c->cpu); break;
         case HELPER_JIT_MOVEM_L_TO_MEM:  m68k_jit_movem_l_to_mem(c->cpu); break;
+        case HELPER_JIT_MOVE_W_POSTINC_TO_DN: m68k_jit_move_w_postinc_to_dn(c->cpu); break;
         default: break;
     }
 }

@@ -47,6 +47,7 @@ typedef enum {
     HELPER_JIT_MOVEM_L_PREDEC,   /* MOVEM.L reglist,-(An) fast helper */
     HELPER_JIT_MOVEM_W_TO_MEM,   /* MOVEM.W reglist,(An) fast helper */
     HELPER_JIT_MOVEM_L_TO_MEM,   /* MOVEM.L reglist,(An) fast helper */
+    HELPER_JIT_MOVE_W_POSTINC_TO_DN, /* MOVE.W (An)+,Dn fast helper for MMIO */
     LITERAL_COUNT
 } literal_id;
 

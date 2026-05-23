@@ -1685,9 +1685,15 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             xt_and  (&e, 10, 8, 9);
             emit_cache_flush(&e, &rc);
             i32 op_pc_wp = 2, op_cyc_wp = 8;
-            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_wp, op_cyc_wp)));
-            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
-                                              entry_off, &rc, op_pc_wp, op_cyc_wp);
+            /* Custom MMIO helper bridge — replaces m68k_step for VIA reads. */
+            u32 wp_bridge_size = emit_jit_fast_helper_size(&rc);
+            xt_beqz (&e, 10, (i32)(6u + wp_bridge_size));
+            /* a8 still has An (the addr). Use it for jit_arg1 (helper ignores
+             * it and uses jit_arg2's packed dn|an<<4 instead). */
+            emit_jit_fast_helper(&e, 8, dn | (an << 4),
+                                 lit_off[HELPER_JIT_MOVE_W_POSTINC_TO_DN],
+                                 entry_off, &rc);
+            (void)op_pc_wp; (void)op_cyc_wp;
             u32 jwp_pos = e.len;
             xt_j    (&e, 4);
             /* Fast path: read 2 BE bytes into a10 (.W value). */
