@@ -187,14 +187,16 @@ instr/cyc on the target; helper-cost proxy `M68K_JIT_HELPER_LX7_COST = 64`).
 | JIT M6.42 (fast-path MMIO helper for ORI.B (d16,An)) ✨ | 1.289 | 23.76 × | 1.734 | 17.66 × |
 | JIT M6.43 (fast-path MMIO helper for BTST (d16,An)) ✨ | 1.289 | 23.76 × | 1.723 | 17.78 × |
 | JIT M6.44 (MOVEM fast helpers, large-reglist arms only) | 1.289 | 23.76 × | 1.723 | 17.78 × |
-| **JIT M6.45 (current — redirect small-N MOVEM bridges to fast helpers)** 🎯 | **1.289** | **23.76 ×** | **1.729** | **17.72 ×** |
+| JIT M6.45 (redirect small-N MOVEM bridges to fast helpers) 🎯 | 1.289 | 23.76 × | 1.729 | 17.72 × |
+| JIT M6.46 (add MOVEM.L reglist,(An) fast helper) | 1.289 | 23.76 × | 1.725 | 17.76 × |
+| **JIT M6.47 (current — MOVE.W (An)+,Dn fast helper for MMIO reads)** | **1.289** | **23.76 ×** | **1.721** | **17.80 ×** |
 
 ### Real-cost view (from M6.41's `real_lx7_per_cyc`)
 
-| Engine | M6.40 | M6.42 | M6.43 | M6.44 | M6.45 | M6.45 × Mac Plus |
-|--------|------:|------:|------:|------:|------:|-----------------:|
-| Bench  | 1.293 | 1.293 | 1.293 | 1.293 | 1.289 | **23.76 ×**       |
-| Boot   | 3.092 | 2.599 | 2.358 | 2.358 | **1.945** | **15.75 ×** 🎯    |
+| Engine | M6.40 | M6.45 | M6.46 | M6.47 | M6.47 × Mac Plus |
+|--------|------:|------:|------:|------:|-----------------:|
+| Bench  | 1.293 | 1.289 | 1.289 | 1.289 | **23.76 ×**       |
+| Boot   | 3.092 | 1.945 | 1.801 | **1.727** | **17.74 ×** 🎯    |
 
 The displayed metric is now diverging from real cost. Boot displayed
 *slightly worsened* in M6.45 (1.723 → 1.729) because the new bridges
