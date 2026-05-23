@@ -184,14 +184,15 @@ instr/cyc on the target; helper-cost proxy `M68K_JIT_HELPER_LX7_COST = 64`).
 | JIT M6.39 (inline ADD.W/SUB.W Dm,Dn + TST.L Dn) | 1.292 | 23.71 × | 2.193 | 13.97 × |
 | JIT M6.40 (inline MOVEM family with size gating) 🚀 | 1.289 | 23.76 × | 1.756 | 17.44 × |
 | JIT M6.41 (diagnostic: print real helper count from cpu->instrs) | 1.289 | 23.76 × | 1.756 | 17.44 × |
-| **JIT M6.42 (current — fast-path MMIO helper for ORI.B (d16,An))** ✨ | **1.289** | **23.76 ×** | **1.734** | **17.66 ×** |
+| JIT M6.42 (fast-path MMIO helper for ORI.B (d16,An)) ✨ | 1.289 | 23.76 × | 1.734 | 17.66 × |
+| **JIT M6.43 (current — fast-path MMIO helper for BTST (d16,An))** ✨ | **1.289** | **23.76 ×** | **1.723** | **17.78 ×** |
 
 ### Real-cost view (from M6.41's `real_lx7_per_cyc`)
 
-| Engine | M6.40 real lx7/cyc | M6.42 real lx7/cyc | M6.42 real × Mac Plus |
-|--------|-------------------:|-------------------:|----------------------:|
-| Bench  | 1.293              | 1.293              | **23.69 ×**            |
-| Boot   | 3.092              | 2.599              | **11.78 ×**            |
+| Engine | M6.40 real lx7/cyc | M6.42 real | M6.43 real | M6.43 × Mac Plus |
+|--------|-------------------:|-----------:|-----------:|-----------------:|
+| Bench  | 1.293              | 1.293      | 1.293      | **23.69 ×**       |
+| Boot   | 3.092              | 2.599      | **2.358**  | **12.99 ×**       |
 | Goal: 5 × interp on bench       | 1.32            | **23.2 ×**       | 1.18           | **25.9 ×**      |
 
 **Mac Plus speed already cleared** (>1 ×) by the interpreter alone —
