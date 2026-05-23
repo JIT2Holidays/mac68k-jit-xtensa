@@ -558,6 +558,7 @@ void m68k_step(m68k_cpu *cpu) {
      * instructions after the halting one — from diverging from the
      * interpreter's run loop, which stops the instant `halted` is set. */
     if (cpu->halted) return;
+    cpu->instrs++;
     u32 op_pc = cpu->pc;
     u16 op = fetch16(cpu);
     cpu->cycles += 4;

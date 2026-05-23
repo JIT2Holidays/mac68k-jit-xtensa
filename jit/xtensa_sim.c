@@ -267,5 +267,6 @@ static void step(xt_sim *s) {
 void xt_sim_run(xt_sim *s, u32 max_steps) {
     while (s->status == XT_SIM_RUN && max_steps-- > 0) {
         step(s);
+        s->instr_count++;
     }
 }

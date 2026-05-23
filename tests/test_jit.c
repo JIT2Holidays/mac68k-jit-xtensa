@@ -97,12 +97,59 @@ static u32 build_moveq(u8 *img) {
     return a.len;
 }
 
+/* snippet: a Bcc.S loop. The m68a assembler emits only 16-bit-disp
+ * branches, so short branches (the inlined JIT path) are hand-encoded.
+ * D0 counts 5→0; BNE.S loops while D0 != 0. */
+static u32 build_branch(u8 *img) {
+    m68a a;
+    m68a_init(&a, img, 512, 0);
+    m68a_w32(&a, 0x00020000);              /* SSP */
+    m68a_w32(&a, 0x00000100);              /* PC  */
+    while (m68a_here(&a) < 0x100) m68a_w16(&a, 0x4E71);
+    m68a_moveq(&a, 0, 5);                  /* D0 = 5            */
+    m68a_w16(&a, 0x5380);                  /* loop: SUBQ.L #1,D0 */
+    m68a_w16(&a, 0x66FC);                  /* BNE.S loop (-4)   */
+    m68a_moveq(&a, 1, -3);                 /* D1 = -3           */
+    m68a_w16(&a, 0x5281);                  /* L2: ADDQ.L #1,D1  */
+    m68a_w16(&a, 0x6DFC);                  /* BLT.S L2 (D1<0)   */
+    m68a_moveq(&a, 2, -3);                 /* D2 = -3           */
+    m68a_w16(&a, 0x5282);                  /* L3: ADDQ.L #1,D2  */
+    m68a_w16(&a, 0x6FFC);                  /* BLE.S L3 (D2<=0)  */
+    m68a_w16(&a, 0x6002);                  /* BRA.S +2 (over)   */
+    m68a_w16(&a, 0x4E71);                  /* NOP (skipped)     */
+    m68a_stop(&a, 0x2700);
+    m68a_finish(&a);
+    return a.len;
+}
+
 int main(void) {
     int rc = 0;
 
     u8 snip[512];
     u32 slen = build_moveq(snip);
     rc |= run_both("moveq-snippet", snip, slen, 100000);
+
+    u8 brsnip[512];
+    u32 brlen = build_branch(brsnip);
+    rc |= run_both("branch-loop", brsnip, brlen, 100000);
+
+    /* OR.L / AND.L / SUB.L register forms (hand-encoded). */
+    {
+        u8 al[512];
+        m68a a;
+        m68a_init(&a, al, 512, 0);
+        m68a_w32(&a, 0x00020000);
+        m68a_w32(&a, 0x00000100);
+        while (m68a_here(&a) < 0x100) m68a_w16(&a, 0x4E71);
+        m68a_moveq(&a, 0, 0x55);
+        m68a_moveq(&a, 1, 0x0F);
+        m68a_w16(&a, 0x8081);              /* OR.L  D1,D0 */
+        m68a_w16(&a, 0xC081);              /* AND.L D1,D0 */
+        m68a_w16(&a, 0x9081);              /* SUB.L D1,D0 */
+        m68a_stop(&a, 0x2700);
+        m68a_finish(&a);
+        rc |= run_both("alu-reg", al, a.len, 100000);
+    }
 
     u8 demo[DEMO_ROM_MAX];
     mac_mem tmp;

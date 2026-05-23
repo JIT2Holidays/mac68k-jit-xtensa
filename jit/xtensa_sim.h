@@ -34,6 +34,10 @@ typedef struct xt_sim {
     u32 code_size;
     u32 pc;     /* byte offset within `code` */
 
+    /* Number of Xtensa instructions executed — a real-LX7-cycle proxy
+     * for benchmarking the JIT (see dispatcher.h). */
+    u64 instr_count;
+
     /* L32R literal pool resolver. PC-relative addresses pointing BEFORE code
      * are looked up via this callback; the sim returns the 32-bit literal at
      * the requested target address. */

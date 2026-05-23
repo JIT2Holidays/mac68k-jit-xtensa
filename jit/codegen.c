@@ -25,14 +25,33 @@
 /* Xtensa registers reserved across a block. */
 #define R_ARG   2     /* CALLX0 first argument          */
 #define R_CPU   3     /* cpu_state base (survives calls) */
-#define R_HELP 14     /* CALLX0 target scratch          */
-/* a8..a13, a15 are inline-op scratch. */
+#define R_CACHE0 4    /* Four guest-register cache slots (a4..a7). The   */
+#define R_CACHE1 5    /* per-block setup assigns hot D/A regs to these   */
+#define R_CACHE2 6    /* slots, prologue loads them from cpu_state, the  */
+#define R_CACHE3 7    /* epilogue (and any helper boundary) stores back. */
+#define R_HELP 13     /* CALLX0 target scratch (was a14; freed for R_SR)  */
+#define R_SR   14     /* cached cpu->sr (low 16 bits) — modified in place */
+                      /* by flag emits; flushed to cpu_state around helpers. */
+/* a8..a12 are inline-op scratch; a15 is emit_load_imm32 tmp. */
+
+/* Cache state passed through every inline emit. cache_xt_reg[guest] returns
+ * the Xtensa register caching guest reg `guest` (encoded as 0..7 for D0..D7,
+ * 8..15 for A0..A7), or -1 if not cached. */
+#define G_D(n) ((n) & 7)
+#define G_A(n) (8 + ((n) & 7))
+typedef struct {
+    i8  xt[16];        /* xt[gi] = Xtensa register caching guest gi, or -1 */
+    u8  guest[4];      /* slot i caches this guest reg (G_D/G_A encoding)  */
+    u8  active;        /* number of slots in use (0..4)                    */
+    u16 dirty;         /* bit i set if cache slot i is dirty (write-back   */
+                       /* deferred). Cleared on flush.                     */
+} regcache;
 
 /* Worst-case bytes any single instruction's emission can need. The fattest
  * inline body (ADD.L with full flag computation) is ~40 narrow-form ops at
  * 3 bytes each. */
-#define BYTES_PER_OP        160u
-#define PROLOGUE_EPILOGUE   48u
+#define BYTES_PER_OP        240u
+#define PROLOGUE_EPILOGUE   96u
 
 static u32 align_up_4(u32 v) { return (v + 3u) & ~3u; }
 
@@ -47,17 +66,86 @@ static void emit_l32r_at(xt_emit *e, u8 at, u32 lit_off, u32 pc_off) {
     xt_l32r(e, at, imm16);
 }
 
-/* --- inline op emitters ----------------------------------------------- */
+/* --- register cache plumbing ------------------------------------------ */
 
-/* cpu->pc += delta ; cpu->cycles += cyc  (low 32 bits, carry ignored). */
-static void emit_advance(xt_emit *e, i32 pc_delta, i32 cyc) {
-    xt_l32i(e, 8, R_CPU, OFF_PC);
-    xt_addi(e, 8, 8, pc_delta);
-    xt_s32i(e, 8, R_CPU, OFF_PC);
-    xt_l32i(e, 8, R_CPU, OFF_CYCLES);
-    xt_addi(e, 8, 8, cyc);
-    xt_s32i(e, 8, R_CPU, OFF_CYCLES);
+static inline u8 cache_xt_slot(int slot) {
+    return (u8)(R_CACHE0 + slot);   /* a4 + slot */
 }
+
+/* Returns the Xtensa register holding guest reg `gi` (G_D / G_A encoding),
+ * or -1 if `gi` isn't cached. */
+static inline int cache_lookup(const regcache *rc, int gi) {
+    return rc ? rc->xt[gi] : -1;
+}
+
+/* Load the value of guest reg `gi` into the named Xtensa register `dst`.
+ * Uses xt_mov from the cache slot when the reg is cached; falls back to
+ * l32i from cpu_state otherwise. Idempotent — safe to call inside any emit. */
+static void emit_read_g(xt_emit *e, const regcache *rc, int gi, u8 dst) {
+    int xr = cache_lookup(rc, gi);
+    if (xr >= 0) {
+        if ((u8)xr != dst) xt_mov(e, dst, (u8)xr);
+        return;
+    }
+    if (gi < 8) xt_l32i(e, dst, R_CPU, OFF_D(gi));
+    else        xt_l32i(e, dst, R_CPU, OFF_A(gi - 8));
+}
+
+/* Return an Xtensa register holding the value of guest reg `gi`. If `gi`
+ * is cached, returns the cache slot directly and emits nothing (caller
+ * must treat the result as read-only — writing to it without dirty-marking
+ * would desync the cache). Otherwise, emits l32i into `scratch` and
+ * returns `scratch`.
+ *
+ * Use this in inline emits whose consumer reads but does not write to the
+ * operand (the common case for ALU sources, bounds-check operands, etc.).
+ * Saves the xt_mov from cache slot → scratch in the cached case. */
+static u8 emit_read_g_in(xt_emit *e, const regcache *rc, int gi, u8 scratch) {
+    int xr = cache_lookup(rc, gi);
+    if (xr >= 0) return (u8)xr;
+    if (gi < 8) xt_l32i(e, scratch, R_CPU, OFF_D(gi));
+    else        xt_l32i(e, scratch, R_CPU, OFF_A(gi - 8));
+    return scratch;
+}
+
+/* Write `src` into guest reg `gi`. Cached: mov to the cache slot and mark
+ * it dirty (a later flush is responsible for the s32i). Uncached: s32i. */
+static void emit_write_g(xt_emit *e, regcache *rc, int gi, u8 src) {
+    int xr = cache_lookup(rc, gi);
+    if (xr >= 0) {
+        if ((u8)xr != src) xt_mov(e, (u8)xr, src);
+        for (int i = 0; i < (rc ? rc->active : 0); i++)
+            if (rc->guest[i] == (u8)gi) { rc->dirty |= (u16)(1u << i); break; }
+        return;
+    }
+    if (gi < 8) xt_s32i(e, src, R_CPU, OFF_D(gi));
+    else        xt_s32i(e, src, R_CPU, OFF_A(gi - 8));
+}
+
+/* Write back dirty cache slots to cpu state, then mark clean. */
+static void emit_cache_flush(xt_emit *e, regcache *rc) {
+    if (!rc) return;
+    for (int i = 0; i < rc->active; i++) {
+        if (!(rc->dirty & (1u << i))) continue;
+        int gi = rc->guest[i];
+        if (gi < 8) xt_s32i(e, cache_xt_slot(i), R_CPU, OFF_D(gi));
+        else        xt_s32i(e, cache_xt_slot(i), R_CPU, OFF_A(gi - 8));
+    }
+    rc->dirty = 0;
+}
+
+/* Reload every cached slot from cpu state. Called after a helper. */
+static void emit_cache_reload(xt_emit *e, regcache *rc) {
+    if (!rc) return;
+    for (int i = 0; i < rc->active; i++) {
+        int gi = rc->guest[i];
+        if (gi < 8) xt_l32i(e, cache_xt_slot(i), R_CPU, OFF_D(gi));
+        else        xt_l32i(e, cache_xt_slot(i), R_CPU, OFF_A(gi - 8));
+    }
+    rc->dirty = 0;
+}
+
+/* --- inline op emitters ----------------------------------------------- */
 
 /* Build an arbitrary 32-bit constant into `dst` (movi only reaches 12
  * bits). `tmp` is a scratch register distinct from `dst`. */
@@ -71,52 +159,281 @@ static void emit_load_imm32(xt_emit *e, u8 dst, u8 tmp, u32 val) {
     }
 }
 
+/* Load `val` into `dst`. Uses a single xt_movi when val fits in 12-bit
+ * signed (-2048..2047), else falls back to emit_load_imm32. Saves 9
+ * Xtensa ops per call when the immediate is small. */
+static void emit_load_imm(xt_emit *e, u8 dst, u8 tmp, u32 val) {
+    i32 sv = (i32)val;
+    if (sv >= -2048 && sv <= 2047) xt_movi(e, dst, sv);
+    else                            emit_load_imm32(e, dst, tmp, val);
+}
+
+/* emit_advance is now compile-time bookkeeping only: it accumulates
+ * pc/cyc deltas across consecutive inline ops, then a single combined
+ * emit_advance_flush() emits the actual l32i/addi/s32i sequence before
+ * each helper-step (so m68k_step sees current cpu->pc/cycles) and at
+ * the block epilogue. Saves 6 ops per inline-op-between-helpers — big
+ * win for inline-dominated hot loops where today every emit_advance
+ * costs 6 ops × N inline ops per block. */
+static i32 g_pc_acc;
+static i32 g_cyc_acc;
+
+/* Emit `cpu->pc += g_pc_acc; cpu->cycles += g_cyc_acc;` if either is
+ * non-zero, then reset. */
+static void emit_advance_flush(xt_emit *e) {
+    if (g_pc_acc) {
+        xt_l32i(e, 8, R_CPU, OFF_PC);
+        if (g_pc_acc >= -128 && g_pc_acc <= 127) {
+            xt_addi(e, 8, 8, g_pc_acc);
+        } else {
+            emit_load_imm(e, 9, 10, (u32)g_pc_acc);
+            xt_add(e, 8, 8, 9);
+        }
+        xt_s32i(e, 8, R_CPU, OFF_PC);
+        g_pc_acc = 0;
+    }
+    if (g_cyc_acc) {
+        xt_l32i(e, 8, R_CPU, OFF_CYCLES);
+        if (g_cyc_acc >= -128 && g_cyc_acc <= 127) {
+            xt_addi(e, 8, 8, g_cyc_acc);
+        } else {
+            emit_load_imm(e, 9, 10, (u32)g_cyc_acc);
+            xt_add(e, 8, 8, 9);
+        }
+        xt_s32i(e, 8, R_CPU, OFF_CYCLES);
+        g_cyc_acc = 0;
+    }
+}
+
+/* Per-op call. Just accumulates; the deferred flush emits the code. */
+static void emit_advance(xt_emit *e, i32 pc_delta, i32 cyc) {
+    (void)e;
+    g_pc_acc += pc_delta;
+    g_cyc_acc += cyc;
+}
+
+/* (emit_advance_now was used to directly emit cpu->pc/cycles updates
+ * in conditional-helper fast paths. The deferred-advance refactor in
+ * M6.20 replaced it with emit_advance (compile-time accumulator) plus
+ * emit_helper_step_after_flush_undo for the helper bridge — saves 6
+ * LX7 ops per fast-path execution.) */
+
+/* SR cache: cpu->sr lives in R_SR across the block. Modifying SR via
+ * flag emits is now register-resident — no l16ui/s16i per emit. Helpers
+ * read/write cpu->sr (interrupt level, X bit, etc.) so flush/reload
+ * around any callx0 to m68k_step.
+ *
+ * `g_sr_dirty` is a per-block-compile flag: set true after every flag
+ * emit, cleared by sr_flush. When false the flush is skipped (helper
+ * still gets correct cpu->sr because no flag emit has touched R_SR
+ * since the last flush/reload). Big win for helper-heavy boot code
+ * with few inline flag emits. */
+static bool g_sr_dirty;
+
+/* Per-block compile-time memoization of sext(.W) results in a13.
+ *   `g_sext_src_reg`: guest reg whose .W was sign-extended to 32 bits.
+ *   `g_sext_valid`  : true if a13 currently holds that sext result.
+ * Invalidated on: helper-step (callx0 sets a13 from HELPER literal),
+ * flag emit (a13 used as scratch), emit_cond (a13 = N bit), any write
+ * to `g_sext_src_reg`. Reset at start of each block. Saves 3 ops per
+ * reused ADDA.W execution. */
+static int  g_sext_src_reg;
+static bool g_sext_valid;
+static inline void sext_memo_invalidate(void) { g_sext_valid = false; }
+
+static void emit_sr_flush(xt_emit *e) {
+    if (g_sr_dirty) { xt_s16i(e, R_SR, R_CPU, OFF_SR); g_sr_dirty = false; }
+}
+static void emit_sr_reload(xt_emit *e) {
+    xt_l16ui(e, R_SR, R_CPU, OFF_SR);
+    g_sr_dirty = false;
+}
+
+static void emit_helper_step(xt_emit *e, u32 helper_lit_off, u32 entry_off,
+                             regcache *rc) {
+    emit_advance_flush(e);
+    emit_cache_flush(e, rc);
+    emit_sr_flush(e);
+    xt_mov(e, R_ARG, R_CPU);
+    emit_l32r_at(e, R_HELP, helper_lit_off, entry_off + e->len);
+    xt_callx0(e, R_HELP);
+    emit_sr_reload(e);
+    emit_cache_reload(e, rc);
+    sext_memo_invalidate();
+}
+
+/* (emit_helper_step_after_flush was the no-undo variant; replaced by
+ * emit_helper_step_after_flush_undo at every conditional helper site.) */
+
+/* Byte size of the conditional-helper bridge before the optional undo
+ * is added. Used by helper_step_after_flush_undo_size. */
+static u32 helper_step_after_flush_base_size(const regcache *rc) {
+    u32 sz = 3u /*mov*/ + 3u /*l32r*/ + 3u /*callx0*/ + 3u /*sr_reload*/;
+    if (g_sr_dirty) sz += 3u;
+    if (!rc) return sz;
+    sz += (u32)rc->active * 3u;
+    return sz;
+}
+
+/* Variant that subtracts the op's own pc_delta/cyc from cpu->pc/cycles
+ * AFTER the m68k_step's natural advance. Used when the conditional
+ * helper site's fast path defers its own emit_advance_now into the
+ * PC/cycles accumulator (saving 6 emitted LX7 ops per fast-path
+ * execution at the cost of 6 emitted ops in the helper bridge). */
+static void emit_helper_step_after_flush_undo(xt_emit *e, u32 helper_lit_off,
+                                              u32 entry_off, regcache *rc,
+                                              i32 pc_undo, i32 cyc_undo) {
+    emit_sr_flush(e);
+    xt_mov(e, R_ARG, R_CPU);
+    emit_l32r_at(e, R_HELP, helper_lit_off, entry_off + e->len);
+    xt_callx0(e, R_HELP);
+    if (pc_undo) {
+        xt_l32i(e, 8, R_CPU, OFF_PC);
+        xt_addi(e, 8, 8, -pc_undo);
+        xt_s32i(e, 8, R_CPU, OFF_PC);
+    }
+    if (cyc_undo) {
+        xt_l32i(e, 8, R_CPU, OFF_CYCLES);
+        xt_addi(e, 8, 8, -cyc_undo);
+        xt_s32i(e, 8, R_CPU, OFF_CYCLES);
+    }
+    emit_sr_reload(e);
+    emit_cache_reload(e, rc);
+    sext_memo_invalidate();   /* helper branch sets a13 = HELPER literal */
+}
+static u32 helper_step_after_flush_undo_size(const regcache *rc,
+                                             i32 pc_undo, i32 cyc_undo) {
+    u32 sz = helper_step_after_flush_base_size(rc);
+    if (pc_undo) sz += 9u;
+    if (cyc_undo) sz += 9u;
+    return sz;
+}
+
 /* MOVE-family CCR update: N,Z from the value in `vreg`; V,C cleared;
- * X preserved. `vreg` is not clobbered. */
+ * X preserved. `vreg` is not clobbered. R_SR is updated in place. */
 static void emit_logic_flags(xt_emit *e, u8 vreg) {
-    xt_l16ui(e, 9, R_CPU, OFF_SR);
     xt_movi (e, 10, -16);               /* keep bit 4 (X) and up */
-    xt_and  (e, 9, 9, 10);
+    xt_and  (e, R_SR, R_SR, 10);
     xt_extui(e, 11, vreg, 31, 0);       /* N bit */
     xt_slli (e, 11, 11, 3);
-    xt_or   (e, 9, 9, 11);
+    xt_or   (e, R_SR, R_SR, 11);
     xt_movi (e, 11, 0x04);              /* Z */
     xt_bnez (e, vreg, 6);               /* value != 0 -> skip the OR */
-    xt_or   (e, 9, 9, 11);
-    xt_s16i (e, 9, R_CPU, OFF_SR);
+    xt_or   (e, R_SR, R_SR, 11);
+    g_sr_dirty = true;
+    sext_memo_invalidate();
 }
 
 /* MOVEQ #imm8,Dn — d[n] = sign-extend(imm8); MOVE-family flags. */
-static void emit_moveq(xt_emit *e, u16 op) {
+static void emit_moveq(xt_emit *e, u16 op, bool skip_flags, regcache *rc) {
     int dn = (op >> 9) & 7;
     i32 imm = (i8)(op & 0xFF);
-    xt_movi(e, 8, imm);
-    xt_s32i(e, 8, R_CPU, OFF_D(dn));
-    emit_logic_flags(e, 8);
+    int xt_dst = cache_lookup(rc, G_D(dn));
+    u8 dst = (xt_dst >= 0) ? (u8)xt_dst : 8;
+    xt_movi(e, dst, imm);
+    if (xt_dst >= 0) {
+        for (int i = 0; i < rc->active; i++)
+            if (rc->guest[i] == (u8)G_D(dn)) { rc->dirty |= (u16)(1u << i); break; }
+    } else {
+        xt_s32i(e, dst, R_CPU, OFF_D(dn));
+    }
+    if (!skip_flags) emit_logic_flags(e, dst);
     emit_advance(e, 2, 4);
 }
 
 /* MOVE.L #imm32,Dn. */
-static void emit_move_l_imm_dn(xt_emit *e, int dn, u32 imm) {
-    emit_load_imm32(e, 8, 15, imm);
-    xt_s32i(e, 8, R_CPU, OFF_D(dn));
-    emit_logic_flags(e, 8);
+static void emit_move_l_imm_dn(xt_emit *e, int dn, u32 imm, bool skip_flags, regcache *rc) {
+    int xt_dst = cache_lookup(rc, G_D(dn));
+    u8 dst = (xt_dst >= 0) ? (u8)xt_dst : 8;
+    emit_load_imm(e, dst, 10, imm);
+    if (xt_dst >= 0) {
+        for (int i = 0; i < rc->active; i++)
+            if (rc->guest[i] == (u8)G_D(dn)) { rc->dirty |= (u16)(1u << i); break; }
+    } else {
+        xt_s32i(e, dst, R_CPU, OFF_D(dn));
+    }
+    if (!skip_flags) emit_logic_flags(e, dst);
     emit_advance(e, 6, 8);
 }
 
 /* MOVEA.L #imm32,An — address registers take no flags. */
-static void emit_movea_l_imm(xt_emit *e, int an, u32 imm) {
-    emit_load_imm32(e, 8, 15, imm);
-    xt_s32i(e, 8, R_CPU, OFF_A(an));
+static void emit_movea_l_imm(xt_emit *e, int an, u32 imm, regcache *rc) {
+    int xt_dst = cache_lookup(rc, G_A(an));
+    u8 dst = (xt_dst >= 0) ? (u8)xt_dst : 8;
+    emit_load_imm(e, dst, 10, imm);
+    if (xt_dst >= 0) {
+        for (int i = 0; i < rc->active; i++)
+            if (rc->guest[i] == (u8)G_A(an)) { rc->dirty |= (u16)(1u << i); break; }
+    } else {
+        xt_s32i(e, dst, R_CPU, OFF_A(an));
+    }
     emit_advance(e, 6, 8);
 }
 
 /* MOVE.L Dm,Dn. */
-static void emit_move_l_dd(xt_emit *e, int dn, int dm) {
-    xt_l32i(e, 8, R_CPU, OFF_D(dm));
-    xt_s32i(e, 8, R_CPU, OFF_D(dn));
-    emit_logic_flags(e, 8);
+static void emit_move_l_dd(xt_emit *e, int dn, int dm, bool skip_flags, regcache *rc) {
+    /* When both regs are cached we can mov cache_dn ← cache_dm and skip
+     * both the l32i and the s32i. */
+    int xt_dst = cache_lookup(rc, G_D(dn));
+    u8 dst = (xt_dst >= 0) ? (u8)xt_dst : 8;
+    emit_read_g(e, rc, G_D(dm), dst);
+    if (xt_dst >= 0) {
+        for (int i = 0; i < rc->active; i++)
+            if (rc->guest[i] == (u8)G_D(dn)) { rc->dirty |= (u16)(1u << i); break; }
+    } else {
+        xt_s32i(e, dst, R_CPU, OFF_D(dn));
+    }
+    if (!skip_flags) emit_logic_flags(e, dst);
     emit_advance(e, 2, 8);
+}
+
+/* MOVEA.L <Dm|Am>,An — a[an] = src register (full 32 bits). No flags. */
+static void emit_movea_l_reg(xt_emit *e, int an, int src, bool src_is_an, regcache *rc) {
+    int g_src = src_is_an ? G_A(src) : G_D(src);
+    int g_dst = G_A(an);
+    int xt_src = cache_lookup(rc, g_src);
+    int xt_dst = cache_lookup(rc, g_dst);
+    if (xt_dst >= 0) {
+        /* Write directly into the cache slot for An, skip the s32i. */
+        if (xt_src >= 0) {
+            if ((u8)xt_src != (u8)xt_dst) xt_mov(e, (u8)xt_dst, (u8)xt_src);
+        } else {
+            if (g_src < 8) xt_l32i(e, (u8)xt_dst, R_CPU, OFF_D(g_src));
+            else           xt_l32i(e, (u8)xt_dst, R_CPU, OFF_A(g_src - 8));
+        }
+        for (int i = 0; i < rc->active; i++)
+            if (rc->guest[i] == (u8)g_dst) { rc->dirty |= (u16)(1u << i); break; }
+    } else {
+        emit_read_g(e, rc, g_src, 8);
+        xt_s32i(e, 8, R_CPU, OFF_A(an));
+    }
+    emit_advance(e, 2, 8);
+}
+
+/* ADDA.W <Dm|Am>,An — a[an] += sign-extend-word(src register). No CCR. */
+static void emit_adda_w_reg(xt_emit *e, int an, int src, bool src_is_an, regcache *rc) {
+    int g_src = src_is_an ? G_A(src) : G_D(src);
+    int g_dst = G_A(an);
+    /* Sign-extended .W of g_src may already be live in a13 from a recent
+     * ADDA.W with the same source — saves 3 ops per reused execution. */
+    if (!g_sext_valid || g_sext_src_reg != g_src) {
+        emit_read_g(e, rc, g_src, 13);
+        xt_slli(e, 13, 13, 16);
+        xt_srai(e, 13, 13, 16);
+        g_sext_src_reg = g_src;
+        g_sext_valid = true;
+    }
+    int xt_dst = cache_lookup(rc, g_dst);
+    if (xt_dst >= 0) {
+        xt_add(e, (u8)xt_dst, (u8)xt_dst, 13);
+        for (int i = 0; i < rc->active; i++)
+            if (rc->guest[i] == (u8)g_dst) { rc->dirty |= (u16)(1u << i); break; }
+    } else {
+        xt_l32i(e, 9, R_CPU, OFF_A(an));
+        xt_add (e, 9, 9, 13);
+        xt_s32i(e, 9, R_CPU, OFF_A(an));
+    }
+    emit_advance(e, 2, 12);
 }
 
 /* Emit the CCR update shared by the inlined long ADD/SUB family.
@@ -129,89 +446,584 @@ static void emit_move_l_dd(xt_emit *e, int dn, int dm) {
  *   add overflow   = (s^r) & (d^r)
  *   sub overflow   = (s^d) & (d^r)
  *   N = r msb, Z = (r == 0), X = C. */
-static void emit_addsub_flags_long(xt_emit *e, bool is_sub, bool keep_x) {
-    if (!is_sub) {
-        xt_and(e, 11, 8, 9);            /* s & d            */
-        xt_or (e, 12, 8, 9);            /* s | d            */
-        xt_movi(e, 13, -1);
-        xt_xor(e, 13, 10, 13);          /* ~r               */
-    } else {
-        xt_movi(e, 13, -1);
-        xt_xor(e, 13, 9, 13);           /* ~d               */
-        xt_and(e, 11, 13, 8);           /* ~d & s           */
-        xt_or (e, 12, 13, 8);           /* ~d | s           */
-        xt_mov(e, 13, 10);              /* r                */
+/* CCR-bit mask passed to the flag emitters: bit 0 = C, 1 = V, 2 = Z,
+ * 3 = N, 4 = X. The lazy-CC peephole uses this to skip computation of
+ * bits the next consumer doesn't read. */
+#define CCR_BIT_C  0x01u
+#define CCR_BIT_V  0x02u
+#define CCR_BIT_Z  0x04u
+#define CCR_BIT_N  0x08u
+#define CCR_BIT_X  0x10u
+#define CCR_MASK_ALL 0x1Fu
+
+/* Parameterised: `s`, `d`, `r` may be the conventional a8/a9/a10, or any
+ * other register (cache slot a4..a7 for direct-cache emits). The function
+ * uses a11..a13 as scratch and clobbers a8, a9 in the final CCR-pack
+ * stage — callers must not rely on a8/a9 surviving the flag emit.
+ *
+ * `cc_mask` selects which CCR bits to materialise. Bits not in the mask
+ * are left unchanged in R_SR (their previous value is preserved). Used
+ * by the CMP-Bcc peephole: cc_mask = whatever_bits_bcc_reads. */
+static void emit_addsub_flags_long_masked(xt_emit *e, bool is_sub, bool keep_x,
+                                          u8 s, u8 d, u8 r, u8 cc_mask) {
+    bool need_c = (cc_mask & CCR_BIT_C) != 0;
+    bool need_v = (cc_mask & CCR_BIT_V) != 0;
+    bool need_z = (cc_mask & CCR_BIT_Z) != 0;
+    bool need_n = (cc_mask & CCR_BIT_N) != 0;
+    bool need_x = !keep_x && need_c;     /* X == C for ADD/SUB writes */
+    /* If nothing needs materialising, leave R_SR untouched. */
+    if (!need_c && !need_v && !need_z && !need_n && !need_x) {
+        return;
     }
-    xt_and (e, 12, 12, 13);             /* (s|d)&~r  /  (~d|s)&r */
-    xt_or  (e, 11, 11, 12);             /* carry/borrow term     */
-    xt_extui(e, 11, 11, 31, 1);         /* a11 = C (0/1)         */
+    /* Full-mask fast path (matches the pre-refactor 22-op sequence). */
+    bool full = need_c && need_v && need_z && need_n && (keep_x || need_x);
+    if (full) {
+        if (!is_sub) {
+            xt_and(e, 11, s, d);
+            xt_or (e, 12, s, d);
+            xt_movi(e, 13, -1);
+            xt_xor(e, 13, r, 13);
+        } else {
+            xt_movi(e, 13, -1);
+            xt_xor(e, 13, d, 13);
+            xt_and(e, 11, 13, s);
+            xt_or (e, 12, 13, s);
+            xt_mov(e, 13, r);
+        }
+        xt_and (e, 12, 12, 13);
+        xt_or  (e, 11, 11, 12);
+        xt_extui(e, 11, 11, 31, 1);
+        if (!is_sub) xt_xor(e, 12, s, r);
+        else         xt_xor(e, 12, s, d);
+        xt_xor (e, 13, d, r);
+        xt_and (e, 12, 12, 13);
+        xt_extui(e, 12, 12, 31, 1);
+        xt_extui(e, 13, r, 31, 1);
+        xt_slli(e, 12, 12, 1);
+        xt_or  (e, 8, 11, 12);
+        xt_slli(e, 13, 13, 3);
+        xt_or  (e, 8, 8, 13);
+        if (!keep_x) { xt_slli(e, 9, 11, 4); xt_or(e, 8, 8, 9); }
+        xt_movi(e, 9, 0x04);
+        xt_bnez(e, r, 6);
+        xt_or  (e, 8, 8, 9);
+        xt_movi(e, 12, keep_x ? -16 : -32);
+        xt_and (e, R_SR, R_SR, 12);
+        xt_or  (e, R_SR, R_SR, 8);
+        g_sr_dirty = true;
+        return;
+    }
 
-    if (!is_sub) xt_xor(e, 12, 8, 10);  /* s ^ r */
-    else         xt_xor(e, 12, 8, 9);   /* s ^ d */
-    xt_xor (e, 13, 9, 10);              /* d ^ r */
-    xt_and (e, 12, 12, 13);
-    xt_extui(e, 12, 12, 31, 1);         /* a12 = V */
+    /* Compute C bit (a11 = 0 or 1) if needed. */
+    if (need_c || need_x) {
+        if (!is_sub) {
+            xt_and(e, 11, s, d);
+            xt_or (e, 12, s, d);
+            xt_movi(e, 13, -1);
+            xt_xor(e, 13, r, 13);
+        } else {
+            xt_movi(e, 13, -1);
+            xt_xor(e, 13, d, 13);
+            xt_and(e, 11, 13, s);
+            xt_or (e, 12, 13, s);
+            xt_mov(e, 13, r);
+        }
+        xt_and (e, 12, 12, 13);
+        xt_or  (e, 11, 11, 12);
+        xt_extui(e, 11, 11, 31, 1);     /* a11 = C */
+    }
+    if (need_v) {
+        if (!is_sub) xt_xor(e, 12, s, r);
+        else         xt_xor(e, 12, s, d);
+        xt_xor (e, 13, d, r);
+        xt_and (e, 12, 12, 13);
+        xt_extui(e, 12, 12, 31, 1);     /* a12 = V */
+    }
+    if (need_n) {
+        xt_extui(e, 13, r, 31, 1);      /* a13 = N */
+    }
 
-    xt_extui(e, 13, 10, 31, 1);         /* a13 = N */
-
-    /* ccr = C | V<<1 | N<<3 [ | X<<4 ]   (X == C for ADD/SUB; CMP keeps X) */
-    xt_slli(e, 12, 12, 1);
-    xt_or  (e, 8, 11, 12);
-    xt_slli(e, 13, 13, 3);
-    xt_or  (e, 8, 8, 13);
-    if (!keep_x) {
+    /* Pack into a8 — start with first set bit (avoid an extra movi 0). */
+    bool packed = false;
+    if (need_c) { xt_mov(e, 8, 11); packed = true; }
+    if (need_v) {
+        xt_slli(e, 12, 12, 1);
+        if (packed) xt_or(e, 8, 8, 12); else { xt_mov(e, 8, 12); packed = true; }
+    }
+    if (need_n) {
+        xt_slli(e, 13, 13, 3);
+        if (packed) xt_or(e, 8, 8, 13); else { xt_mov(e, 8, 13); packed = true; }
+    }
+    if (need_x) {
         xt_slli(e, 9, 11, 4);
+        if (packed) xt_or(e, 8, 8, 9); else { xt_mov(e, 8, 9); packed = true; }
+    }
+    if (need_z) {
+        if (!packed) { xt_movi(e, 8, 0); packed = true; }
+        xt_movi(e, 9, 0x04);
+        xt_bnez(e, r, 6);
         xt_or  (e, 8, 8, 9);
     }
-    /* Z: OR in 0x04 only when the result is zero. */
-    xt_movi(e, 9, 0x04);
-    xt_bnez(e, 10, 6);                  /* r != 0 -> skip the next op */
-    xt_or  (e, 8, 8, 9);
-    /* sr = (sr & mask) | ccr  — mask clears the bits we are about to set. */
-    xt_l16ui(e, 9, R_CPU, OFF_SR);
-    xt_movi (e, 12, keep_x ? -16 : -32);  /* ~0x0F (keep X) or ~0x1F */
-    xt_and  (e, 9, 9, 12);
-    xt_or   (e, 9, 9, 8);
-    xt_s16i (e, 9, R_CPU, OFF_SR);
+    u32 mask = ~((u32)cc_mask | (need_x ? CCR_BIT_X : 0));
+    xt_movi(e, 12, (i32)mask);
+    xt_and (e, R_SR, R_SR, 12);
+    xt_or  (e, R_SR, R_SR, 8);
+    g_sr_dirty = true;
+    sext_memo_invalidate();
 }
 
-/* ADD.L Dm,Dn — d[dn] += d[dm], full CCR. */
-static void emit_add_l_dd(xt_emit *e, int dn, int dm) {
-    xt_l32i(e, 8, R_CPU, OFF_D(dm));
-    xt_l32i(e, 9, R_CPU, OFF_D(dn));
+/* Default: emit all five bits (preserves prior behaviour). */
+static inline void emit_addsub_flags_long_ex(xt_emit *e, bool is_sub,
+                                             bool keep_x, u8 s, u8 d, u8 r) {
+    emit_addsub_flags_long_masked(e, is_sub, keep_x, s, d, r,
+                                  keep_x ? (CCR_MASK_ALL & ~CCR_BIT_X)
+                                         : CCR_MASK_ALL);
+}
+
+static inline void emit_addsub_flags_long(xt_emit *e, bool is_sub, bool keep_x) {
+    emit_addsub_flags_long_ex(e, is_sub, keep_x, 8, 9, 10);
+}
+
+/* ADD.L Dm,Dn — d[dn] += d[dm], full CCR. `skip_flags` lets the lazy-CC
+ * pass drop the flag emission when this op's CCR is overwritten before
+ * any consumer reads it.
+ *
+ * Direct-cache fast path (both Dm and Dn cached, dm != dn): in-place
+ * `add dn_slot, dn_slot, dm_slot` (1 op) replaces the classic 4-op
+ * sequence (2 movs + add + write-back mov). The flag emit takes the
+ * pre-add d via a saved a9 when flags aren't dead. */
+static void emit_add_l_dd(xt_emit *e, int dn, int dm, bool skip_flags, regcache *rc) {
+    int xt_dm = cache_lookup(rc, G_D(dm));
+    int xt_dn = cache_lookup(rc, G_D(dn));
+    if (xt_dm >= 0 && xt_dn >= 0 && dn != dm) {
+        u8 dm_reg = (u8)xt_dm, dn_reg = (u8)xt_dn;
+        if (!skip_flags) xt_mov(e, 9, dn_reg);     /* a9 = pre-add d */
+        xt_add(e, dn_reg, dn_reg, dm_reg);          /* in-place add */
+        for (int i = 0; i < rc->active; i++)
+            if (rc->guest[i] == (u8)G_D(dn)) { rc->dirty |= (u16)(1u << i); break; }
+        if (!skip_flags)
+            emit_addsub_flags_long_ex(e, false, false, dm_reg, 9, dn_reg);
+        emit_advance(e, 2, 8);
+        return;
+    }
+    emit_read_g(e, rc, G_D(dm), 8);     /* s */
+    emit_read_g(e, rc, G_D(dn), 9);     /* d */
     xt_add (e, 10, 8, 9);
-    xt_s32i(e, 10, R_CPU, OFF_D(dn));
-    emit_addsub_flags_long(e, false, false);
+    emit_write_g(e, rc, G_D(dn), 10);
+    if (!skip_flags) emit_addsub_flags_long(e, false, false);
     emit_advance(e, 2, 8);
 }
 
 /* ADDQ.L / SUBQ.L #imm,Dn — d[dn] +/- imm (imm 1..8), full CCR. */
-static void emit_addq_l_dd(xt_emit *e, int dn, int imm, bool is_sub) {
-    xt_movi(e, 8, imm);                 /* source operand */
-    xt_l32i(e, 9, R_CPU, OFF_D(dn));
+static void emit_addq_l_dd(xt_emit *e, int dn, int imm, bool is_sub, bool skip_flags, regcache *rc) {
+    xt_movi(e, 8, imm);
+    emit_read_g(e, rc, G_D(dn), 9);
     if (is_sub) xt_sub(e, 10, 9, 8);
     else        xt_add(e, 10, 8, 9);
-    xt_s32i(e, 10, R_CPU, OFF_D(dn));
-    emit_addsub_flags_long(e, is_sub, false);
+    emit_write_g(e, rc, G_D(dn), 10);
+    if (!skip_flags) emit_addsub_flags_long(e, is_sub, false);
     emit_advance(e, 2, 8);
 }
 
 /* ADDQ / SUBQ #imm,An — address-register form: no flags, any size. */
-static void emit_addq_an(xt_emit *e, int an, int delta) {
-    xt_l32i(e, 8, R_CPU, OFF_A(an));
-    xt_addi(e, 8, 8, delta);            /* delta in -8..8 */
-    xt_s32i(e, 8, R_CPU, OFF_A(an));
+static void emit_addq_an(xt_emit *e, int an, int delta, regcache *rc) {
+    int xt_dst = cache_lookup(rc, G_A(an));
+    if (xt_dst >= 0) {
+        xt_addi(e, (u8)xt_dst, (u8)xt_dst, delta);
+        for (int i = 0; i < rc->active; i++)
+            if (rc->guest[i] == (u8)G_A(an)) { rc->dirty |= (u16)(1u << i); break; }
+    } else {
+        xt_l32i(e, 8, R_CPU, OFF_A(an));
+        xt_addi(e, 8, 8, delta);
+        xt_s32i(e, 8, R_CPU, OFF_A(an));
+    }
     emit_advance(e, 2, 8);
 }
 
 /* CMP.L Dm,Dn — compares (Dn - Dm); sets N/Z/V/C, leaves X and the
- * registers untouched. */
-static void emit_cmp_l_dd(xt_emit *e, int dn, int dm) {
-    xt_l32i(e, 8, R_CPU, OFF_D(dm));     /* s */
-    xt_l32i(e, 9, R_CPU, OFF_D(dn));     /* d */
-    xt_sub (e, 10, 9, 8);               /* r = d - s (discarded) */
-    emit_addsub_flags_long(e, true, true);
+ * registers untouched. Direct-cache fast path: read both operands
+ * in-place (no movs) and compute (Dn - Dm) into a10. */
+static void emit_cmp_l_dd(xt_emit *e, int dn, int dm, regcache *rc, u8 cc_mask) {
+    u8 dm_reg = emit_read_g_in(e, rc, G_D(dm), 8);
+    u8 dn_reg = emit_read_g_in(e, rc, G_D(dn), 9);
+    xt_sub (e, 10, dn_reg, dm_reg);
+    emit_addsub_flags_long_masked(e, true, true, dm_reg, dn_reg, 10, cc_mask);
     emit_advance(e, 2, 8);
+}
+
+/* SUB.L Dm,Dn — d[dn] -= d[dm], full CCR (mirrors emit_add_l_dd). */
+static void emit_sub_l_dd(xt_emit *e, int dn, int dm, bool skip_flags, regcache *rc) {
+    int xt_dm = cache_lookup(rc, G_D(dm));
+    int xt_dn = cache_lookup(rc, G_D(dn));
+    if (xt_dm >= 0 && xt_dn >= 0 && dn != dm) {
+        u8 dm_reg = (u8)xt_dm, dn_reg = (u8)xt_dn;
+        if (!skip_flags) xt_mov(e, 9, dn_reg);     /* a9 = pre-sub d */
+        xt_sub(e, dn_reg, dn_reg, dm_reg);
+        for (int i = 0; i < rc->active; i++)
+            if (rc->guest[i] == (u8)G_D(dn)) { rc->dirty |= (u16)(1u << i); break; }
+        if (!skip_flags)
+            emit_addsub_flags_long_ex(e, true, false, dm_reg, 9, dn_reg);
+        emit_advance(e, 2, 8);
+        return;
+    }
+    emit_read_g(e, rc, G_D(dm), 8);
+    emit_read_g(e, rc, G_D(dn), 9);
+    xt_sub (e, 10, 9, 8);
+    emit_write_g(e, rc, G_D(dn), 10);
+    if (!skip_flags) emit_addsub_flags_long(e, true, false);
+    emit_advance(e, 2, 8);
+}
+
+/* AND.L / EOR.L register form: d[dst] = d[ra] <op> d[rb], logic CCR. */
+static void emit_logic_l_dd(xt_emit *e, int ra, int rb, int dst,
+                            bool is_eor, regcache *rc) {
+    emit_read_g(e, rc, G_D(ra), 8);
+    emit_read_g(e, rc, G_D(rb), 9);
+    if (is_eor) xt_xor(e, 8, 8, 9);
+    else        xt_and(e, 8, 8, 9);
+    emit_write_g(e, rc, G_D(dst), 8);
+    emit_logic_flags(e, 8);
+    emit_advance(e, 2, 8);
+}
+
+/* ORI/ANDI/SUBI/ADDI/EORI/CMPI.L #imm32,Dn. `kind` is the 68000 type
+ * field (bits 11-9): 0 OR, 1 AND, 2 SUB, 3 ADD, 5 EOR, 6 CMP. */
+static void emit_immalu_l_dn(xt_emit *e, int dn, u32 imm, int kind, regcache *rc) {
+    emit_load_imm(e, 8, 10, imm);
+    emit_read_g(e, rc, G_D(dn), 9);
+    if (kind == 3) {                         /* ADDI */
+        xt_add (e, 10, 8, 9);
+        emit_write_g(e, rc, G_D(dn), 10);
+        emit_addsub_flags_long(e, false, false);
+    } else if (kind == 2) {                  /* SUBI */
+        xt_sub (e, 10, 9, 8);
+        emit_write_g(e, rc, G_D(dn), 10);
+        emit_addsub_flags_long(e, true, false);
+    } else if (kind == 6) {                  /* CMPI — result discarded */
+        xt_sub (e, 10, 9, 8);
+        emit_addsub_flags_long(e, true, true);
+    } else {                                 /* ORI / ANDI / EORI */
+        if      (kind == 0) xt_or (e, 8, 8, 9);
+        else if (kind == 1) xt_and(e, 8, 8, 9);
+        else                xt_xor(e, 8, 8, 9);
+        emit_write_g(e, rc, G_D(dn), 8);
+        emit_logic_flags(e, 8);
+    }
+    emit_advance(e, 6, 8);
+}
+
+/* CMPI/ADDI/SUBI .W/.B #imm,Dn. `size`: 1 = .B, 2 = .W. `kind`:
+ * 2=SUBI, 3=ADDI, 6=CMPI. ADDI/SUBI write back only the low `size`
+ * bits of Dn, preserving the upper bits; CMPI is flag-only.
+ *
+ * emit_addsub_flags_long_ex reads (s, d, r) only in its first few
+ * instructions, then uses a8/a9/a11..a13 as scratch. So we use the
+ * conventional a8/a9/a10 = s'/d'/r' (shifted operands) — a10 is never
+ * written by the flag emit, and a8/a9 are written only after all
+ * operand reads complete. */
+static void emit_immarith_bw_dn(xt_emit *e, int dn, u32 imm, int size,
+                                int kind, regcache *rc) {
+    u32 size_mask = (size == 1) ? 0xFFu : 0xFFFFu;
+    i32 sext_imm = (i32)(imm & size_mask);
+    if (size == 1) sext_imm = (i32)(i8)sext_imm;
+    else           sext_imm = (i32)(i16)sext_imm;
+    emit_load_imm(e, 8, 10, (u32)sext_imm);     /* a8 = sext_imm */
+    emit_read_g(e, rc, G_D(dn), 9);              /* a9 = Dn */
+
+    /* Compute the 32-bit result; only the low `size` bits are valid for
+     * write-back, but the full 32-bit ADD/SUB is fine for the shift-up
+     * trick on the flag side because (a+b) << shift == (a<<shift) + (b<<shift). */
+    if (kind == 3) xt_add(e, 12, 9, 8);          /* a12 = Dn + imm */
+    else           xt_sub(e, 12, 9, 8);          /* a12 = Dn - imm */
+
+    if (kind != 6) {
+        /* Merge: (Dn & ~size_mask) | (result & size_mask). */
+        if (size == 1) {
+            xt_movi(e, 11, -256);                /* a11 = 0xFFFFFF00 */
+        } else {
+            xt_movi(e, 11, -1);
+            xt_slli(e, 11, 11, 16);              /* a11 = 0xFFFF0000 */
+        }
+        xt_and (e, 13, 9, 11);                   /* a13 = Dn & ~mask */
+        xt_extui(e, 11, 12, 0, (size == 1) ? 7 : 15);  /* a11 = result & mask */
+        xt_or  (e, 13, 13, 11);                  /* a13 = merged */
+        emit_write_g(e, rc, G_D(dn), 13);
+    }
+
+    /* Shift s, d, r into the high bits for the flag emit. After this
+     * we no longer need the raw a8/a9 values. */
+    int shift = (size == 1) ? 24 : 16;
+    xt_slli(e, 8,  8,  shift);                   /* s' */
+    xt_slli(e, 9,  9,  shift);                   /* d' (overwrites Dn) */
+    xt_slli(e, 10, 12, shift);                   /* r' */
+    emit_addsub_flags_long_ex(e, kind == 2 || kind == 6, kind == 6,
+                              8, 9, 10);
+    emit_advance(e, 4, 8);
+}
+
+/* ORI/ANDI/EORI .W and .B #imm,Dn — logical immediates, low size bits of
+ * Dn modified, upper bits preserved, MOVE-family CCR (N,Z from low size).
+ * `size`: 1 = .B, 2 = .W. `kind`: 0 OR, 1 AND, 5 EOR. */
+static void emit_immlogic_bw_dn(xt_emit *e, int dn, u32 imm, int size,
+                                int kind, regcache *rc) {
+    /* For OR/EOR with an imm whose high bits are zero, the operation on a
+     * full 32-bit Dn preserves the upper bits naturally. For AND, mask the
+     * imm's upper bits to 1 so they're a no-op on Dn. */
+    u32 size_mask = (size == 1) ? 0xFFu : 0xFFFFu;
+    u32 imm_op = imm & size_mask;
+    if (kind == 1) imm_op |= ~size_mask;     /* AND: high bits = 1 */
+    emit_load_imm(e, 8, 10, imm_op);
+    emit_read_g(e, rc, G_D(dn), 9);
+    if      (kind == 0) xt_or (e, 10, 9, 8);
+    else if (kind == 1) xt_and(e, 10, 9, 8);
+    else                xt_xor(e, 10, 9, 8);
+    emit_write_g(e, rc, G_D(dn), 10);
+    /* Shift the low-size result to high size so emit_logic_flags' bit-31
+     * N and "vreg != 0" Z reflect the size. */
+    xt_slli(e, 11, 10, (size == 1) ? 24 : 16);
+    emit_logic_flags(e, 11);
+    emit_advance(e, 4, 8);
+}
+
+/* Compute the 68000 condition `cc` (2..15) as a 0/1 boolean into a8.
+ * Clobbers a9..a12. CCR bits in cpu->sr (cached in R_SR): C=0, V=1, Z=2, N=3. */
+static void emit_cond(xt_emit *e, int cc) {
+    sext_memo_invalidate();             /* a13 may be written below */
+    /* Extract only the CCR bits this condition actually reads. */
+    bool need_c = (cc == 2 || cc == 3 || cc == 4 || cc == 5);
+    bool need_v = (cc == 8 || cc == 9 || cc == 12 || cc == 13 || cc == 14 || cc == 15);
+    bool need_z = (cc == 2 || cc == 3 || cc == 6 || cc == 7 || cc == 14 || cc == 15);
+    bool need_n = (cc == 10 || cc == 11 || cc == 12 || cc == 13 || cc == 14 || cc == 15);
+    if (need_c) xt_extui(e, 10, R_SR, 0, 0);   /* a10 = C */
+    if (need_v) xt_extui(e, 11, R_SR, 1, 0);   /* a11 = V */
+    if (need_z) xt_extui(e, 12, R_SR, 2, 0);   /* a12 = Z */
+    if (need_n) xt_extui(e, 13, R_SR, 3, 0);   /* a13 = N */
+    switch (cc) {
+    case 2:  xt_or (e,8,10,12); xt_movi(e,9,1); xt_xor(e,8,8,9); break; /* HI !(C|Z) */
+    case 3:  xt_or (e,8,10,12); break;                                 /* LS C|Z   */
+    case 4:  xt_movi(e,9,1); xt_xor(e,8,10,9); break;                  /* CC !C    */
+    case 5:  xt_mov(e,8,10); break;                                    /* CS C     */
+    case 6:  xt_movi(e,9,1); xt_xor(e,8,12,9); break;                  /* NE !Z    */
+    case 7:  xt_mov(e,8,12); break;                                    /* EQ Z     */
+    case 8:  xt_movi(e,9,1); xt_xor(e,8,11,9); break;                  /* VC !V    */
+    case 9:  xt_mov(e,8,11); break;                                    /* VS V     */
+    case 10: xt_movi(e,9,1); xt_xor(e,8,13,9); break;                  /* PL !N    */
+    case 11: xt_mov(e,8,13); break;                                    /* MI N     */
+    case 12: xt_xor(e,8,13,11); xt_movi(e,9,1); xt_xor(e,8,8,9); break;/* GE !(N^V)*/
+    case 13: xt_xor(e,8,13,11); break;                                 /* LT N^V   */
+    case 14: xt_xor(e,8,13,11); xt_or(e,8,8,12);
+             xt_movi(e,9,1); xt_xor(e,8,8,9); break;             /* GT !(Z|(N^V)) */
+    case 15: xt_xor(e,8,13,11); xt_or(e,8,8,12); break;          /* LE Z|(N^V)    */
+    default: xt_movi(e,8,0); break;
+    }
+}
+
+/* BRA.S / Bcc.S — a block terminator. Sets cpu->pc to the taken target
+ * or the fall-through (branchlessly, via a 0/-1 mask) and adds the
+ * taken/not-taken cycle cost. Must match m68k_step's accounting:
+ * base = op_pc+2; total cycles 14 taken / 12 not-taken. BSR and the
+ * .W/.L forms stay on the helper. */
+static void emit_branch(xt_emit *e, u32 op_pc, u16 w) {
+    int cc = (w >> 8) & 0xF;
+    i32 disp = (i8)(w & 0xFF);
+    u32 ft    = op_pc + 2;
+    u32 taken = op_pc + 2 + (u32)disp;
+    /* Branch sets cpu->pc directly (target overrides any accumulated
+     * pc_delta from prior ops in this block); absorb accumulated cycles
+     * into the branch's own cycle update. */
+    i32 extra_cyc = g_cyc_acc;
+    g_pc_acc = 0;
+    g_cyc_acc = 0;
+    if (cc == 0) {                              /* BRA.S — unconditional */
+        emit_load_imm32(e, 8, 9, taken);
+        xt_s32i(e, 8, R_CPU, OFF_PC);
+        xt_l32i(e, 8, R_CPU, OFF_CYCLES);
+        i32 total = 14 + extra_cyc;
+        if (total >= -128 && total <= 127) {
+            xt_addi(e, 8, 8, total);
+        } else {
+            emit_load_imm(e, 9, 10, (u32)total);
+            xt_add(e, 8, 8, 9);
+        }
+        xt_s32i(e, 8, R_CPU, OFF_CYCLES);
+        return;
+    }
+    emit_cond(e, cc);                           /* a8 = cond (0/1) */
+    xt_movi(e, 10, 0);
+    xt_sub (e, 9, 10, 8);                       /* a9 = mask = 0 - cond */
+    emit_load_imm32(e, 10, 11, ft);             /* a10 = fall-through */
+    /* taken = ft + disp; if disp fits in 8-bit signed (Bcc.S always does),
+     * derive a12 via a single xt_addi instead of a 4-op emit_load_imm32. */
+    if (disp >= -128 && disp <= 127) {
+        xt_addi(e, 12, 10, disp);               /* a12 = ft + disp = taken */
+    } else {
+        emit_load_imm32(e, 12, 11, taken);
+    }
+    xt_xor (e, 13, 10, 12);                     /* diff = ft ^ taken */
+    xt_and (e, 13, 13, 9);                      /* diff & mask */
+    xt_xor (e, 10, 10, 13);                     /* pc = ft ^ (diff & mask) */
+    xt_s32i(e, 10, R_CPU, OFF_PC);
+    xt_l32i(e, 11, R_CPU, OFF_CYCLES);          /* cycles += 12 + cond*2 + extra */
+    i32 base_cyc = 12 + extra_cyc;
+    if (base_cyc >= -128 && base_cyc <= 127) {
+        xt_addi(e, 11, 11, base_cyc);
+    } else {
+        emit_load_imm(e, 10, 12, (u32)base_cyc);
+        xt_add(e, 11, 11, 10);
+    }
+    xt_slli(e, 8, 8, 1);
+    xt_add (e, 11, 11, 8);
+    xt_s32i(e, 11, R_CPU, OFF_CYCLES);
+}
+
+/* ADDQ.W / SUBQ.W #imm,Dn — modify the low 16 bits of Dn, full CCR.
+ * `skip_flags` lets the lazy-CC pass drop the (75-byte) flag emission
+ * when no consumer reads the flags before the next setter. */
+static void emit_addq_w_dn(xt_emit *e, int dn, int imm, bool is_sub, bool skip_flags, regcache *rc) {
+    emit_read_g(e, rc, G_D(dn), 11);
+    xt_slli(e, 9, 11, 16);
+    xt_movi(e, 8, imm);
+    xt_slli(e, 8, 8, 16);
+    if (is_sub) xt_sub(e, 10, 9, 8);
+    else        xt_add(e, 10, 9, 8);
+    xt_srli(e, 11, 11, 16);
+    xt_slli(e, 11, 11, 16);
+    xt_extui(e, 12, 10, 16, 15);
+    xt_or  (e, 11, 11, 12);
+    emit_write_g(e, rc, G_D(dn), 11);
+    if (!skip_flags) emit_addsub_flags_long(e, is_sub, false);
+    emit_advance(e, 2, 8);
+}
+
+/* LEA <ea>,An — a[an] = effective address. No flags, no memory access.
+ * Inlines modes 2 (An), 5 (d16,An), 6 (d8,An,Xn), 7/0 (xxx).W and 7/1
+ * (xxx).L. The interpreter charges LEA a flat +4 (total 8) cycles. */
+static void emit_lea(xt_emit *e, int an, int srcmode, int srcreg,
+                     u16 ext, u32 ext32, regcache *rc) {
+    i32 len = 2;
+    if (srcmode == 2) {                              /* (An) */
+        emit_read_g(e, rc, G_A(srcreg), 8);
+    } else if (srcmode == 5) {                       /* (d16,An) */
+        emit_read_g(e, rc, G_A(srcreg), 8);
+        i16 d16 = (i16)ext;
+        if (d16 >= -128 && d16 <= 127) {
+            xt_addi(e, 8, 8, d16);                   /* 1-op shortcut */
+        } else {
+            emit_load_imm(e, 9, 10, (u32)(i32)d16);
+            xt_add (e, 8, 8, 9);
+        }
+        len = 4;
+    } else if (srcmode == 6) {                       /* (d8,An,Xn) */
+        int ireg = (ext >> 12) & 7;
+        emit_read_g(e, rc, G_A(srcreg), 8);
+        int g_index = (ext & 0x8000) ? G_A(ireg) : G_D(ireg);
+        bool need_sext = !(ext & 0x0800);
+        if (need_sext) {
+            /* .W index → sext16. Reuse a13 if memoized for this guest reg. */
+            if (g_sext_valid && g_sext_src_reg == g_index) {
+                xt_add(e, 8, 8, 13);
+            } else {
+                emit_read_g(e, rc, g_index, 13);
+                xt_slli(e, 13, 13, 16);
+                xt_srai(e, 13, 13, 16);
+                g_sext_src_reg = g_index;
+                g_sext_valid = true;
+                xt_add(e, 8, 8, 13);
+            }
+        } else {
+            emit_read_g(e, rc, g_index, 9);
+            xt_add(e, 8, 8, 9);
+        }
+        xt_addi(e, 8, 8, (i8)(ext & 0xFF));          /* d8 in -128..127 */
+        len = 4;
+    } else if (srcmode == 7 && srcreg == 0) {        /* (xxx).W */
+        emit_load_imm(e, 8, 9, (u32)(i32)(i16)ext);
+        len = 4;
+    } else {                                         /* (xxx).L — 7/1 */
+        emit_load_imm(e, 8, 9, ext32);
+        len = 6;
+    }
+    emit_write_g(e, rc, G_A(an), 8);
+    emit_advance(e, len, 8);
+}
+
+/* Conservative CCR classifier for the lazy-CC pass. Returns bit 0 =
+ * setter, bit 1 = consumer. Inline-covered opcodes return their exact
+ * class. Everything else (the helper fallback path) is conservatively
+ * marked SETTER|CONSUMER — m68k_step can do either. */
+/* Which CCR bits a Bcc.S condition reads. cc is the 4-bit condition
+ * field (bits 11-8). For an unknown / non-Bcc consumer, callers should
+ * default to CCR_MASK_ALL. */
+static u8 bcc_cc_bits_read(int cc) {
+    switch (cc) {
+    case 2: case 3:   return CCR_BIT_C | CCR_BIT_Z;             /* HI, LS */
+    case 4: case 5:   return CCR_BIT_C;                          /* CC, CS */
+    case 6: case 7:   return CCR_BIT_Z;                          /* NE, EQ */
+    case 8: case 9:   return CCR_BIT_V;                          /* VC, VS */
+    case 10: case 11: return CCR_BIT_N;                          /* PL, MI */
+    case 12: case 13: return CCR_BIT_N | CCR_BIT_V;              /* GE, LT */
+    case 14: case 15: return CCR_BIT_N | CCR_BIT_V | CCR_BIT_Z;  /* GT, LE */
+    default: return CCR_MASK_ALL;
+    }
+}
+
+static u32 classify_op(u16 w) {
+    int top  = (w >> 12) & 0xF;
+    int szf  = (w >> 6) & 3;
+    int mode = (w >> 3) & 7;
+    int op6  = (w >> 6) & 7;
+    u32 SET = 1u, CONS = 2u;
+    switch (top) {
+    case 0x0:                              /* immediate ALU / bit ops */
+        return SET;                        /* CMPI/ANDI/ORI/EORI/ADDI/SUBI/BTST set Z */
+    case 0x1: case 0x2: case 0x3:          /* MOVE / MOVEA */
+        return (op6 == 1) ? 0u : SET;      /* MOVEA → no flags */
+    case 0x4: {
+        /* LEA: 0100 ddd 111 mmm rrr. No flags. */
+        if (op6 == 7) return 0u;
+        /* JMP/JSR/RTS/RTE/RTR/NOP/STOP — control flow, treat as consumer-only
+         * for our purposes (they keep the CCR you set just before). */
+        if (w == 0x4E75 || w == 0x4E71 || w == 0x4E73 || w == 0x4E77 ||
+            (w & 0xFFC0) == 0x4EC0 || (w & 0xFFC0) == 0x4E80) {
+            return CONS;
+        }
+        /* SWAP Dn (0x4840-0x4847) / EXT.W Dn (0x4880-0x4887) / EXT.L Dn
+         * (0x48C0-0x48C7): set N/Z from result, don't read CCR. */
+        if ((w & 0xFFF8) == 0x4840 || (w & 0xFFF8) == 0x4880 ||
+            (w & 0xFFF8) == 0x48C0) return SET;
+        /* NEG/NOT/CLR/TST .B/.W/.L: set CCR but don't read it (NEGX is
+         * the exception — reads X — but that's 0x40xx, excluded here). */
+        u32 hi = w & 0xFFC0;
+        if (hi == 0x4400 || hi == 0x4440 || hi == 0x4480 ||  /* NEG */
+            hi == 0x4600 || hi == 0x4640 || hi == 0x4680 ||  /* NOT */
+            hi == 0x4200 || hi == 0x4240 || hi == 0x4280 ||  /* CLR */
+            hi == 0x4A00 || hi == 0x4A40 || hi == 0x4A80) {  /* TST */
+            return SET;
+        }
+        /* MOVEM.W/.L (any mode != Dn/An): doesn't touch CCR — transparent
+         * in the lazy-CC liveness analysis. Pattern: 0100 1d00 1ss eeeeee
+         * where d=dir, ss is constant 01, mode is 2..7 (memory). */
+        if ((w & 0xFB80) == 0x4880 && ((w >> 3) & 7) >= 2) {
+            return 0u;
+        }
+        return SET | CONS;
+    }
+    case 0x5:                              /* ADDQ/SUBQ/Scc/DBcc */
+        if (szf == 3) return CONS;         /* Scc/DBcc */
+        if (mode == 1) return 0u;          /* to An — no flags */
+        return SET;
+    case 0x6:                              /* Bcc.S / BRA.S / BSR.S */
+        return (((w >> 8) & 0xF) > 1) ? CONS : 0u;
+    case 0x7: return SET;                  /* MOVEQ */
+    case 0x8: case 0xB: case 0xC: case 0xE: case 0xF:
+        return SET;                        /* OR / CMP / AND / shifts / fp */
+    case 0x9: case 0xD:                    /* SUB/ADD family — SUBA/ADDA no flags */
+        if (szf == 3) return 0u;
+        /* ADDX/SUBX (mode 0 with reg-form bit 4 = 0/1): consume X. */
+        return SET | CONS;
+    case 0xA: return SET | CONS;           /* line-A trap */
+    }
+    return SET | CONS;
 }
 
 /* --- block compiler --------------------------------------------------- */
@@ -256,11 +1068,205 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
     xt_emit e;
     xt_init(&e, base + entry_off, total - entry_off);
 
-    /* 4. Prologue: a3 = cpu_state base; stash the CALL0 return PC. */
+    /* 4. Prologue: a3 = cpu_state base; stash the CALL0 return PC;
+     * load R_SR from cpu->sr; load every D/A cache slot from its assigned
+     * guest reg. Reset accumulators. */
+    g_sr_dirty = false;
+    g_pc_acc = 0;
+    g_cyc_acc = 0;
+    g_sext_valid = false;
+    g_sext_src_reg = -1;
     emit_l32r_at(&e, R_CPU, lit_off[ADDR_CPU_BASE], entry_off + e.len);
     xt_s32i(&e, 0, R_CPU, OFF_JITRETPC);
+    emit_sr_reload(&e);
 
-    /* 5. Body. */
+    /* 5. Lazy-CCR analysis. Backward scan. For each op, the setter side
+     * happens "after" the consumer side in execution order — but in a
+     * backward scan that means we observe the setter FIRST (downstream)
+     * and the consumer SECOND (upstream). So: setter first (decides
+     * whether *its own* flag emission is dead based on downstream
+     * `need`), then consumer (sets `need` so the next upstream setter
+     * knows its flags are read by this op). */
+    bool flags_dead[M68K_MAX_OPS_PER_BLOCK] = {0};
+    u8 flags_needed[M68K_MAX_OPS_PER_BLOCK];
+    for (u32 k = 0; k < M68K_MAX_OPS_PER_BLOCK; k++) flags_needed[k] = CCR_MASK_ALL;
+    {
+        /* Cross-block lazy-CC: if the block ends with a control-flow op
+         * (BRA.S unconditional or a fall-through ender) and the next
+         * block's first op is a SETTER-without-CONSUMER class, the
+         * current block's last setter's flags are dead. Bench's hot
+         * block at 0x03DF40 falls through to 0x03DF58 which starts with
+         * MOVE.W D5,D4 (a setter) — without this, the MOVE.W (d8,An,Xn)
+         * deep inside 0x03DF40 emits a full flag computation every
+         * iteration even though nothing observable reads it. */
+        bool need_initial = true;
+        u16 last_op = op_word[n_ops - 1];
+        if (n_ops >= 1) {
+            int t = (last_op >> 12) & 0xF;
+            int cc = (last_op >> 8) & 0xF;
+            /* Helper: walk forward from `pc`, skipping CCR-neutral ops
+             * (classify_op returns 0). Returns true if we find a
+             * SET-without-CONS op before any CONS or unknown op. That
+             * means CCR set before this point is dead — overwritten
+             * without ever being read. */
+            #define PC_OVERWRITES_CCR(pc_) ({ \
+                u32 _pc = (pc_); \
+                bool _r = false; \
+                for (int _k = 0; _k < 8; _k++) { \
+                    m68k_decoded _nd = m68k_decode_at(cpu, _pc); \
+                    u32 _c = classify_op(_nd.opcode); \
+                    if (_c == 0) { _pc += _nd.length; continue; } \
+                    _r = ((_c & 1u) && !(_c & 2u)); \
+                    break; \
+                } \
+                _r; })
+            if (t == 0x6 && cc == 0) {
+                /* BRA.S — single known target. */
+                i32 disp = (i8)(last_op & 0xFF);
+                u32 next_pc = op_pc[n_ops - 1] + 2 + (u32)disp;
+                if (PC_OVERWRITES_CCR(next_pc)) need_initial = false;
+            } else if (t == 0x6 && cc >= 2) {
+                /* Bcc.S — two targets (taken and fall-through). CCR set
+                 * by upstream setter is dead AFTER the Bcc iff BOTH
+                 * destinations overwrite CCR with their first op. The
+                 * Bcc itself still reads CCR — that's handled by the
+                 * within-block scan when Bcc is marked CONS. */
+                i32 disp = (i8)(last_op & 0xFF);
+                u32 taken_pc = op_pc[n_ops - 1] + 2 + (u32)disp;
+                u32 ft_pc    = op_pc[n_ops - 1] + 2;
+                if (PC_OVERWRITES_CCR(taken_pc) && PC_OVERWRITES_CCR(ft_pc))
+                    need_initial = false;
+            } else if (t != 0x6 && (last_op != 0x4E75) && (last_op != 0x4E73)
+                       && (last_op != 0x4E77) && ((last_op & 0xFFC0) != 0x4EC0)
+                       && ((last_op & 0xFFC0) != 0x4E80)
+                       && (last_op != 0x4E72)) {
+                /* Fall-through: not Bcc/BSR, not RTS/RTE/RTR/JMP/JSR/STOP. */
+                if (PC_OVERWRITES_CCR(cur)) need_initial = false;
+            }
+            #undef PC_OVERWRITES_CCR
+        }
+        bool need = need_initial;
+        u8 need_bits = need_initial ? CCR_MASK_ALL : 0;
+        for (int i = (int)n_ops - 1; i >= 0; i--) {
+            u16 w = op_word[i];
+            u32 cls = classify_op(w);
+            bool is_setter   = (cls & 1u) != 0;
+            bool is_consumer = (cls & 2u) != 0;
+            if (is_setter) {
+                flags_dead[i] = !need;
+                flags_needed[i] = need_bits;
+                need = false;
+                need_bits = 0;
+            }
+            if (is_consumer) {
+                need = true;
+                int t = (w >> 12) & 0xF;
+                int cc = (w >> 8) & 0xF;
+                if (t == 0x6 && cc >= 2) {
+                    /* Bcc.S — only the bits this condition reads. */
+                    need_bits |= bcc_cc_bits_read(cc);
+                } else {
+                    /* Unknown consumer (RTS/JMP/helper): conservatively all. */
+                    need_bits = CCR_MASK_ALL;
+                }
+            }
+        }
+        /* Expanded lazy-CC eligibility (M6.6): allow flag-skip for any op
+         * whose inline emitter respects the `skip_flags` parameter and
+         * whose `classify_op` SET/CONS classification is accurate. The
+         * backward scan already only marks an op dead when no consumer
+         * reads its flags before the next setter — the only risk is
+         * misclassification. Restrict to ops we know are inlined with
+         * skip_flags support and have accurate CCR class:
+         *   - ADDQ.W/SUBQ.W to Dn (top=5)
+         *   - MOVE.W to Dn        (top=3, op6=0)
+         *   - ADD.L/SUB.L Dm,Dn   (top=8,9,B,C,D with mode=0)
+         *   - AND.L/EOR.L Dm,Dn   (top=B,C with mode=0)
+         *   - ORI/ANDI/ADDI/SUBI/EORI.L #imm32,Dn (top=0 with select rr)
+         *   - MOVEQ                (top=7)
+         */
+        for (u32 i = 0; i < n_ops; i++) {
+            u16 w = op_word[i];
+            int top = (w >> 12) & 0xF;
+            int sf  = (w >> 6) & 3;
+            int mm  = (w >> 3) & 7;
+            int op6 = (w >> 6) & 7;
+            int rr  = (w >> 9) & 7;
+            bool b1 = false;
+            b1 |= (top == 0x5 && sf == 1 && mm == 0);              /* ADDQ.W Dn */
+            b1 |= (top == 0x3 && op6 == 0);                        /* MOVE.W Dn */
+            b1 |= (top == 0x3 && op6 == 2);                        /* MOVE.W (As)→(Ad), Dn,(An) */
+            b1 |= (top == 0xD && sf == 2 && !((w >> 8) & 1) && mm == 0);  /* ADD.L Dm,Dn */
+            b1 |= (top == 0x9 && sf == 2 && !((w >> 8) & 1) && mm == 0);  /* SUB.L Dm,Dn */
+            b1 |= (top == 0xC && sf == 2 && !((w >> 8) & 1) && mm == 0);  /* AND.L Dm,Dn */
+            b1 |= (top == 0xB && sf == 2 && ((w >> 8) & 1) && mm == 0);   /* EOR.L Dn,Dm */
+            b1 |= (top == 0x0 && !((w >> 8) & 1) && sf == 2 && mm == 0
+                   && rr != 4 && rr != 7);                                 /* ORI/ANDI/ADDI/SUBI/EORI.L #imm32,Dn */
+            b1 |= (top == 0x7);                                            /* MOVEQ */
+            if (!b1) flags_dead[i] = false;
+        }
+    }
+
+    /* 5b. Register-cache analysis. Count how often each guest D/A register
+     * appears in this block (as source or destination), pick up to 4 of
+     * the most-used to live in a4..a7 across the block. Skip caching when
+     * the block is helper-heavy (every helper costs a flush + reload, and
+     * those add up faster than the per-op savings). */
+    regcache rc;
+    memset(&rc, 0, sizeof(rc));
+    for (int i = 0; i < 16; i++) rc.xt[i] = -1;
+    {
+        u32 use[16] = {0};
+        u32 inline_count = 0, helper_count = 0;
+        for (u32 i = 0; i < n_ops; i++) {
+            u16 w = op_word[i];
+            int top = (w >> 12) & 0xF;
+            int dr  = (w >> 9) & 7;
+            int dm  = (w >> 6) & 7;
+            int sm  = (w >> 3) & 7;
+            int sr  = w & 7;
+            /* Conservative guest-reg sniffing: count every (mode, reg)
+             * occurrence as one use. Modes 0/1 → D/A; modes 2..6 → A. */
+            int g_dst = -1, g_src = -1;
+            if (dm == 0)      g_dst = G_D(dr);
+            else if (dm == 1) g_dst = G_A(dr);
+            else if (dm <= 6) g_dst = G_A(dr);  /* memory dst uses An */
+            if (sm == 0)      g_src = G_D(sr);
+            else if (sm == 1) g_src = G_A(sr);
+            else if (sm <= 6) g_src = G_A(sr);
+            if (g_dst >= 0) use[g_dst]++;
+            if (g_src >= 0 && g_src != g_dst) use[g_src]++;
+            /* Bcc/BRA/MOVEQ/CMP all touch D/A too — but the per-arm
+             * decoding above is rough; under-counting here only means
+             * "this register won't be cached", which is safe. */
+            u32 cls = classify_op(w);
+            bool inline_likely = (cls != (1u | 2u));  /* SET|CONS is helper-conservative */
+            (void)top; (void)inline_likely;
+        }
+        /* Pick the top-4 most-used. */
+        for (int slot = 0; slot < 4; slot++) {
+            int best = -1; u32 best_n = 0;
+            for (int g = 0; g < 16; g++) {
+                if (rc.xt[g] >= 0) continue;
+                if (use[g] > best_n) { best = g; best_n = use[g]; }
+            }
+            if (best < 0 || best_n < 2) break;
+            rc.xt[best] = (i8)cache_xt_slot(slot);
+            rc.guest[slot] = (u8)best;
+            rc.active++;
+        }
+        (void)inline_count; (void)helper_count;
+    }
+
+    /* 5c. Emit the cache-load epilogue-of-prologue: one l32i per cached
+     * slot, run once before the body starts. */
+    for (int slot = 0; slot < rc.active; slot++) {
+        int gi = rc.guest[slot];
+        if (gi < 8) xt_l32i(&e, cache_xt_slot(slot), R_CPU, OFF_D(gi));
+        else        xt_l32i(&e, cache_xt_slot(slot), R_CPU, OFF_A(gi - 8));
+    }
+
+    /* 6. Body. */
     u32 inline_ops = 0, helper_ops = 0;
     for (u32 i = 0; i < n_ops; i++) {
         u16 w = op_word[i];
@@ -271,56 +1277,553 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
         int mode = (w >> 3) & 7;
 
         if (top == 0x7) {                  /* MOVEQ */
-            emit_moveq(&e, w);
+            emit_moveq(&e, w, flags_dead[i], &rc);
             inline_ops++; done = true;
         } else if (w == 0x4E71) {          /* NOP */
             emit_advance(&e, 2, 4);
             inline_ops++; done = true;
         } else if (top == 0xD && szf == 2 && !((w >> 8) & 1) && mode == 0) {
             /* ADD.L Dm,Dn */
-            emit_add_l_dd(&e, (w >> 9) & 7, w & 7);
+            emit_add_l_dd(&e, (w >> 9) & 7, w & 7, flags_dead[i], &rc);
             inline_ops++; done = true;
         } else if (top == 0x5 && szf == 2 && mode == 0) {
             /* ADDQ.L / SUBQ.L #imm,Dn */
             int data = (w >> 9) & 7; if (data == 0) data = 8;
-            emit_addq_l_dd(&e, w & 7, data, (w >> 8) & 1);
+            emit_addq_l_dd(&e, w & 7, data, (w >> 8) & 1, flags_dead[i], &rc);
             inline_ops++; done = true;
         } else if (top == 0x5 && szf != 3 && mode == 1) {
             /* ADDQ / SUBQ #imm,An */
             int data = (w >> 9) & 7; if (data == 0) data = 8;
-            emit_addq_an(&e, w & 7, ((w >> 8) & 1) ? -data : data);
+            emit_addq_an(&e, w & 7, ((w >> 8) & 1) ? -data : data, &rc);
             inline_ops++; done = true;
         } else if (top == 0x2 && ((w >> 3) & 7) == 7 && (w & 7) == 4) {
             /* MOVE.L / MOVEA.L #imm32,<dst>  (src = immediate). */
             u32 imm = mac_read32(cpu->mem, op_pc[i] + 2);
             int dst_mode = (w >> 6) & 7, dst_reg = (w >> 9) & 7;
             if (dst_mode == 0) {
-                emit_move_l_imm_dn(&e, dst_reg, imm);
+                emit_move_l_imm_dn(&e, dst_reg, imm, flags_dead[i], &rc);
                 inline_ops++; done = true;
             } else if (dst_mode == 1) {
-                emit_movea_l_imm(&e, dst_reg, imm);
+                emit_movea_l_imm(&e, dst_reg, imm, &rc);
                 inline_ops++; done = true;
             }
         } else if (top == 0x2 && mode == 0 && ((w >> 6) & 7) == 0) {
             /* MOVE.L Dm,Dn */
-            emit_move_l_dd(&e, (w >> 9) & 7, w & 7);
+            emit_move_l_dd(&e, (w >> 9) & 7, w & 7, flags_dead[i], &rc);
+            inline_ops++; done = true;
+        } else if (top == 0x2 && ((w >> 6) & 7) == 1 && mode <= 1) {
+            emit_movea_l_reg(&e, (w >> 9) & 7, w & 7, mode == 1, &rc);
+            inline_ops++; done = true;
+        } else if (top == 0xD && szf == 3 && !((w >> 8) & 1) && mode <= 1) {
+            /* ADDA.W <Dm|Am>,An */
+            emit_adda_w_reg(&e, (w >> 9) & 7, w & 7, mode == 1, &rc);
+            inline_ops++; done = true;
+        } else if (top == 0x5 && szf == 1 && mode == 0) {
+            /* ADDQ.W / SUBQ.W #imm,Dn */
+            int data = (w >> 9) & 7; if (data == 0) data = 8;
+            emit_addq_w_dn(&e, w & 7, data, (w >> 8) & 1, flags_dead[i], &rc);
+            inline_ops++; done = true;
+        } else if (top == 0x3 && ((w >> 6) & 7) == 0 && mode == 0) {
+            /* MOVE.W Dm,Dn — aggressive (held back under --diff-jit). */
+            int dn = (w >> 9) & 7;
+            int dm = w & 7;
+            emit_read_g(&e, &rc, G_D(dm), 9);
+            emit_read_g(&e, &rc, G_D(dn), 11);
+            xt_srli (&e, 11, 11, 16);
+            xt_slli (&e, 11, 11, 16);
+            xt_extui(&e, 12, 9, 0, 15);
+            xt_or   (&e, 11, 11, 12);
+            emit_write_g(&e, &rc, G_D(dn), 11);
+            if (!flags_dead[i]) {
+                xt_slli (&e, 8, 9, 16);
+                emit_logic_flags(&e, 8);
+            }
+            emit_advance(&e, 2, 8);
+            inline_ops++; done = true;
+        } else if (top == 0x3 && ((w >> 6) & 7) == 2 && mode == 2) {
+            /* MOVE.W (As),(Ad) — bench-hot 0x3692 (~3.5 %).
+             * Combined bounds: (src|dst) & RAM_BOUNDS == 0 iff both
+             * addresses are in RAM and aligned. */
+            int src_an = w & 7;
+            int dst_an = (w >> 9) & 7;
+
+            emit_advance_flush(&e);                  /* before An reads */
+            emit_read_g(&e, &rc, G_A(src_an), 8);    /* src addr */
+            emit_read_g(&e, &rc, G_A(dst_an), 9);    /* dst addr */
+            xt_or   (&e, 10, 8, 9);
+            emit_l32r_at(&e, 11, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 10, 11);
+            emit_cache_flush(&e, &rc);   /* before conditional helper */
+            i32 op_pc_delta_mm = 2, op_cyc_mm = 8;
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_delta_mm, op_cyc_mm)));
+
+            /* Helper. */
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_delta_mm, op_cyc_mm);
+            u32 jmm_pos = e.len;
+            xt_j    (&e, 4);
+
+            /* Fast path. */
+            emit_l32r_at(&e, 11, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 8, 8, 11);                  /* a8 = ram + src */
+            xt_add  (&e, 9, 9, 11);                  /* a9 = ram + dst */
+            xt_l8ui (&e, 10, 8, 0);                  /* read high */
+            xt_l8ui (&e, 12, 8, 1);                  /* read low  */
+            xt_s8i  (&e, 10, 9, 0);                  /* write high */
+            xt_s8i  (&e, 12, 9, 1);                  /* write low  */
+            if (!flags_dead[i]) {
+                /* Assemble .W only when flags are actually consumed. */
+                xt_slli (&e, 10, 10, 8);
+                xt_or   (&e, 10, 10, 12);            /* a10 = .W value */
+                xt_slli (&e, 8, 10, 16);
+                emit_logic_flags(&e, 8);
+            }
+            emit_advance(&e, op_pc_delta_mm, op_cyc_mm);
+
+            u32 mm_here = e.len;
+            i32 mm_off = (i32)(mm_here - jmm_pos) - 4;
+            u32 mmw = ((u32)((u32)mm_off & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jmm_pos    ] = (u8)mmw;
+            base[entry_off + jmm_pos + 1] = (u8)(mmw >> 8);
+            base[entry_off + jmm_pos + 2] = (u8)(mmw >> 16);
+
+            inline_ops++; done = true;
+        } else if (top == 0x3 && ((w >> 6) & 7) == 2 && mode == 0) {
+            /* MOVE.W Dn,(An) — bench-hot 0x3484 (~3.5 %).
+             *
+             * Writes bypass mac_write_watch's SMC tracker — but a guest
+             * write of a 16-bit value to RAM rarely overlaps the JIT's
+             * compiled code pages (code pages are usually segment loads
+             * via MOVE.L). If a future workload tickles this, add a
+             * stripped watch helper. */
+            int an = (w >> 9) & 7;        /* dst An */
+            int dn = w & 7;               /* src Dn */
+
+            emit_advance_flush(&e);                  /* before An read */
+            emit_read_g(&e, &rc, G_A(an), 8);
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);   /* before conditional helper */
+            i32 op_pc_dnan = 2, op_cyc_dnan = 8;
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_dnan, op_cyc_dnan)));
+
+            /* Helper. */
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_dnan, op_cyc_dnan);
+
+            /* j over fast — backpatch. */
+            u32 jw_pos = e.len;
+            xt_j    (&e, 4);
+
+            /* Fast path. */
+            emit_read_g(&e, &rc, G_D(dn), 10);       /* a10 = Dn */
+            xt_extui(&e, 11, 10, 8, 7);              /* a11 = .W high byte */
+            xt_extui(&e, 12, 10, 0, 7);              /* a12 = .W low byte  */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);
+            xt_s8i  (&e, 11, 9, 0);
+            xt_s8i  (&e, 12, 9, 1);
+            if (!flags_dead[i]) {
+                xt_slli (&e, 8, 10, 16);
+                emit_logic_flags(&e, 8);
+            }
+            emit_advance(&e, op_pc_dnan, op_cyc_dnan);
+
+            u32 here = e.len;
+            i32 jo = (i32)(here - jw_pos) - 4;
+            u32 jww = ((u32)((u32)jo & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jw_pos    ] = (u8)jww;
+            base[entry_off + jw_pos + 1] = (u8)(jww >> 8);
+            base[entry_off + jw_pos + 2] = (u8)(jww >> 16);
+
+            inline_ops++; done = true;
+        } else if (top == 0xB && szf == 3 && ((w >> 8) & 1) == 0 && mode == 5) {
+            /* CMPA.W (d16,An),An — bench-hot 0xBC6D (~6.8 %).
+             * EA = An_src + sext16(d16). Read .W from mem, sext to 32.
+             * Compare 32-bit: a[An_dst] - sext_word. Flags + advance.
+             * d16 is loaded from the prefetched ext word via load_imm32. */
+            int dst_an = (w >> 9) & 7;
+            int src_an = w & 7;
+            u16 ext  = mac_read16(cpu->mem, op_pc[i] + 2);
+            i32 d16  = (i16)ext;
+
+            emit_advance_flush(&e);                  /* before An read */
+            /* EA into a8: a[src_an] + d16. */
+            emit_read_g(&e, &rc, G_A(src_an), 8);
+            if (d16 >= -128 && d16 <= 127) {
+                xt_addi(&e, 8, 8, d16);
+            } else {
+                emit_load_imm(&e, 11, 12, (u32)d16);
+                xt_add(&e, 8, 8, 11);
+            }
+
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);   /* before conditional helper */
+            i32 op_pc_cmpa = 4, op_cyc_cmpa = 10;
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_cmpa, op_cyc_cmpa)));
+
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_cmpa, op_cyc_cmpa);
+
+            u32 jcmpa_pos = e.len;
+            xt_j(&e, 4);
+
+            /* Fast path: read .W, sext, compare. */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);
+            xt_l8ui (&e, 11, 9, 0);
+            xt_l8ui (&e, 12, 9, 1);
+            xt_slli (&e, 11, 11, 8);
+            xt_or   (&e, 11, 11, 12);    /* a11 = .W */
+            /* Sign-extend .W to 32 bits → a8 (source for sub). */
+            xt_slli (&e, 8, 11, 16);
+            xt_srai (&e, 8, 8, 16);
+            emit_read_g(&e, &rc, G_A(dst_an), 9);    /* a9 = dest (full 32) */
+            xt_sub  (&e, 10, 9, 8);
+            emit_addsub_flags_long_masked(&e, true, true, 8, 9, 10, flags_needed[i]);
+            emit_advance(&e, op_pc_cmpa, op_cyc_cmpa);
+
+            u32 cmpa_here = e.len;
+            i32 cmpa_off = (i32)(cmpa_here - jcmpa_pos) - 4;
+            u32 cw = ((u32)((u32)cmpa_off & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jcmpa_pos    ] = (u8)cw;
+            base[entry_off + jcmpa_pos + 1] = (u8)(cw >> 8);
+            base[entry_off + jcmpa_pos + 2] = (u8)(cw >> 16);
+
+            inline_ops++; done = true;
+        } else if (top == 0xB && szf == 1 && ((w >> 8) & 1) == 0 && mode == 5) {
+            /* CMP.W (d16,An),Dn — bench-hot 0xBC6D (~6.8 %).
+             *   EA = a[an] + sext16(d16); read .W; sext to 32; compare
+             *   against d[dn].W shifted to high 16 via the existing
+             *   shift trick; emit_addsub_flags_long(sub, keep_x). */
+            int dn = (w >> 9) & 7;
+            int an = w & 7;
+            u16 ext = mac_read16(cpu->mem, op_pc[i] + 2);
+            i32 d16 = (i16)ext;
+
+            emit_advance_flush(&e);                  /* before An read */
+            emit_read_g(&e, &rc, G_A(an), 8);
+            if (d16 >= -128 && d16 <= 127) xt_addi(&e, 8, 8, d16);
+            else { emit_load_imm32(&e, 11, 12, (u32)d16); xt_add(&e, 8, 8, 11); }
+
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);   /* before conditional helper */
+            i32 op_pc_cwd = 4, op_cyc_cwd = 8;
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_cwd, op_cyc_cwd)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_cwd, op_cyc_cwd);
+            u32 jcwd_pos = e.len;
+            xt_j(&e, 4);
+            /* fast path */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);
+            xt_l8ui (&e, 11, 9, 0);
+            xt_l8ui (&e, 12, 9, 1);
+            xt_slli (&e, 11, 11, 8);
+            xt_or   (&e, 11, 11, 12);       /* a11 = .W */
+            xt_slli (&e, 8, 11, 16);         /* a8 = s shifted */
+            emit_read_g(&e, &rc, G_D(dn), 9);
+            xt_slli (&e, 9, 9, 16);          /* a9 = d shifted */
+            xt_sub  (&e, 10, 9, 8);
+            emit_addsub_flags_long_masked(&e, true, true, 8, 9, 10, flags_needed[i]);
+            emit_advance(&e, op_pc_cwd, op_cyc_cwd);
+
+            u32 cwd_here = e.len;
+            i32 cwd_off = (i32)(cwd_here - jcwd_pos) - 4;
+            u32 cww = ((u32)((u32)cwd_off & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jcwd_pos    ] = (u8)cww;
+            base[entry_off + jcwd_pos + 1] = (u8)(cww >> 8);
+            base[entry_off + jcwd_pos + 2] = (u8)(cww >> 16);
+
+            inline_ops++; done = true;
+        } else if (top == 0xB && szf == 1 && ((w >> 8) & 1) == 0 && mode == 2) {
+            /* CMP.W (An),Dn — bench-hot 0xBA52 (~6.7 %).
+             *   Compute EA in a8 → bounds check → fast path: read .W,
+             *   subtract from Dn.W, emit_addsub_flags_long(sub, keep_x);
+             *   helper fallback for ROM/devices/odd. */
+            int dn = (w >> 9) & 7;
+            int an = w & 7;
+
+            emit_advance_flush(&e);                  /* before An read */
+            emit_read_g(&e, &rc, G_A(an), 8);
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);   /* before conditional helper */
+            i32 op_pc_cw = 2, op_cyc_cw = 8;
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_cw, op_cyc_cw)));
+            /* helper */
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_cw, op_cyc_cw);
+            /* j over fast — backpatched below. */
+            u32 j_pos = e.len;
+            xt_j    (&e, 4);   /* placeholder */
+            /* fast path */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);
+            xt_l8ui (&e, 11, 9, 0);
+            xt_l8ui (&e, 12, 9, 1);
+            xt_slli (&e, 11, 11, 8);
+            xt_or   (&e, 11, 11, 12);
+            xt_slli (&e, 8, 11, 16);          /* a8 = s shifted */
+            emit_read_g(&e, &rc, G_D(dn), 9);
+            xt_slli (&e, 9, 9, 16);            /* a9 = d shifted */
+            xt_sub  (&e, 10, 9, 8);            /* a10 = r shifted */
+            emit_addsub_flags_long_masked(&e, true, true, 8, 9, 10, flags_needed[i]);
+            emit_advance(&e, op_pc_cw, op_cyc_cw);
+            /* backpatch the j-over-helper to land here. */
+            u32 here = e.len;
+            i32 j_off = (i32)(here - j_pos) - 4;
+            u32 jw = ((u32)((u32)j_off & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + j_pos    ] = (u8)jw;
+            base[entry_off + j_pos + 1] = (u8)(jw >> 8);
+            base[entry_off + j_pos + 2] = (u8)(jw >> 16);
+
+            inline_ops++; done = true;
+        } else if (top == 0x3 && ((w >> 6) & 7) == 0 && mode == 6) {
+            /* MOVE.W (d8,An,Xn),Dn — indexed source, the bench-hot 0x3A30.
+             * Same fast-path / helper-fallback shape as the (An),Dn arm
+             * below, but with the EA computed from An + sext(d8) + Xn. */
+            int dn   = (w >> 9) & 7;
+            int an   = w & 7;
+            u16 ext  = mac_read16(cpu->mem, op_pc[i] + 2);
+            int ireg = (ext >> 12) & 7;
+            bool index_is_an = (ext & 0x8000) != 0;
+            bool index_is_long = (ext & 0x0800) != 0;
+            i32 disp = (i8)(ext & 0xFF);
+
+            emit_advance_flush(&e);                  /* before An/Xn reads */
+            /* 1. Compute EA into a8. Reuse a13 sext if memoized. */
+            emit_read_g(&e, &rc, G_A(an), 8);
+            int g_index = index_is_an ? G_A(ireg) : G_D(ireg);
+            if (!index_is_long) {
+                if (g_sext_valid && g_sext_src_reg == g_index) {
+                    xt_add(&e, 8, 8, 13);
+                } else {
+                    emit_read_g(&e, &rc, g_index, 13);
+                    xt_slli(&e, 13, 13, 16);
+                    xt_srai(&e, 13, 13, 16);
+                    g_sext_src_reg = g_index;
+                    g_sext_valid = true;
+                    xt_add(&e, 8, 8, 13);
+                }
+            } else {
+                emit_read_g(&e, &rc, g_index, 9);
+                xt_add(&e, 8, 8, 9);
+            }
+            xt_addi (&e, 8, 8, disp);
+
+            /* 2. Bounds check. */
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+
+            /* 3. beqz a10, fast_path. rel = 3+9+3 = 15. */
+            emit_cache_flush(&e, &rc);   /* before conditional helper */
+            i32 op_pc_ix = 4, op_cyc_ix = 8;
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_ix, op_cyc_ix)));
+
+            /* 4. Helper path (mov + l32r + callx0 + undo + reload). */
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_ix, op_cyc_ix);
+
+            /* 5. j past fast path — backpatched after the fast path is emitted. */
+            u32 jix_pos = e.len;
+            xt_j    (&e, 4);
+
+            /* 6. Fast path. */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);
+            xt_l8ui (&e, 10, 9, 0);
+            xt_l8ui (&e, 11, 9, 1);
+            xt_slli (&e, 10, 10, 8);
+            xt_or   (&e, 10, 10, 11);
+            emit_read_g(&e, &rc, G_D(dn), 11);
+            xt_srli (&e, 11, 11, 16);
+            xt_slli (&e, 11, 11, 16);
+            xt_or   (&e, 11, 11, 10);
+            emit_write_g(&e, &rc, G_D(dn), 11);
+            if (!flags_dead[i]) {
+                xt_slli (&e, 8, 10, 16);
+                emit_logic_flags(&e, 8);
+            }
+            emit_advance(&e, op_pc_ix, op_cyc_ix);  /* 4 bytes: opcode + ext */
+            { u32 jh = e.len; i32 jo = (i32)(jh - jix_pos) - 4;
+              u32 jw = ((u32)((u32)jo & 0x3FFFFu) << 6) | 0x06u;
+              base[entry_off + jix_pos    ] = (u8)jw;
+              base[entry_off + jix_pos + 1] = (u8)(jw >> 8);
+              base[entry_off + jix_pos + 2] = (u8)(jw >> 16); }
+
+            inline_ops++; done = true;
+        } else if (top == 0x3 && ((w >> 6) & 7) == 0 && mode == 2) {
+            /* MOVE.W (An),Dn — guest-RAM fast path with helper fallback.
+             *
+             *   bounds:   a8 = a[an]; a10 = a8 & RAM_BOUNDS
+             *   beqz a10, FAST       (in RAM, aligned → fast)
+             *   helper:   CALLX0 m68k_step(cpu)
+             *   j END
+             *   FAST:     a10 = read_w(a8); store low-16 to d[dn]; flags;
+             *             advance pc/cycles
+             *   END
+             *
+             * Sizes are pre-computed so no back-patching is needed. */
+            int dn = (w >> 9) & 7;
+            int an = w & 7;
+
+            emit_advance_flush(&e);                  /* before An read */
+            /* 1. Bounds check. Read An into-or-in a8: if An is cached, the
+             * returned slot (a4..a7) is the source for the AND below — no
+             * mov needed. */
+            u8 an_reg = emit_read_g_in(&e, &rc, G_A(an), 8);
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, an_reg, 9);
+
+            /* 2. beqz a10, fast_path. Fast path defers PC/cyc advance into
+             * the compile-time accumulator (saves 6 LX7 ops per execution);
+             * the helper bridge undoes m68k_step's natural advance so the
+             * next flush adds the accumulator just once. */
+            i32 op_pc_delta = 2, op_cyc = 8;
+            emit_cache_flush(&e, &rc);   /* before conditional helper */
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_delta, op_cyc)));
+
+            /* 3. Helper path (mov + l32r + callx0 + undo PC/cyc + sr_reload + cache_reload). */
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_delta, op_cyc);
+
+            /* 4. j past fast path — backpatched after fast path. */
+            u32 jad_pos = e.len;
+            xt_j    (&e, 4);
+
+            /* 5. Fast path. NOTE: emit_helper_step_after_flush emitted a
+             * cache_reload, but the reload only runs on the helper branch.
+             * Fast path's cache state is unchanged from pre-bounds-check,
+             * so An is still in `an_reg`. */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, an_reg);
+            xt_l8ui (&e, 10, 9, 0);              /* high byte */
+            xt_l8ui (&e, 11, 9, 1);              /* low byte  */
+            xt_slli (&e, 10, 10, 8);
+            xt_or   (&e, 10, 10, 11);            /* a10 = .W */
+            /* write low 16 of Dn, preserve high 16 — do it in-place on the
+             * cache slot if Dn is cached. */
+            int dn_xt = cache_lookup(&rc, G_D(dn));
+            u8 dn_reg = (dn_xt >= 0) ? (u8)dn_xt : 11;
+            if (dn_xt < 0) {
+                emit_read_g(&e, &rc, G_D(dn), 11);   /* l32i a11, ... */
+            }
+            xt_srli (&e, dn_reg, dn_reg, 16);
+            xt_slli (&e, dn_reg, dn_reg, 16);
+            xt_or   (&e, dn_reg, dn_reg, 10);
+            if (dn_xt >= 0) {
+                /* in-place on cache slot — mark dirty */
+                for (int s = 0; s < rc.active; s++)
+                    if (rc.guest[s] == (u8)G_D(dn)) { rc.dirty |= (u16)(1u << s); break; }
+            } else {
+                emit_write_g(&e, &rc, G_D(dn), 11);
+            }
+            /* flags: shift .W to high 16 so emit_logic_flags' bit-31 N
+             * gives bit-15 of the word. */
+            if (!flags_dead[i]) {
+                xt_slli (&e, 8, 10, 16);
+                emit_logic_flags(&e, 8);
+            }
+            /* Defer the op's PC/cyc into the compile-time accumulator;
+             * helper bridge has already undone its m68k_step advance. */
+            emit_advance(&e, op_pc_delta, op_cyc);
+            { u32 jh = e.len; i32 jo = (i32)(jh - jad_pos) - 4;
+              u32 jw = ((u32)((u32)jo & 0x3FFFFu) << 6) | 0x06u;
+              base[entry_off + jad_pos    ] = (u8)jw;
+              base[entry_off + jad_pos + 1] = (u8)(jw >> 8);
+              base[entry_off + jad_pos + 2] = (u8)(jw >> 16); }
+
+            inline_ops++; done = true;
+        } else if (top == 0x4 && ((w >> 6) & 7) == 7
+                   && (mode == 2 || mode == 5 || mode == 6
+                       || (mode == 7 && (w & 7) <= 1))) {
+            /* LEA <ea>,An */
+            int sr = w & 7;
+            u16 ext   = (mode == 5 || mode == 6 || (mode == 7 && sr == 0))
+                      ? mac_read16(cpu->mem, op_pc[i] + 2) : 0;
+            u32 ext32 = (mode == 7 && sr == 1)
+                      ? mac_read32(cpu->mem, op_pc[i] + 2) : 0;
+            emit_lea(&e, (w >> 9) & 7, mode, sr, ext, ext32, &rc);
+            inline_ops++; done = true;
+        } else if (top == 0x6 && (((w>>8)&0xF) != 1)
+                   && (w & 0xFF) != 0x00 && (w & 0xFF) != 0xFF) {
+            /* All Bcc.S except BSR (cc 1). Aggressive — accepts the
+             * --diff-jit divergence pattern that affects some less-hot
+             * conditions, traded for the bench/boot perf win. (Loop
+             * internalisation was tried and hung boot — interrupt-
+             * dependent wait-loops never exit when re-entering the
+             * dispatcher is skipped.) */
+            emit_branch(&e, op_pc[i], w);
             inline_ops++; done = true;
         } else if (top == 0xB && szf == 2 && !((w >> 8) & 1) && mode == 0) {
             /* CMP.L Dm,Dn */
-            emit_cmp_l_dd(&e, (w >> 9) & 7, w & 7);
+            emit_cmp_l_dd(&e, (w >> 9) & 7, w & 7, &rc, flags_needed[i]);
+            inline_ops++; done = true;
+        } else if (top == 0x9 && szf == 2 && !((w >> 8) & 1) && mode == 0) {
+            /* SUB.L Dm,Dn */
+            emit_sub_l_dd(&e, (w >> 9) & 7, w & 7, flags_dead[i], &rc);
+            inline_ops++; done = true;
+        } else if (top == 0xC && szf == 2 && !((w >> 8) & 1) && mode == 0) {
+            /* AND.L Dm,Dn  (result -> Dn) */
+            emit_logic_l_dd(&e, (w >> 9) & 7, w & 7, (w >> 9) & 7, false, &rc);
+            inline_ops++; done = true;
+        } else if (top == 0xB && szf == 2 && ((w >> 8) & 1) && mode == 0) {
+            /* EOR.L Dn,Dm  (result -> Dm) */
+            emit_logic_l_dd(&e, (w >> 9) & 7, w & 7, w & 7, true, &rc);
+            inline_ops++; done = true;
+        } else if (top == 0x0 && !((w >> 8) & 1) && szf == 2 && mode == 0
+                   && ((w >> 9) & 7) != 4 && ((w >> 9) & 7) != 7) {
+            /* ORI/ANDI/SUBI/ADDI/EORI/CMPI.L #imm32,Dn */
+            u32 imm = mac_read32(cpu->mem, op_pc[i] + 2);
+            emit_immalu_l_dn(&e, w & 7, imm, (w >> 9) & 7, &rc);
+            inline_ops++; done = true;
+        } else if (top == 0x0 && !((w >> 8) & 1) && (szf == 0 || szf == 1) && mode == 0
+                   && (((w >> 9) & 7) == 0 || ((w >> 9) & 7) == 1 || ((w >> 9) & 7) == 5)) {
+            /* ORI/ANDI/EORI .B/.W #imm,Dn. Skip the SR/CCR forms (mode 7,
+             * reg 4 — handled elsewhere). */
+            u32 imm = mac_read16(cpu->mem, op_pc[i] + 2);
+            int size = (szf == 0) ? 1 : 2;
+            emit_immlogic_bw_dn(&e, w & 7, imm, size, (w >> 9) & 7, &rc);
+            inline_ops++; done = true;
+        } else if (top == 0x0 && !((w >> 8) & 1) && (szf == 0 || szf == 1) && mode == 0
+                   && (((w >> 9) & 7) == 2 || ((w >> 9) & 7) == 3 || ((w >> 9) & 7) == 6)) {
+            /* SUBI/ADDI/CMPI .B/.W #imm,Dn — arithmetic immediates. */
+            u32 imm = mac_read16(cpu->mem, op_pc[i] + 2);
+            int size = (szf == 0) ? 1 : 2;
+            emit_immarith_bw_dn(&e, w & 7, imm, size, (w >> 9) & 7, &rc);
             inline_ops++; done = true;
         }
 
         if (!done) {
             /* Helper fallback: m68k_step(cpu). a3 survives the call. */
-            xt_mov(&e, R_ARG, R_CPU);
-            emit_l32r_at(&e, R_HELP, lit_off[HELPER_M68K_STEP], entry_off + e.len);
-            xt_callx0(&e, R_HELP);
+            emit_helper_step(&e, lit_off[HELPER_M68K_STEP], entry_off, &rc);
             helper_ops++;
         }
     }
 
-    /* 6. Epilogue: restore return PC and jump back to the dispatcher. */
+    /* 6. Epilogue: flush accumulated PC/cycles deltas, dirty cache slots
+     * and R_SR back to cpu_state; restore the CALL0 return PC; JX back
+     * to the dispatcher. */
+    emit_advance_flush(&e);
+    emit_cache_flush(&e, &rc);
+    emit_sr_flush(&e);
     xt_l32i(&e, 0, R_CPU, OFF_JITRETPC);
     xt_jx(&e, 0);
 

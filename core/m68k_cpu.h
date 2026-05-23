@@ -39,6 +39,7 @@ typedef struct m68k_cpu {
     u32 ssp;           /* system stack pointer (valid when in user)      */
 
     u64 cycles;        /* free-running cycle counter */
+    u64 instrs;        /* count of m68k_step calls — interp throughput stat */
 
     u8  stopped;       /* STOP instruction — waiting for an interrupt */
     u8  halted;        /* non-zero: run loop should exit (see enum above) */

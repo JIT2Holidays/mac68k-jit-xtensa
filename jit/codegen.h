@@ -36,6 +36,9 @@
 typedef enum {
     ADDR_CPU_BASE = 0,
     HELPER_M68K_STEP,
+    ADDR_RAM_BASE,        /* guest RAM base (sim's mapped address). */
+    LITERAL_RAM_BOUNDS,   /* ~(ram_size-1) | 1 — fails the AND fast-path */
+                          /* test for any out-of-RAM or odd address. */
     LITERAL_COUNT
 } literal_id;
 

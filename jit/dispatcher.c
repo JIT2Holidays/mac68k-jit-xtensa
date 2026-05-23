@@ -8,6 +8,7 @@
 #include "m68k_interp.h"
 #include "mac_mem.h"
 #include "sony.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -20,6 +21,7 @@
 #define HOST_CPU_BASE    0x40000000u
 #define HOST_STACK_BASE  0x50000000u
 #define HOST_STACK_TOP   (HOST_STACK_BASE + 0x800u)
+#define HOST_RAM_BASE    0x60000000u
 #endif
 
 /* --- literal-pool resolver -------------------------------------------- */
@@ -29,21 +31,37 @@
 extern void m68k_step_call0(m68k_cpu *cpu);
 #endif
 
+/* RAM bounds mask: bit-AND a guest address against this; result is zero
+ * only when the address is in RAM and 16-bit-aligned. For RAM sizes that
+ * are a power of two (1 / 2 / 4 MB) the mask is `~(ram_size-1) | 1`. The
+ * overlay bit forces the mask to all-ones, sending every fast-path probe
+ * to the helper while ROM is mapped at 0. */
+static u32 ram_bounds_mask(m68k_cpu *cpu) {
+    if (!cpu || !cpu->mem) return 0xFFFFFFFFu;
+    if (cpu->mem->overlay) return 0xFFFFFFFFu;
+    u32 sz = cpu->mem->ram_size;
+    if (sz == 0 || (sz & (sz - 1))) return 0xFFFFFFFFu;  /* non-pow2 → off */
+    return (~(sz - 1u)) | 1u;
+}
+
 static u32 helper_addr(literal_id id, void *user) {
     m68k_cpu *cpu = (m68k_cpu *)user;
 #if defined(ESP_PLATFORM)
     switch (id) {
-        case ADDR_CPU_BASE:    return (u32)(uintptr_t)cpu;
-        case HELPER_M68K_STEP: return (u32)(uintptr_t)&m68k_step_call0;
-        default:               return 0;
+        case ADDR_CPU_BASE:     return (u32)(uintptr_t)cpu;
+        case HELPER_M68K_STEP:  return (u32)(uintptr_t)&m68k_step_call0;
+        case ADDR_RAM_BASE:     return (u32)(uintptr_t)cpu->mem->ram;
+        case LITERAL_RAM_BOUNDS:return ram_bounds_mask(cpu);
+        default:                return 0;
     }
 #else
     /* Host: the literal values are sentinels the sim's callbacks decode. */
-    (void)cpu;
     switch (id) {
-        case ADDR_CPU_BASE:    return HOST_CPU_BASE;
-        case HELPER_M68K_STEP: return (u32)HELPER_M68K_STEP;
-        default:               return 0;
+        case ADDR_CPU_BASE:     return HOST_CPU_BASE;
+        case HELPER_M68K_STEP:  return (u32)HELPER_M68K_STEP;
+        case ADDR_RAM_BASE:     return HOST_RAM_BASE;
+        case LITERAL_RAM_BOUNDS:return ram_bounds_mask(cpu);
+        default:                return 0;
     }
 #endif
 }
@@ -203,6 +221,17 @@ static u8 *sim_translate(xt_sim *s, u32 addr) {
         return (u8 *)c->cpu + (addr - HOST_CPU_BASE);
     if (addr >= HOST_STACK_BASE && addr < HOST_STACK_BASE + sizeof(c->stack_buf))
         return c->stack_buf + (addr - HOST_STACK_BASE);
+    if (c->cpu && c->cpu->mem && c->cpu->mem->ram) {
+        u32 guest = addr - HOST_RAM_BASE;
+        /* Mac Plus alias: RAM mirrors fill 0..0x3FFFFF when ram_size <
+         * 0x400000. Match mac_read16's `addr & (ram_size-1)` handling. */
+        if (guest < 0x400000u && (guest & (c->cpu->mem->ram_size - 1u)) < c->cpu->mem->ram_size)
+            return c->cpu->mem->ram + (guest & (c->cpu->mem->ram_size - 1u));
+        /* ROM at guest 0x400000-0x41FFFF (aliased to HOST_RAM_BASE+0x400000). */
+        if (c->cpu->mem->rom && guest >= 0x400000u &&
+            guest < 0x400000u + c->cpu->mem->rom_size)
+            return c->cpu->mem->rom + (guest - 0x400000u);
+    }
     if (addr < c->block->code_size)
         return c->block->code + addr;
     return NULL;
@@ -240,6 +269,8 @@ static void enter_block(m68k_dispatcher *d, m68k_block *b) {
     s.a[1] = HOST_STACK_TOP;
 
     xt_sim_run(&s, 1u << 22);
+    d->xt_instrs   += s.instr_count;     /* native-Xtensa-cycle proxy   */
+    d->helper_calls += b->helper_ops;    /* dynamic CALLX0→m68k_step cnt */
     if (s.status != XT_SIM_RETURNED) {
         fprintf(stderr, "[m68k-jit] block pc=%06X stopped status=%d sim_pc=%u\n",
                 b->pc_start, (int)s.status, (unsigned)s.pc);
@@ -294,8 +325,13 @@ void m68k_dispatcher_run_until(m68k_dispatcher *d, u64 until) {
             b = prev->predicted_next;
             d->chain_hits++;
         } else {
+            /* get_block may trigger an arena reset (free_all_blocks)
+             * which leaves `prev` dangling. Snapshot the reset counter
+             * and null `prev` if it changed before we touch it. */
+            u64 resets_before = d->arena_resets;
             b = get_block(d, pc);
             d->chain_misses++;
+            if (d->arena_resets != resets_before) prev = NULL;
             if (prev && !d->no_cache) {
                 prev->predicted_next = b;
                 prev->predicted_next_pc = pc;

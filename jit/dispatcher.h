@@ -14,7 +14,14 @@
  * through enter_block(), selected by #ifdef ESP_PLATFORM. */
 
 #ifndef M68K_JIT_ARENA_KB
-#define M68K_JIT_ARENA_KB 128u
+#define M68K_JIT_ARENA_KB 1024u
+#endif
+
+/* Estimated LX7-instruction cost of one CALLX0→m68k_step helper fallback
+ * (the reference interpreter's average per-opcode cost). Used only to
+ * weight helper calls in the host JIT-cost benchmark metric. */
+#ifndef M68K_JIT_HELPER_LX7_COST
+#define M68K_JIT_HELPER_LX7_COST 64u
 #endif
 
 typedef struct m68k_dispatcher {
@@ -35,6 +42,15 @@ typedef struct m68k_dispatcher {
     u64 interp_fallbacks;   /* ops run via m68k_step when compile failed */
     u64 arena_resets;
     u64 smc_invalidations;
+
+    /* Host-only JIT-cost accounting (xtensa_sim). xt_instrs is the number
+     * of native Xtensa instructions the generated code ran (≈ LX7 cycles
+     * on the real target); helper_calls is the CALLX0→m68k_step count.
+     * The estimated LX7 cost of the workload is
+     *   xt_instrs + helper_calls * M68K_JIT_HELPER_LX7_COST.
+     * This is the benchmark metric the optimisation loop minimises. */
+    u64 xt_instrs;
+    u64 helper_calls;
 
     bool no_cache;          /* bench toggle: recompile every dispatch */
 

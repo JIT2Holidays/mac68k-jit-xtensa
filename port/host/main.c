@@ -8,6 +8,7 @@
 #include "m68k_interp.h"
 #include "mac_mem.h"
 #include "mac_input.h"
+#include "sony.h"
 #include "demo_rom.h"
 #include "dispatcher.h"
 #include "protocol.h"
@@ -451,6 +452,43 @@ static int read_file(const char *path, u8 **out, u32 *len) {
     return 0;
 }
 
+/* Load a machine snapshot (written by write_snapshot / the mvmac_diff
+ * format) into `m` and `cpu`, replacing their contents. Used by
+ * --load-snapshot to benchmark the engines on a frozen Speedometer
+ * state. Returns 0 on success. */
+static int load_snapshot(mac_mem *m, m68k_cpu *cpu, const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    u32 hdr[24], ram_size = 0, rom_size = 0;
+    int rc = -2;
+    if (fread(hdr, 4, 24, f) == 24 && hdr[0] == 0x4D414331u
+        && fread(&ram_size, 4, 1, f) == 1 && ram_size && ram_size <= 64u*1024*1024) {
+        mac_mem_free(m);
+        mac_mem_init(m, ram_size);
+        if (fread(m->ram, 1, ram_size, f) == ram_size
+            && fread(&rom_size, 4, 1, f) == 1
+            && rom_size && rom_size <= 4u*1024*1024) {
+            free(m->rom);
+            m->rom = (u8 *)malloc(rom_size);
+            if (m->rom && fread(m->rom, 1, rom_size, f) == rom_size) {
+                m->rom_size = rom_size;
+                m->overlay  = false;
+                memset(cpu, 0, sizeof(*cpu));
+                for (int i = 0; i < 8; i++) {
+                    cpu->d[i] = hdr[1 + i];
+                    cpu->a[i] = hdr[9 + i];
+                }
+                cpu->pc = hdr[17]; cpu->sr  = hdr[18];
+                cpu->usp = hdr[19]; cpu->ssp = hdr[20];
+                cpu->mem = m; m->cpu = cpu;
+                rc = 0;
+            }
+        }
+    }
+    fclose(f);
+    return rc;
+}
+
 static void usage(const char *a0) {
     fprintf(stderr,
         "usage: %s [--interp|--jit] [--rom] [--max-cycles N] [--ram-mb M] [file]\n"
@@ -465,6 +503,8 @@ static void usage(const char *a0) {
         "                  drive 2 automatically (disable: MAC68K_NO_HD).\n"
         "  --screenshot P  write the 512x342 framebuffer to BMP file P at exit\n"
         "  --max-cycles N  stop after N cycles (default 200M)\n"
+        "  --load-snapshot S  load machine snapshot S and run it (for\n"
+        "                  benchmarking an engine on a frozen state)\n"
         "  --ram-mb M      RAM size in MiB (default 1)\n"
         "  file            raw 68k image at 0x0, or a Mac ROM with --rom;\n"
         "                  omit for the built-in demo\n",
@@ -480,6 +520,11 @@ int main(int argc, char **argv) {
     const char *disk_path[2] = { NULL, NULL };
     int  n_disks = 0;
     const char *shot_path = NULL;
+    const char *snap_load = NULL;
+    bool profile = false;
+    bool diff_jit = false;
+    bool diff_jit_trace = false;
+    bool no_irq = false;
     bool server = false;
 
     for (int i = 1; i < argc; i++) {
@@ -497,6 +542,12 @@ int main(int argc, char **argv) {
             max_cycles = strtoull(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--ram-mb") && i + 1 < argc)
             ram_mb = (u32)strtoul(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--load-snapshot") && i + 1 < argc)
+            snap_load = argv[++i];
+        else if (!strcmp(argv[i], "--profile")) profile = true;
+        else if (!strcmp(argv[i], "--diff-jit")) diff_jit = true;
+        else if (!strcmp(argv[i], "--diff-jit-trace")) diff_jit_trace = true;
+        else if (!strcmp(argv[i], "--no-irq")) no_irq = true;
         else if (argv[i][0] == '-') { usage(argv[0]); return 1; }
         else rom_path = argv[i];
     }
@@ -559,7 +610,7 @@ int main(int argc, char **argv) {
         if (g_hd_path)
             fprintf(stderr, "[host] drive 2 = %s (inserted after boot)\n",
                     g_hd_path);
-    } else {
+    } else if (!snap_load) {
         u8 img[DEMO_ROM_MAX];
         u32 len = demo_rom_build(img, mem.fb_base);
         mac_load_ram_image(&mem, 0, img, len);
@@ -569,8 +620,201 @@ int main(int argc, char **argv) {
 
     m68k_cpu cpu;
     m68k_reset(&cpu, &mem);
+    if (snap_load) {
+        if (load_snapshot(&mem, &cpu, snap_load) != 0) {
+            fprintf(stderr, "failed to load snapshot %s\n", snap_load);
+            return 5;
+        }
+        fprintf(stderr, "[host] loaded snapshot %s (pc=0x%06X, ram=%uK)\n",
+                snap_load, cpu.pc, mem.ram_size >> 10);
+    }
     fprintf(stderr, "[host] reset: PC=0x%06X SSP=0x%06X  mode=%s\n",
             cpu.pc, cpu.a[7], server ? "server" : use_jit ? "JIT" : "interp");
+
+    /* --profile: interpret the workload and histogram executed opcodes,
+     * so the JIT optimisation work can target the actually-hot ops. */
+    if (profile) {
+        static u32 freq[65536];
+        u64 total = 0;
+        while (cpu.cycles < max_cycles && !cpu.halted) {
+            mac_mem_tick(cpu.mem, cpu.cycles);
+            if (m68k_poll_interrupts(&cpu)) continue;
+            if (sony_service(&cpu)) continue;
+            if (cpu.stopped) { cpu.cycles += 64; continue; }
+            freq[mac_read16(&mem, cpu.pc)]++;
+            total++;
+            m68k_step(&cpu);
+        }
+        /* Top 30 opcodes by execution count. */
+        fprintf(stderr, "[profile] %llu instructions, top opcodes:\n",
+                (unsigned long long)total);
+        for (int rank = 0; rank < 30; rank++) {
+            int best = -1; u32 bestn = 0;
+            for (int o = 0; o < 65536; o++)
+                if (freq[o] > bestn) { bestn = freq[o]; best = o; }
+            if (best < 0) break;
+            fprintf(stderr, "  %2d. op=%04X  %9u  %5.1f%%\n", rank + 1,
+                    best, bestn, 100.0 * (double)bestn / (double)total);
+            freq[best] = 0;
+        }
+        mac_mem_free(&mem);
+        return 0;
+    }
+
+    /* --diff-jit-trace: run JIT one block at a time and compare to the
+     * interpreter after each. Pinpoints the first diverging block — its
+     * 68000 instructions are decoded and printed so the buggy op is
+     * visible. Much slower than --diff-jit; use only for debugging. */
+    if (diff_jit_trace && snap_load) {
+        mac_mem mj; m68k_cpu cj;
+        mac_mem_init(&mj, 4096);
+        if (load_snapshot(&mj, &cj, snap_load) != 0) {
+            fprintf(stderr, "trace: snapshot reload failed\n"); return 5;
+        }
+        if (no_irq) { cpu.sr |= 0x0700; cj.sr |= 0x0700; }
+        m68k_dispatcher dd;
+        if (!m68k_dispatcher_init(&dd, &cj)) {
+            fprintf(stderr, "trace: jit init failed\n"); return 4;
+        }
+        u64 step = 0;
+        m68k_cpu pre_cj;
+        while (cj.cycles < max_cycles && !cj.halted) {
+            u32 pc_before = cj.pc;
+            u64 cyc_before = cj.cycles;
+            pre_cj = cj;
+            m68k_dispatcher_run_until(&dd, cj.cycles + 1);   /* ≈ 1 block */
+            m68k_run_until(&cpu, cj.cycles);
+            int bad = 0;
+            for (int r = 0; r < 8; r++) {
+                if (cpu.d[r] != cj.d[r]) bad = 1;
+                if (cpu.a[r] != cj.a[r]) bad = 1;
+            }
+            if (cpu.pc != cj.pc)                  bad = 1;
+            if (cpu.sr != cj.sr)                  bad = 1;
+            if (cpu.cycles != cj.cycles)          bad = 1;
+            if (cpu.pending_irq != cj.pending_irq) bad = 1;
+            if (cpu.usp != cj.usp || cpu.ssp != cj.ssp) bad = 1;
+            if (memcmp(mem.ram, mj.ram, mem.ram_size) != 0) bad = 1;
+            /* VIA state always diverges because mac_mem_tick is called
+             * per-block in the JIT vs per-instruction in the interp. The
+             * snapshot's code doesn't read VIA registers, so the divergence
+             * doesn't propagate — exclude it from the comparison. */
+            if (bad) {
+                fprintf(stderr,
+                    "[trace] DIVERGENCE at step %llu, block PC=0x%06X, "
+                    "cycles %llu..%llu\n",
+                    (unsigned long long)step, pc_before,
+                    (unsigned long long)cyc_before, (unsigned long long)cj.cycles);
+                for (int r = 0; r < 8; r++) {
+                    if (cpu.d[r] != cj.d[r])
+                        fprintf(stderr, "  D%d interp=%08X jit=%08X\n",
+                                r, cpu.d[r], cj.d[r]);
+                    if (cpu.a[r] != cj.a[r])
+                        fprintf(stderr, "  A%d interp=%08X jit=%08X\n",
+                                r, cpu.a[r], cj.a[r]);
+                }
+                if (cpu.pc != cj.pc)
+                    fprintf(stderr, "  PC interp=%06X jit=%06X\n",
+                            cpu.pc, cj.pc);
+                if (cpu.sr != cj.sr)
+                    fprintf(stderr, "  SR interp=%04X jit=%04X\n",
+                            cpu.sr, cj.sr);
+                if (cpu.usp != cj.usp)
+                    fprintf(stderr, "  USP interp=%08X jit=%08X\n",
+                            cpu.usp, cj.usp);
+                if (cpu.ssp != cj.ssp)
+                    fprintf(stderr, "  SSP interp=%08X jit=%08X\n",
+                            cpu.ssp, cj.ssp);
+                if (memcmp(mem.ram, mj.ram, mem.ram_size) != 0) {
+                    int diffs = 0;
+                    for (u32 a = 0; a < mem.ram_size && diffs < 6; a++) {
+                        if (mem.ram[a] != mj.ram[a]) {
+                            fprintf(stderr,
+                                "  RAM[%06X] interp=%02X jit=%02X\n",
+                                a, mem.ram[a], mj.ram[a]);
+                            diffs++;
+                        }
+                    }
+                }
+                if (memcmp(&mem.via, &mj.via, sizeof(mem.via)) != 0) {
+                    const u8 *vi = (const u8*)&mem.via;
+                    const u8 *vj = (const u8*)&mj.via;
+                    fprintf(stderr, "  VIA differs:\n");
+                    int diffs = 0;
+                    for (size_t b = 0; b < sizeof(mem.via) && diffs < 12; b++) {
+                        if (vi[b] != vj[b]) {
+                            fprintf(stderr,
+                                "    +%02zX interp=%02X jit=%02X\n",
+                                b, vi[b], vj[b]);
+                            diffs++;
+                        }
+                    }
+                }
+                fprintf(stderr, "  pre-block state:\n");
+                for (int r = 0; r < 8; r++)
+                    fprintf(stderr, "    D%d=%08X  A%d=%08X\n",
+                            r, pre_cj.d[r], r, pre_cj.a[r]);
+                fprintf(stderr, "  block instructions:\n");
+                u32 ppc = pc_before;
+                for (int i = 0; i < 16; i++) {
+                    m68k_decoded dec = m68k_decode_at(&cpu, ppc);
+                    fprintf(stderr, "    PC=%06X  op=%04X%s\n",
+                            ppc, dec.opcode, dec.ends_block ? " (ends)" : "");
+                    if (dec.ends_block) break;
+                    ppc += dec.length;
+                }
+                m68k_dispatcher_shutdown(&dd);
+                return 2;
+            }
+            step++;
+        }
+        fprintf(stderr, "[trace] match through %llu cycles (%llu blocks)\n",
+                (unsigned long long)cj.cycles, (unsigned long long)step);
+        m68k_dispatcher_shutdown(&dd);
+        return 0;
+    }
+
+    /* --diff-jit: run the loaded snapshot under the interpreter and the
+     * JIT to the same cycle budget and report the first state mismatch.
+     * Keep --max-cycles below one VBL period so no interrupt fires (an
+     * interrupt taken at a block vs instruction boundary diverges the
+     * engines legitimately). A real divergence is a JIT bug. */
+    if (diff_jit && snap_load) {
+        mac_mem mj; m68k_cpu cj;
+        mac_mem_init(&mj, 4096);
+        if (load_snapshot(&mj, &cj, snap_load) != 0) {
+            fprintf(stderr, "diff-jit: snapshot reload failed\n"); return 5;
+        }
+        if (no_irq) { cpu.sr |= 0x0700; cj.sr |= 0x0700; }
+        /* The JIT runs whole blocks, so it overshoots `max_cycles` to a
+         * block boundary; run it first, then run the interpreter to the
+         * JIT's exact final cycle count so both stop at the same point. */
+        m68k_dispatcher dd;
+        if (!m68k_dispatcher_init(&dd, &cj)) {
+            fprintf(stderr, "diff-jit: jit init failed\n"); return 4;
+        }
+        m68k_dispatcher_run_until(&dd, max_cycles);  /* JIT  */
+        m68k_run_until(&cpu, cj.cycles);             /* interp to same cyc */
+        int bad = 0;
+        for (int r = 0; r < 8; r++) {
+            if (cpu.d[r] != cj.d[r]) { fprintf(stderr,
+                "  D%d interp=%08X jit=%08X\n", r, cpu.d[r], cj.d[r]); bad = 1; }
+            if (cpu.a[r] != cj.a[r]) { fprintf(stderr,
+                "  A%d interp=%08X jit=%08X\n", r, cpu.a[r], cj.a[r]); bad = 1; }
+        }
+        if (cpu.pc != cj.pc) { fprintf(stderr,
+            "  PC interp=%06X jit=%06X\n", cpu.pc, cj.pc); bad = 1; }
+        if ((cpu.sr & 0x1F) != (cj.sr & 0x1F)) { fprintf(stderr,
+            "  CCR interp=%02X jit=%02X\n", cpu.sr & 0x1F, cj.sr & 0x1F); bad = 1; }
+        if (cpu.cycles != cj.cycles) { fprintf(stderr,
+            "  cycles interp=%llu jit=%llu\n",
+            (unsigned long long)cpu.cycles, (unsigned long long)cj.cycles); bad = 1; }
+        fprintf(stderr, "[diff-jit] %s at %llu cycles\n",
+                bad ? "*** DIVERGENCE ***" : "match",
+                (unsigned long long)max_cycles);
+        m68k_dispatcher_shutdown(&dd);
+        return bad ? 2 : 0;
+    }
 
     if (server) {
         int rc = server_loop(&mem, &cpu);
@@ -615,7 +859,31 @@ int main(int argc, char **argv) {
             (unsigned long long)disp.chain_hits,
             (unsigned long long)disp.chain_misses,
             (unsigned long long)disp.arena_resets);
+        /* JIT-cost benchmark metric: estimated LX7 instructions to run the
+         * workload, per emulated 68000 cycle. Lower is a faster JIT. */
+        u64 cost = disp.xt_instrs
+                 + disp.helper_calls * (u64)M68K_JIT_HELPER_LX7_COST;
+        fprintf(stderr,
+            "[BENCH] jit_cost=%llu lx7 (xt=%llu helpers=%llu) "
+            "cycles=%llu  lx7_per_cyc=%.3f\n",
+            (unsigned long long)cost,
+            (unsigned long long)disp.xt_instrs,
+            (unsigned long long)disp.helper_calls,
+            (unsigned long long)cpu.cycles,
+            cpu.cycles ? (double)cost / (double)cpu.cycles : 0.0);
         m68k_dispatcher_shutdown(&disp);
+    } else {
+        /* Interp baseline: each m68k_step is one "helper-call" equivalent,
+         * weighted by M68K_JIT_HELPER_LX7_COST. Gives an apples-to-apples
+         * lx7_per_cyc the JIT optimisation pass can beat. */
+        u64 cost = cpu.instrs * (u64)M68K_JIT_HELPER_LX7_COST;
+        fprintf(stderr,
+            "[BENCH] interp_cost=%llu lx7 (instrs=%llu) "
+            "cycles=%llu  lx7_per_cyc=%.3f\n",
+            (unsigned long long)cost,
+            (unsigned long long)cpu.instrs,
+            (unsigned long long)cpu.cycles,
+            cpu.cycles ? (double)cost / (double)cpu.cycles : 0.0);
     }
 
     if (shot_path) {

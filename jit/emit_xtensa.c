@@ -259,8 +259,15 @@ u32 xt_slli(xt_emit *e, u8 ar, u8 as, u8 sa) {
     return emit24(e, enc_rrr(op2, 0x1, ar, as, (u8)(sa1 & 0xF)));
 }
 u32 xt_srli(xt_emit *e, u8 ar, u8 as, u8 sa) {
-    assert(sa <= 15);
-    return emit24(e, enc_rrr(0x4, 0x1, ar, sa, as));
+    if (sa <= 15) {
+        return emit24(e, enc_rrr(0x4, 0x1, ar, sa, as));
+    }
+    /* SRLI's encoding only reaches shifts 0..15. For 16..31, emit an
+     * equivalent EXTUI (extract bits sa..31 into ar, zero-extended).
+     * Without this fallback sa > 15 was silently encoded as SRLI by
+     * (sa & 0xF), which corrupted ADDQ.W's shift-trick. */
+    assert(sa <= 31);
+    return xt_extui(e, ar, as, sa, (u8)(31u - sa));
 }
 u32 xt_srai(xt_emit *e, u8 ar, u8 as, u8 sa) {
     /* Canonical: bit 21 fixed = 1, bits 22..23 = 0. So op2 = 2 | sa_hi1. */
