@@ -239,6 +239,19 @@ static bool g_sr_dirty;
  * reused ADDA.W execution. */
 static int  g_sext_src_reg;
 static bool g_sext_valid;
+
+/* Per-block PC-constant literal. compile_block writes the block
+ * terminator's PC constant (Bcc.S fall-through `ft` or BRA.S `taken`)
+ * to LITERAL_BCC_PC and exposes the slot via these globals. Each
+ * emit_bcc_branchless_tail / emit_branch BRA load then uses a 1-op
+ * `l32r` instead of the 10-op `emit_load_imm32`. Saves ~9 ops per
+ * branch execution — for bench's fused CMP+Bcc the dominant tail
+ * cost. `g_pc_lit_valid` is false when the literal is unset (block
+ * has no PC-overwriting terminator). */
+static bool g_pc_lit_valid;
+static u32  g_pc_lit_val;
+static u32  g_pc_lit_off;
+static u32  g_pc_lit_entry_off;
 static inline void sext_memo_invalidate(void) { g_sext_valid = false; }
 
 static void emit_sr_flush(xt_emit *e) {
@@ -795,8 +808,13 @@ static u32 fused_helper_bcc_tail_size(int cc) {
         case 15: cond_size = 15; break;  /* BLE: extui V + extui Z + extui N + xor + or */
         default: return 0;
     }
-    /* emit_bcc_branchless_tail: 22 ops × 3 = 66 bytes (when disp i8 + base_cyc i8). */
-    return cond_size + 66;
+    /* emit_bcc_branchless_tail size when g_pc_lit_valid:
+     *   movi+sub (2) + l32r (1) + addi+xor+and+xor (4) + s32i (1)
+     *   + l32i+addi+slli+add+s32i (5) = 13 ops × 3 = 39 bytes.
+     * Without literal (fallback): emit_load_imm32 expands the l32r to
+     * 10 ops, so 22 ops × 3 = 66 bytes. */
+    u32 tail_size = g_pc_lit_valid ? 39 : 66;
+    return cond_size + tail_size;
 }
 
 /* CMP+Bcc fused condition compute. Given s/d/r registers (shifted-to-high
@@ -830,7 +848,12 @@ static void emit_cmp_cond_fused(xt_emit *e, int cc, u8 s, u8 d, u8 r) {
 static void emit_bcc_branchless_tail(xt_emit *e, u32 ft, i32 disp, i32 base_cyc) {
     xt_movi(e, 10, 0);
     xt_sub (e, 9, 10, 8);                       /* a9 = mask = 0 - cond */
-    emit_load_imm32(e, 10, 11, ft);             /* a10 = ft */
+    if (g_pc_lit_valid && ft == g_pc_lit_val) {
+        /* 1-op load from the per-block literal — saves 9 ops vs emit_load_imm32. */
+        emit_l32r_at(e, 10, g_pc_lit_off, g_pc_lit_entry_off + e->len);
+    } else {
+        emit_load_imm32(e, 10, 11, ft);         /* fallback: 10-op build */
+    }
     if (disp >= -128 && disp <= 127) {
         xt_addi(e, 12, 10, disp);               /* a12 = ft + disp = taken */
     } else {
@@ -903,7 +926,11 @@ static void emit_branch(xt_emit *e, u32 op_pc, u16 w) {
     g_pc_acc = 0;
     g_cyc_acc = 0;
     if (cc == 0) {                              /* BRA.S — unconditional */
-        emit_load_imm32(e, 8, 9, taken);
+        if (g_pc_lit_valid && taken == g_pc_lit_val) {
+            emit_l32r_at(e, 8, g_pc_lit_off, g_pc_lit_entry_off + e->len);
+        } else {
+            emit_load_imm32(e, 8, 9, taken);
+        }
         xt_s32i(e, 8, R_CPU, OFF_PC);
         xt_l32i(e, 8, R_CPU, OFF_CYCLES);
         i32 total = 14 + extra_cyc;
@@ -1109,6 +1136,35 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
         *(u32 *)(base + i * 4u) = helper_addr((literal_id)i, user);
     }
     u32 entry_off = lit_bytes;
+
+    /* 3b. Per-block PC literal. If the terminator is BRA.S or Bcc.S, store
+     * its PC constant (taken or ft) in LITERAL_BCC_PC so emit_branch /
+     * emit_bcc_branchless_tail can load it with a 1-op `l32r` instead of
+     * a 10-op `emit_load_imm32`. */
+    g_pc_lit_valid = false;
+    g_pc_lit_val = 0;
+    g_pc_lit_off = lit_off[LITERAL_BCC_PC];
+    g_pc_lit_entry_off = lit_bytes;
+    {
+        u16 last_op = op_word[n_ops - 1];
+        if ((last_op >> 12) == 0x6) {        /* BRA.S / Bcc.S family */
+            int cc = (last_op >> 8) & 0xF;
+            i32 disp = (i8)(last_op & 0xFF);
+            if (disp != 0 && disp != -1) {  /* not .W/.L variants (handled by helper) */
+                u32 pc_const;
+                if (cc == 0) {
+                    /* BRA.S: literal is the taken target. */
+                    pc_const = op_pc[n_ops - 1] + 2 + (u32)disp;
+                } else {
+                    /* Bcc.S: literal is the fall-through PC. */
+                    pc_const = op_pc[n_ops - 1] + 2;
+                }
+                *(u32 *)(base + lit_off[LITERAL_BCC_PC]) = pc_const;
+                g_pc_lit_val = pc_const;
+                g_pc_lit_valid = true;
+            }
+        }
+    }
 
     xt_emit e;
     xt_init(&e, base + entry_off, total - entry_off);

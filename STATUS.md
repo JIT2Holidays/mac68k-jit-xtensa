@@ -173,7 +173,8 @@ instr/cyc on the target; helper-cost proxy `M68K_JIT_HELPER_LX7_COST = 64`).
 | JIT M6.26 (emit_cond extracts only the CCR bits the cc actually reads) | 1.632 | 18.77 × | 4.429 | 6.92 × |
 | JIT M6.27 (MOVE.W (As),(Ad) skip .W assembly when flags_dead) | 1.625 | 18.85 × | 4.429 | 6.92 × |
 | JIT M6.28 (CMP.W (d16,An),Dn + BLT.S fusion) | 1.550 | 19.76 × | 4.429 | 6.92 × |
-| **JIT M6.29 (current — fusion extended to BLE.S and CMP.W (An),Dn)** | **1.455** | **21.05 ×** | **4.429** | **6.92 ×** |
+| JIT M6.29 (fusion extended to BLE.S and CMP.W (An),Dn) | 1.455 | 21.05 × | 4.429 | 6.92 × |
+| **JIT M6.30 (current — Bcc/BRA PC constant in per-block literal pool: 1-op l32r vs 10-op emit_load_imm32)** | **1.330** | **23.03 ×** | **4.330** | **7.07 ×** |
 | Goal: 5 × interp on bench       | 1.32            | **23.2 ×**       | 1.18           | **25.9 ×**      |
 
 **Mac Plus speed already cleared** (>1 ×) by the interpreter alone —
@@ -1086,13 +1087,39 @@ Cumulative session win **M6.2 → M6.29**:
 Remaining gap: 1.455 → 1.32 = 0.135 (9.3 %). Single-digit % away from
 the 5 × target on bench.
 
-**Next target (M6.30+):** Further fusion candidates: CMPA.W (d16,An),An
-+ Bcc (bench's 0xBC6D arm), CMP.L Dm,Dn + Bcc.S, plus extending the
-CMP+Bcc cc coverage to the four remaining sign comparisons (BEQ/BNE
-cc=6/7 — Z only; BGE/BGT cc=12/14). The Z-only ones are cheap (1 op
-vs 5–7 currently). Also worth profiling: the prologue's
-`emit_sr_reload` skip when the block doesn't read R_SR (saves 1 op
-per execution × all blocks).
+**M6.30 — Bcc/BRA PC constant in per-block literal pool (delivered).**
+The block terminator's PC constant — Bcc.S `ft` (fall-through PC) or
+BRA.S `taken` — is the only 32-bit value `emit_load_imm32` materialises
+inside the Bcc/BRA tail, and it's known at compile time. Reserved a
+fifth literal-pool slot (`LITERAL_BCC_PC`) and write the terminator's
+PC into it; `emit_bcc_branchless_tail` and `emit_branch` (BRA case)
+now load it via a 1-op `l32r` instead of a 10-op
+movi/slli/movi/or × 4. Saves **9 ops per Bcc/BRA execution**.
+
+Affects every Bcc/BRA-terminated block in both engines:
+* Bench: ~810 K Bcc executions through fused-CMP fast paths +
+  smaller paths → ~7.5 M ops shaved.
+* Boot: 988 K block executions, majority Bcc-terminated → ~6 M ops shaved.
+
+| Engine | M6.29   | **M6.30**   | × Mac Plus    | delta |
+|--------|--------:|------------:|--------------:|------:|
+| Bench  | 1.455   | **1.330**   | **23.03 ×**   | **+8.6 %** |
+| Boot   | 4.429   | **4.330**   | **7.07 ×**    | **+2.2 %** |
+
+`--diff-jit-trace` matches baseline through step 544. ctest 3/3.
+
+Cumulative session win **M6.2 → M6.30**:
+* Bench `4.008 → 1.330 lx7/cyc` (**+66.8 %**), 7.64 × → **23.03 × Mac Plus**.
+* Boot  `5.376 → 4.330 lx7/cyc` (**+19.5 %**), 5.70 × → **7.07 × Mac Plus**.
+
+**Goal**: 5 × interp = **23.2 × Mac Plus** = 1.32 lx7/cyc.
+**Status**: bench is **0.01 lx7/cyc (0.8 %) away from the goal.**
+
+**Next target (M6.31+):** Extend the literal-pool trick — there are
+several other places `emit_load_imm32` is called for constants known
+per-block (cycle deltas, RAM_BOUNDS reloads). Also: extend CMP+Bcc
+fusion cc coverage (BEQ/BNE/BGE/BGT) for non-bench hot paths; skip
+prologue `emit_sr_reload` when no inline path touches R_SR.
 
 Profiled bench's hot-block distribution (per `block_executed`):
 
