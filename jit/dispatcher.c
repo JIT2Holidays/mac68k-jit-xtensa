@@ -119,6 +119,15 @@ static void smc_watch(void *ctx, u32 addr) {
     m68k_dispatcher *d = (m68k_dispatcher *)ctx;
     u32 page = (addr >> 8) & 0xFFFFu;
     if (!(d->code_pages[page >> 3] & (1u << (page & 7)))) return;
+    /* Native chaining (ESP32, M6.54) lets a block JX directly to its
+     * predicted successor without returning to the dispatcher. That
+     * bypasses smc_flush — so a chained block writing to a code page
+     * could chain into a stale block before the dispatcher gets a turn.
+     * Zeroing chain_budget here forces the next block's chain check
+     * (the `beqz a11, FALLBACK` on the budget) to fall back, returning
+     * to the dispatcher where smc_flush will drop the affected blocks.
+     * No-op on host (chain epilogue not emitted there). */
+    d->cpu->chain_budget = 0;
     for (int i = 0; i < d->n_dirty; i++)
         if (d->dirty_pages[i] == page) return;
     if (d->n_dirty < (int)(sizeof(d->dirty_pages) / sizeof(d->dirty_pages[0])))

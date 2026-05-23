@@ -269,6 +269,34 @@ block, epilogue (under `#ifdef ESP_PLATFORM`) emits the chain check
 latency under ~1 ms. Host build skips the chain emit entirely;
 xt_sim still runs one block per invocation as before.
 
+**M6.55 — chain epilogue a0-restore fix (latent crash beyond depth 1).**
+Audit of M6.54 found that the chain JX hopped to the next block's
+prologue without reloading `a0` from `cpu->jit_ret_pc`. The next
+block's prologue does `s32i a0, OFF_JITRETPC` on entry — but `a0`
+had been clobbered by any helper CALLs in the *current* block, so the
+next block would overwrite `cpu->jit_ret_pc` with garbage. Hidden at
+chain depth 1 (the dispatcher's next enter_block call resets `a0`),
+but at depth ≥ 2 the eventual standard return would JX to a bad PC.
+Added `l32i a0, OFF_JITRETPC` to the chain epilogue right before
+the chain JX. +1 LX7 op per chain hit; on host build the chain epilogue
+is still `#ifdef ESP_PLATFORM`-gated so bench/boot host metrics
+unchanged (bench 1.279, boot 1.739 lx7/cyc — the 1.711 noted earlier
+was a different run config).
+
+**M6.56 — chain budget must yield on SMC dirty-page detection.**
+Found auditing M6.54's interaction with the self-modifying-code path:
+`smc_watch` queues dirty pages on `d->n_dirty` / `d->smc_overflow`
+but doesn't touch `cpu->chain_budget`. The dispatcher's `smc_flush`
+runs only between *non-chained* dispatcher returns (`dispatcher.c:418`),
+so a chained block writing to a code page could continue chaining
+for up to 16 hops — executing potentially stale JIT code against
+fresh guest RAM. Fix: zero `cpu->chain_budget` in `smc_watch` whenever
+a write hits a code page. The next block's chain epilogue's
+`beqz a11, FALLBACK` on the budget then fires, falling back to the
+dispatcher, where `smc_flush` runs and drops the affected blocks.
+Host build is unaffected (no chain epilogue emitted; the write to
+`cpu->chain_budget` is dead state).
+
 **Cross-block register caching.** The other unimplemented item.
 M6.10's regcache caches D/A regs *within* a block (loaded at
 prologue, flushed at epilogue). Extending across blocks would
