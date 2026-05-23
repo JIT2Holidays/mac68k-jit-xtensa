@@ -859,6 +859,8 @@ int main(int argc, char **argv) {
             (unsigned long long)disp.chain_hits,
             (unsigned long long)disp.chain_misses,
             (unsigned long long)disp.arena_resets);
+        fprintf(stderr, "[host] interp_fallbacks=%llu\n",
+            (unsigned long long)disp.interp_fallbacks);
         /* JIT-cost benchmark metric: estimated LX7 instructions to run the
          * workload, per emulated 68000 cycle. Lower is a faster JIT. */
         u64 cost = disp.xt_instrs

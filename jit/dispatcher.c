@@ -54,6 +54,9 @@ static u32 helper_addr(literal_id id, void *user) {
         case LITERAL_RAM_BOUNDS:return ram_bounds_mask(cpu);
         case HELPER_JIT_ORI_B_MMIO: return (u32)(uintptr_t)&m68k_jit_ori_b_mmio;
         case HELPER_JIT_BTST_B_MMIO: return (u32)(uintptr_t)&m68k_jit_btst_b_mmio;
+        case HELPER_JIT_MOVEM_L_POSTINC: return (u32)(uintptr_t)&m68k_jit_movem_l_postinc_to_regs;
+        case HELPER_JIT_MOVEM_L_PREDEC:  return (u32)(uintptr_t)&m68k_jit_movem_l_predec_from_regs;
+        case HELPER_JIT_MOVEM_W_TO_MEM:  return (u32)(uintptr_t)&m68k_jit_movem_w_to_mem;
         default:                return 0;
     }
 #else
@@ -65,6 +68,9 @@ static u32 helper_addr(literal_id id, void *user) {
         case LITERAL_RAM_BOUNDS:return ram_bounds_mask(cpu);
         case HELPER_JIT_ORI_B_MMIO: return (u32)HELPER_JIT_ORI_B_MMIO;
         case HELPER_JIT_BTST_B_MMIO: return (u32)HELPER_JIT_BTST_B_MMIO;
+        case HELPER_JIT_MOVEM_L_POSTINC: return (u32)HELPER_JIT_MOVEM_L_POSTINC;
+        case HELPER_JIT_MOVEM_L_PREDEC:  return (u32)HELPER_JIT_MOVEM_L_PREDEC;
+        case HELPER_JIT_MOVEM_W_TO_MEM:  return (u32)HELPER_JIT_MOVEM_W_TO_MEM;
         default:                return 0;
     }
 #endif
@@ -270,12 +276,14 @@ static u32 sim_read_literal(xt_sim *s, u32 addr) {
 
 static void sim_call(xt_sim *s, u32 fn_token) {
     sim_ctx *c = (sim_ctx *)s->user;
-    if ((literal_id)fn_token == HELPER_M68K_STEP) {
-        m68k_step(c->cpu);
-    } else if ((literal_id)fn_token == HELPER_JIT_ORI_B_MMIO) {
-        m68k_jit_ori_b_mmio(c->cpu);
-    } else if ((literal_id)fn_token == HELPER_JIT_BTST_B_MMIO) {
-        m68k_jit_btst_b_mmio(c->cpu);
+    switch ((literal_id)fn_token) {
+        case HELPER_M68K_STEP:           m68k_step(c->cpu); break;
+        case HELPER_JIT_ORI_B_MMIO:      m68k_jit_ori_b_mmio(c->cpu); break;
+        case HELPER_JIT_BTST_B_MMIO:     m68k_jit_btst_b_mmio(c->cpu); break;
+        case HELPER_JIT_MOVEM_L_POSTINC: m68k_jit_movem_l_postinc_to_regs(c->cpu); break;
+        case HELPER_JIT_MOVEM_L_PREDEC:  m68k_jit_movem_l_predec_from_regs(c->cpu); break;
+        case HELPER_JIT_MOVEM_W_TO_MEM:  m68k_jit_movem_w_to_mem(c->cpu); break;
+        default: break;
     }
 }
 

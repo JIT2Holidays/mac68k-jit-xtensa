@@ -43,6 +43,9 @@ typedef enum {
                           /* Filled by codegen, not by the helper_addr cb. */
     HELPER_JIT_ORI_B_MMIO,/* fast-path ORI.B (d16,An) helper for MMIO targets */
     HELPER_JIT_BTST_B_MMIO,/* fast-path BTST (d16,An) helper for MMIO targets */
+    HELPER_JIT_MOVEM_L_POSTINC,  /* MOVEM.L (An)+,reglist fast helper */
+    HELPER_JIT_MOVEM_L_PREDEC,   /* MOVEM.L reglist,-(An) fast helper */
+    HELPER_JIT_MOVEM_W_TO_MEM,   /* MOVEM.W reglist,(An) fast helper */
     LITERAL_COUNT
 } literal_id;
 

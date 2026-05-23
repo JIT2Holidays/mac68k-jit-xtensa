@@ -16,6 +16,7 @@
 #include "m68k_interp.h"
 #include "mac_mem.h"
 #include "sony.h"
+#include <stdio.h>
 #include <string.h>
 
 /* ---- size helpers ----------------------------------------------------- */
@@ -588,6 +589,57 @@ void m68k_jit_btst_b_mmio(m68k_cpu *cpu) {
     u8 ccr = m68k_get_ccr(cpu) & (u8)~CCR_Z;
     if (((d >> bit) & 1) == 0) ccr |= CCR_Z;
     m68k_set_ccr(cpu, ccr);
+}
+
+/* JIT custom MOVEM fast helpers. Skip m68k_step's decode for the
+ * three shapes the JIT's MOVEM inline arms handle but defer to a
+ * helper when the reglist is too big for the unrolled inline body.
+ *
+ * Args:  jit_arg1 = reglist (low 16 bits); jit_arg2 = An register
+ *        index (0..7).  PC/cycle advance is handled by the JIT
+ *        arm's emit_advance — the helper touches neither. */
+void m68k_jit_movem_l_postinc_to_regs(m68k_cpu *cpu) {
+    u16 list = (u16)cpu->jit_arg1;
+    int an = (int)(cpu->jit_arg2 & 7);
+    u32 addr = cpu->a[an];
+    for (int i = 0; i < 16; i++) {
+        if (list & (1 << i)) {
+            u32 v = mac_read32(cpu->mem, addr);
+            if (i < 8) cpu->d[i] = v;
+            else       cpu->a[i - 8] = v;
+            addr += 4;
+        }
+    }
+    cpu->a[an] = addr;
+}
+
+void m68k_jit_movem_l_predec_from_regs(m68k_cpu *cpu) {
+    u16 list = (u16)cpu->jit_arg1;
+    int an = (int)(cpu->jit_arg2 & 7);
+    u32 addr = cpu->a[an];
+    for (int i = 0; i < 16; i++) {
+        if (list & (1 << i)) {
+            int idx = 15 - i;
+            u32 v = (idx < 8) ? cpu->d[idx] : cpu->a[idx - 8];
+            addr -= 4;
+            mac_write32(cpu->mem, addr, v);
+        }
+    }
+    cpu->a[an] = addr;
+}
+
+void m68k_jit_movem_w_to_mem(m68k_cpu *cpu) {
+    u16 list = (u16)cpu->jit_arg1;
+    int an = (int)(cpu->jit_arg2 & 7);
+    u32 addr = cpu->a[an];
+    for (int i = 0; i < 16; i++) {
+        if (list & (1 << i)) {
+            u32 v = (i < 8) ? cpu->d[i] : cpu->a[i - 8];
+            mac_write16(cpu->mem, addr, (u16)v);
+            addr += 2;
+        }
+    }
+    /* (An) destination — no writeback of An. */
 }
 
 void m68k_step(m68k_cpu *cpu) {

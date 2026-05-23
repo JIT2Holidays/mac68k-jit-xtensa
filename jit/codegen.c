@@ -11,6 +11,7 @@
 #include "m68k_interp.h"
 #include "mac_mem.h"
 #include <assert.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -321,6 +322,40 @@ static u32 helper_step_after_flush_undo_size(const regcache *rc,
     u32 sz = helper_step_after_flush_base_size(rc);
     if (pc_undo) sz += 9u;
     if (cyc_undo) sz += 9u;
+    return sz;
+}
+
+/* Emit a "fast helper" bridge for ops that pass (jit_arg1, jit_arg2)
+ * via cpu state and call a specialised C helper instead of m68k_step.
+ * The helper does NOT touch cpu->pc / cpu->cycles — the JIT arm's own
+ * emit_advance handles that.
+ *
+ * a8 must hold the value to store into jit_arg1 (e.g. the address or
+ * the reglist bitmap). `imm2` is the constant to store into jit_arg2
+ * (small enough for xt_movi: -2048..2047). */
+static void emit_jit_fast_helper(xt_emit *e, u8 a8_arg1_reg, i32 imm2,
+                                 u32 helper_lit_off, u32 entry_off,
+                                 regcache *rc) {
+    sext_memo_invalidate();
+    emit_sr_flush(e);
+    xt_s32i(e, a8_arg1_reg, R_CPU, OFF_JIT_ARG1);
+    xt_movi(e, 9, imm2);
+    xt_s32i(e, 9, R_CPU, OFF_JIT_ARG2);
+    xt_mov (e, R_ARG, R_CPU);
+    emit_l32r_at(e, R_HELP, helper_lit_off, entry_off + e->len);
+    xt_callx0(e, R_HELP);
+    emit_sr_reload(e);
+    emit_cache_reload(e, rc);
+}
+
+/* Size in bytes (must match emit_jit_fast_helper exactly). */
+__attribute__((unused))
+static u32 emit_jit_fast_helper_size(const regcache *rc) {
+    u32 sz = 3u /*s32i arg1*/ + 3u /*movi*/ + 3u /*s32i arg2*/
+           + 3u /*mov R_ARG*/ + 3u /*l32r*/ + 3u /*callx0*/
+           + 3u /*sr_reload*/;
+    if (g_sr_dirty) sz += 3u;
+    if (rc) sz += (u32)rc->active * 3u;
     return sz;
 }
 
@@ -2289,6 +2324,16 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                 base[entry_off + jmsm_pos + 2] = (u8)(jw_msm >> 16);
                 sext_memo_invalidate();
                 inline_ops++; done = true;
+            } else if (n_regs >= 1 && sz == 2) {
+                /* Large reglist .W: use fast helper instead of m68k_step. */
+                emit_advance_flush(&e);
+                emit_cache_flush(&e, &rc);
+                emit_load_imm(&e, 8, 9, (u32)list);
+                emit_jit_fast_helper(&e, 8, an,
+                                     lit_off[HELPER_JIT_MOVEM_W_TO_MEM],
+                                     entry_off, &rc);
+                emit_advance(&e, 4, 20);
+                inline_ops++; done = true;
             }
         } else if (top == 0x4 && (w & 0xFB80) == 0x4880
                    && ((w >> 10) & 1) == 0 && mode == 4) {
@@ -2354,6 +2399,16 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                 base[entry_off + jpdm_pos + 1] = (u8)(jw_pdm >> 8);
                 base[entry_off + jpdm_pos + 2] = (u8)(jw_pdm >> 16);
                 sext_memo_invalidate();
+                inline_ops++; done = true;
+            } else if (n_regs >= 1 && sz == 4) {
+                /* Large reglist .L: use fast helper. */
+                emit_advance_flush(&e);
+                emit_cache_flush(&e, &rc);
+                emit_load_imm(&e, 8, 9, (u32)list);
+                emit_jit_fast_helper(&e, 8, an,
+                                     lit_off[HELPER_JIT_MOVEM_L_PREDEC],
+                                     entry_off, &rc);
+                emit_advance(&e, 4, 20);
                 inline_ops++; done = true;
             }
         } else if (top == 0x4 && (w & 0xFB80) == 0x4880
@@ -2424,8 +2479,18 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
 
                 sext_memo_invalidate();
                 inline_ops++; done = true;
+            } else if (n_regs >= 1) {
+                /* Large reglist .L: use fast helper. */
+                emit_advance_flush(&e);
+                emit_cache_flush(&e, &rc);
+                emit_load_imm(&e, 8, 9, (u32)list);
+                emit_jit_fast_helper(&e, 8, an,
+                                     lit_off[HELPER_JIT_MOVEM_L_POSTINC],
+                                     entry_off, &rc);
+                emit_advance(&e, 4, 20);
+                inline_ops++; done = true;
             }
-            /* else: large reglist — fall through to helper. */
+            /* else: empty reglist — fall through to helper. */
         } else if (top == 0x4 && ((w >> 6) & 7) == 7
                    && (mode == 2 || mode == 5 || mode == 6
                        || (mode == 7 && (w & 7) <= 1))) {
