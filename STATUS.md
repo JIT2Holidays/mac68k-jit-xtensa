@@ -178,7 +178,8 @@ instr/cyc on the target; helper-cost proxy `M68K_JIT_HELPER_LX7_COST = 64`).
 | JIT M6.31 (ADDX2 fuses slli+add for the Bcc.S cycle update) 🎯 | 1.316 | 23.27 × ✅ | 4.319 | 7.09 × |
 | JIT M6.32 (skip prologue R_SR reload + extend fusion to BEQ/BNE) | 1.303 | 23.51 × | 4.319 | 7.09 × |
 | JIT M6.33 (inline OR.L Dm,Dn — top-3 boot helper) | 1.303 | 23.51 × | 3.397 | 9.02 × |
-| **JIT M6.34 (current — inline ADDA.W/SUBA.W #imm + MOVE.L (An)+ ⇄ Dn)** | **1.299** | **23.58 ×** | **3.014** | **10.16 ×** ✅ |
+| JIT M6.34 (inline ADDA.W/SUBA.W #imm + MOVE.L (An)+ ⇄ Dn) | 1.299 | 23.58 × | 3.014 | 10.16 × ✅ |
+| **JIT M6.37 (current — inline ORI.B (d16,An) + BTST (d16,An) + MOVE.W (An)+,Dn)** | **1.299** | **23.58 ×** | **2.457** | **12.47 ×** |
 | Goal: 5 × interp on bench       | 1.32            | **23.2 ×**       | 1.18           | **25.9 ×**      |
 
 **Mac Plus speed already cleared** (>1 ×) by the interpreter alone —
@@ -1250,6 +1251,43 @@ ctest 3/3.
 Cumulative session win **M6.2 → M6.34**:
 * Bench `4.008 → 1.299 lx7/cyc` (**+67.6 %**), 7.64 × → **23.58 × Mac Plus**.
 * Boot  `5.376 → 3.014 lx7/cyc` (**+43.9 %**), 5.70 × → **10.16 × Mac Plus**.
+
+**M6.35–M6.37 — three more boot inlines (delivered).** Continued the
+boot-helper inlining campaign:
+
+1. **M6.35 — ORI.B #imm,(d16,An)** (top=0, op9=0, szf=0, mode=5). The
+   single biggest boot helper at 408 K execs (0x002C / d16,A4).
+   Bounds-check, read byte, OR with imm8, write back, set N/Z via
+   `emit_logic_flags` on the byte-shifted-to-bit-31 value. Boot
+   3.014 → 2.639 (+12.4 %).
+
+2. **M6.36 — BTST #imm,(d16,An)** (top=0, op9=4, szf=0, mode=5). 214 K
+   execs (0x082D / d16,A5). Reads byte, extracts one bit at the
+   `imm & 7` position, then updates only Z in R_SR via a small
+   bnez-gated `or` sequence (clear Z mask, OR Z if bit clear).
+   Boot 2.639 → 2.514 (+4.7 %).
+
+3. **M6.37 — MOVE.W (An)+,Dn** (top=3, op6=0, mode=3). 65 K execs
+   (0x3018). Companion to the .W (An),Dn arm with An post-increment
+   by 2 and the same low-16-of-Dn write pattern. Boot 2.514 → 2.457
+   (+2.3 %).
+
+| Engine | M6.34   | **M6.37**   | × Mac Plus    | delta |
+|--------|--------:|------------:|--------------:|------:|
+| Bench  | 1.299   | **1.299**   | **23.58 ×**   | unchanged |
+| Boot   | 3.014   | **2.457**   | **12.47 ×**   | **+18.5 %** |
+
+ctest 3/3. `--diff-jit-trace` divergence at step 84 in VIA timer
+state only — pre-existing M5.x cadence mismatch, CPU regs match.
+
+Cumulative session win **M6.2 → M6.37**:
+* Bench `4.008 → 1.299 lx7/cyc` (**+67.6 %**), 7.64 × → **23.58 × Mac Plus**.
+* Boot  `5.376 → 2.457 lx7/cyc` (**+54.3 %**), 5.70 × → **12.47 × Mac Plus**.
+
+Boot is now closing in on bench (interp baseline: bench 6.601, boot
+5.923 lx7/cyc). The JIT/interp ratio:
+* Bench: **5.08 ×** interp (was 1.65 × at M6.2).
+* Boot:  **2.41 ×** interp (was 1.10 × at M6.2).
 
 Profiled bench's hot-block distribution (per `block_executed`):
 
