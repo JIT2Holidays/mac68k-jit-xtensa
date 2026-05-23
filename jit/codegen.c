@@ -2232,6 +2232,129 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
 
             inline_ops++; done = true;
         } else if (top == 0x4 && (w & 0xFB80) == 0x4880
+                   && ((w >> 10) & 1) == 0 && mode == 2) {
+            /* MOVEM.W/.L <reglist>,(An) — boot's 0x48D0 (.W) at 131 K.
+             * Store regs to memory at An, An unchanged. Bit order: bit 0=D0,
+             * bit 15=A7. Length 4, cycles 20. */
+            int an = w & 7;
+            int sz = (w & 0x40) ? 4 : 2;
+            u16 list = mac_read16(cpu->mem, op_pc[i] + 2);
+            int n_regs = __builtin_popcount(list);
+            int threshold = (sz == 4) ? 4 : 6;
+
+            if (n_regs >= 1 && n_regs <= threshold) {
+                emit_advance_flush(&e);
+                emit_read_g(&e, &rc, G_A(an), 8);
+                emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                             entry_off + e.len);
+                xt_addi(&e, 12, 8, n_regs * sz - 1);
+                xt_or  (&e, 10, 8, 12);
+                xt_and (&e, 10, 10, 9);
+                emit_cache_flush(&e, &rc);
+                i32 op_pc_msm = 4, op_cyc_msm = 20;
+                xt_beqz(&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_msm, op_cyc_msm)));
+                emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                                  entry_off, &rc, op_pc_msm, op_cyc_msm);
+                u32 jmsm_pos = e.len;
+                xt_j(&e, 4);
+                /* Fast path: write each reg as sz BE bytes. */
+                emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                             entry_off + e.len);
+                xt_add(&e, 9, 9, 8);
+                int byte_off = 0;
+                for (int b = 0; b < 16; b++) {
+                    if (!(list & (1 << b))) continue;
+                    int g_reg = (b < 8) ? G_D(b) : G_A(b - 8);
+                    emit_read_g(&e, &rc, g_reg, 10);
+                    if (sz == 4) {
+                        xt_extui(&e, 11, 10, 24, 7); xt_s8i(&e, 11, 9, (u8)(byte_off + 0));
+                        xt_extui(&e, 11, 10, 16, 7); xt_s8i(&e, 11, 9, (u8)(byte_off + 1));
+                        xt_extui(&e, 11, 10,  8, 7); xt_s8i(&e, 11, 9, (u8)(byte_off + 2));
+                        xt_extui(&e, 11, 10,  0, 7); xt_s8i(&e, 11, 9, (u8)(byte_off + 3));
+                    } else {
+                        xt_extui(&e, 11, 10, 8, 7); xt_s8i(&e, 11, 9, (u8)(byte_off + 0));
+                        xt_extui(&e, 11, 10, 0, 7); xt_s8i(&e, 11, 9, (u8)(byte_off + 1));
+                    }
+                    byte_off += sz;
+                }
+                emit_advance(&e, op_pc_msm, op_cyc_msm);
+
+                u32 here_msm = e.len;
+                i32 jo_msm = (i32)(here_msm - jmsm_pos) - 4;
+                u32 jw_msm = ((u32)((u32)jo_msm & 0x3FFFFu) << 6) | 0x06u;
+                base[entry_off + jmsm_pos    ] = (u8)jw_msm;
+                base[entry_off + jmsm_pos + 1] = (u8)(jw_msm >> 8);
+                base[entry_off + jmsm_pos + 2] = (u8)(jw_msm >> 16);
+                sext_memo_invalidate();
+                inline_ops++; done = true;
+            }
+        } else if (top == 0x4 && (w & 0xFB80) == 0x4880
+                   && ((w >> 10) & 1) == 0 && mode == 4) {
+            /* MOVEM.W/.L <reglist>,-(An) — boot's 0x48E1 (.L) at 131 K.
+             * Pre-decrement An by N*sz then write regs at consecutive
+             * offsets from the new An. Bit order is REVERSED for -(An):
+             * bit 0=A7, bit 15=D0. The lowest-numbered register set
+             * (smallest bit position) ends up at the HIGHEST address. */
+            int an = w & 7;
+            int sz = (w & 0x40) ? 4 : 2;
+            u16 list = mac_read16(cpu->mem, op_pc[i] + 2);
+            int n_regs = __builtin_popcount(list);
+            int threshold = (sz == 4) ? 4 : 6;
+
+            if (n_regs >= 1 && n_regs <= threshold) {
+                emit_advance_flush(&e);
+                emit_read_g(&e, &rc, G_A(an), 8);
+                /* New An = An - N*sz. */
+                xt_addi(&e, 8, 8, -(n_regs * sz));
+                emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                             entry_off + e.len);
+                xt_addi(&e, 12, 8, n_regs * sz - 1);
+                xt_or  (&e, 10, 8, 12);
+                xt_and (&e, 10, 10, 9);
+                emit_cache_flush(&e, &rc);
+                i32 op_pc_pdm = 4, op_cyc_pdm = 20;
+                xt_beqz(&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_pdm, op_cyc_pdm)));
+                emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                                  entry_off, &rc, op_pc_pdm, op_cyc_pdm);
+                u32 jpdm_pos = e.len;
+                xt_j(&e, 4);
+                /* Fast path: iterate bits high-to-low (= regs low-to-high
+                 * since bit i = reg 15-i), writing at increasing offsets
+                 * from the (decremented) An. */
+                emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                             entry_off + e.len);
+                xt_add(&e, 9, 9, 8);
+                int byte_off = 0;
+                for (int b = 15; b >= 0; b--) {
+                    if (!(list & (1 << b))) continue;
+                    int reg_idx = 15 - b;
+                    int g_reg = (reg_idx < 8) ? G_D(reg_idx) : G_A(reg_idx - 8);
+                    emit_read_g(&e, &rc, g_reg, 10);
+                    if (sz == 4) {
+                        xt_extui(&e, 11, 10, 24, 7); xt_s8i(&e, 11, 9, (u8)(byte_off + 0));
+                        xt_extui(&e, 11, 10, 16, 7); xt_s8i(&e, 11, 9, (u8)(byte_off + 1));
+                        xt_extui(&e, 11, 10,  8, 7); xt_s8i(&e, 11, 9, (u8)(byte_off + 2));
+                        xt_extui(&e, 11, 10,  0, 7); xt_s8i(&e, 11, 9, (u8)(byte_off + 3));
+                    } else {
+                        xt_extui(&e, 11, 10, 8, 7); xt_s8i(&e, 11, 9, (u8)(byte_off + 0));
+                        xt_extui(&e, 11, 10, 0, 7); xt_s8i(&e, 11, 9, (u8)(byte_off + 1));
+                    }
+                    byte_off += sz;
+                }
+                /* Write decremented An back. */
+                emit_write_g(&e, &rc, G_A(an), 8);
+                emit_advance(&e, op_pc_pdm, op_cyc_pdm);
+
+                u32 here_pdm = e.len;
+                i32 jo_pdm = (i32)(here_pdm - jpdm_pos) - 4;
+                u32 jw_pdm = ((u32)((u32)jo_pdm & 0x3FFFFu) << 6) | 0x06u;
+                base[entry_off + jpdm_pos    ] = (u8)jw_pdm;
+                base[entry_off + jpdm_pos + 1] = (u8)(jw_pdm >> 8);
+                base[entry_off + jpdm_pos + 2] = (u8)(jw_pdm >> 16);
+                sext_memo_invalidate();
+                inline_ops++; done = true;
+            }
+        } else if (top == 0x4 && (w & 0xFB80) == 0x4880
                    && ((w >> 10) & 1) == 1 && (w & 0x40) != 0 && mode == 3) {
             /* MOVEM.L (An)+,<reglist> — boot's 0x4CD8 at 262 K execs.
              *
