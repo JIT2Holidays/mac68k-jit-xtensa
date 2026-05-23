@@ -423,6 +423,35 @@ static void emit_movea_l_reg(xt_emit *e, int an, int src, bool src_is_an, regcac
     emit_advance(e, 2, 8);
 }
 
+/* ADDA.W / SUBA.W #imm16,An — a[an] ± sign-extend(imm16). No CCR.
+ * Boot-hot 0xD0FC (ADDA.W #imm,A0) at 131 K execs / 60 M cycles. */
+static void emit_adda_w_imm(xt_emit *e, int an, i16 imm, bool is_sub, regcache *rc) {
+    i32 sext = (i32)imm;
+    if (is_sub) sext = -sext;
+    int xt_dst = cache_lookup(rc, G_A(an));
+    if (xt_dst >= 0) {
+        u8 dst = (u8)xt_dst;
+        if (sext >= -128 && sext <= 127) {
+            xt_addi(e, dst, dst, sext);
+        } else {
+            emit_load_imm(e, 9, 10, (u32)sext);
+            xt_add(e, dst, dst, 9);
+        }
+        for (int i = 0; i < rc->active; i++)
+            if (rc->guest[i] == (u8)G_A(an)) { rc->dirty |= (u16)(1u << i); break; }
+    } else {
+        xt_l32i(e, 8, R_CPU, OFF_A(an));
+        if (sext >= -128 && sext <= 127) {
+            xt_addi(e, 8, 8, sext);
+        } else {
+            emit_load_imm(e, 9, 10, (u32)sext);
+            xt_add(e, 8, 8, 9);
+        }
+        xt_s32i(e, 8, R_CPU, OFF_A(an));
+    }
+    emit_advance(e, 4, 8);
+}
+
 /* ADDA.W <Dm|Am>,An — a[an] += sign-extend-word(src register). No CCR. */
 static void emit_adda_w_reg(xt_emit *e, int an, int src, bool src_is_an, regcache *rc) {
     int g_src = src_is_an ? G_A(src) : G_D(src);
@@ -1491,6 +1520,13 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
         } else if (top == 0xD && szf == 3 && !((w >> 8) & 1) && mode <= 1) {
             /* ADDA.W <Dm|Am>,An */
             emit_adda_w_reg(&e, (w >> 9) & 7, w & 7, mode == 1, &rc);
+            inline_ops++; done = true;
+        } else if ((top == 0xD || top == 0x9) && szf == 3 && !((w >> 8) & 1)
+                   && mode == 7 && (w & 7) == 4) {
+            /* ADDA.W / SUBA.W #imm16,An — boot-hot 0xD0FC.  mode 7/4 = #imm. */
+            int an = (w >> 9) & 7;
+            u16 imm = mac_read16(cpu->mem, op_pc[i] + 2);
+            emit_adda_w_imm(&e, an, (i16)imm, top == 0x9, &rc);
             inline_ops++; done = true;
         } else if (top == 0x5 && szf == 1 && mode == 0) {
             /* ADDQ.W / SUBQ.W #imm,Dn */
