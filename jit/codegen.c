@@ -810,10 +810,10 @@ static u32 fused_helper_bcc_tail_size(int cc) {
     }
     /* emit_bcc_branchless_tail size when g_pc_lit_valid:
      *   movi+sub (2) + l32r (1) + addi+xor+and+xor (4) + s32i (1)
-     *   + l32i+addi+slli+add+s32i (5) = 13 ops × 3 = 39 bytes.
+     *   + l32i+addi+addx2+s32i (4) = 12 ops × 3 = 36 bytes.
      * Without literal (fallback): emit_load_imm32 expands the l32r to
-     * 10 ops, so 22 ops × 3 = 66 bytes. */
-    u32 tail_size = g_pc_lit_valid ? 39 : 66;
+     * 10 ops, so 21 ops × 3 = 63 bytes. */
+    u32 tail_size = g_pc_lit_valid ? 36 : 63;
     return cond_size + tail_size;
 }
 
@@ -871,8 +871,8 @@ static void emit_bcc_branchless_tail(xt_emit *e, u32 ft, i32 disp, i32 base_cyc)
         emit_load_imm(e, 10, 12, (u32)base_cyc);
         xt_add(e, 11, 11, 10);
     }
-    xt_slli(e, 8, 8, 1);
-    xt_add (e, 11, 11, 8);
+    /* a11 += a8 * 2 — one ADDX2 instead of `slli a8, 8, 1; add a11, 11, 8`. */
+    xt_addx2(e, 11, 8, 11);
     xt_s32i(e, 11, R_CPU, OFF_CYCLES);
 }
 

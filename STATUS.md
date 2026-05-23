@@ -174,7 +174,8 @@ instr/cyc on the target; helper-cost proxy `M68K_JIT_HELPER_LX7_COST = 64`).
 | JIT M6.27 (MOVE.W (As),(Ad) skip .W assembly when flags_dead) | 1.625 | 18.85 × | 4.429 | 6.92 × |
 | JIT M6.28 (CMP.W (d16,An),Dn + BLT.S fusion) | 1.550 | 19.76 × | 4.429 | 6.92 × |
 | JIT M6.29 (fusion extended to BLE.S and CMP.W (An),Dn) | 1.455 | 21.05 × | 4.429 | 6.92 × |
-| **JIT M6.30 (current — Bcc/BRA PC constant in per-block literal pool: 1-op l32r vs 10-op emit_load_imm32)** | **1.330** | **23.03 ×** | **4.330** | **7.07 ×** |
+| JIT M6.30 (Bcc/BRA PC constant in per-block literal pool) | 1.330 | 23.03 × | 4.330 | 7.07 × |
+| **JIT M6.31 (current — ADDX2 fuses slli+add for the Bcc.S cycle update)** 🎯 | **1.316** | **23.27 ×** ✅ | **4.319** | **7.09 ×** |
 | Goal: 5 × interp on bench       | 1.32            | **23.2 ×**       | 1.18           | **25.9 ×**      |
 
 **Mac Plus speed already cleared** (>1 ×) by the interpreter alone —
@@ -1115,11 +1116,38 @@ Cumulative session win **M6.2 → M6.30**:
 **Goal**: 5 × interp = **23.2 × Mac Plus** = 1.32 lx7/cyc.
 **Status**: bench is **0.01 lx7/cyc (0.8 %) away from the goal.**
 
-**Next target (M6.31+):** Extend the literal-pool trick — there are
-several other places `emit_load_imm32` is called for constants known
-per-block (cycle deltas, RAM_BOUNDS reloads). Also: extend CMP+Bcc
-fusion cc coverage (BEQ/BNE/BGE/BGT) for non-bench hot paths; skip
-prologue `emit_sr_reload` when no inline path touches R_SR.
+**M6.31 — ADDX2 fuses slli+add for the Bcc.S cycle update (delivered).**
+The Bcc.S branchless tail's last two ops were `xt_slli a8, 8, 1` +
+`xt_add a11, 11, 8`, computing `cycles += cond * 2`. Xtensa LX7 has
+ADDX2 — `ar = (as << 1) + at` — a single instruction that does both.
+Added `xt_addx2` / `xt_addx4` to the emit table and the xtensa_sim
+decoder, then replaced the pair with `xt_addx2(e, 11, 8, 11)`. Saves
+1 op per Bcc.S execution (every Bcc-terminated block in both engines).
+
+| Engine | M6.30   | **M6.31**   | × Mac Plus    | delta |
+|--------|--------:|------------:|--------------:|------:|
+| Bench  | 1.330   | **1.316**   | **23.27 ×** ✅ | **+1.1 %** |
+| Boot   | 4.330   | **4.319**   | **7.09 ×**    | **+0.3 %** |
+
+`--diff-jit-trace` matches baseline through step 544. ctest 3/3.
+
+## ✅ 5×-interp goal cleared on bench
+
+Cumulative session win **M6.2 → M6.31**:
+* Bench `4.008 → 1.316 lx7/cyc` (**+67.2 %**), 7.64 × → **23.27 × Mac Plus**.
+* Boot  `5.376 → 4.319 lx7/cyc` (**+19.7 %**), 5.70 × → **7.09 × Mac Plus**.
+
+Bench cleared the **23.2 × Mac Plus (= 5 × interpreter) goal** the user
+set at the start of the loop, and boot's gain is no longer trailing —
+it has crossed 7 × Mac Plus, more than the original Mac Plus running
+the bench workload at quartz-clock speed could ever do.
+
+This was the optimisation loop's planned aggressive push, executed
+across 31 incremental iterations with `--diff-jit-trace` matching the
+baseline at every step. The optimisation surface is now well-mapped;
+further low-effort wins are possible (CMP+Bcc fusion cc coverage for
+BEQ/BNE/BGE/BGT, prologue R_SR-reload skip, more literal-pool uses),
+but the headline goal is in hand.
 
 Profiled bench's hot-block distribution (per `block_executed`):
 

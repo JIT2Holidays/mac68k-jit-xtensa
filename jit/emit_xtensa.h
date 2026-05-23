@@ -44,6 +44,8 @@ u32 xt_l32r(xt_emit *e, u8 at, u32 lit_offset);     /* L32R at, label */
 
 /* Arithmetic / logical (3-operand). */
 u32 xt_add(xt_emit *e, u8 ar, u8 as, u8 at);
+u32 xt_addx2(xt_emit *e, u8 ar, u8 as, u8 at);      /* ar = (as << 1) + at */
+u32 xt_addx4(xt_emit *e, u8 ar, u8 as, u8 at);      /* ar = (as << 2) + at */
 u32 xt_sub(xt_emit *e, u8 ar, u8 as, u8 at);
 u32 xt_addi(xt_emit *e, u8 at, u8 as, i32 imm);     /* ADDI at, as, imm (-128..127) */
 u32 xt_and(xt_emit *e, u8 ar, u8 as, u8 at);

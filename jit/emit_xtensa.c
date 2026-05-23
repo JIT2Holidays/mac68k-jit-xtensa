@@ -109,6 +109,8 @@ u32 xt_and(xt_emit *e, u8 ar, u8 as, u8 at) { return emit24(e, enc_rrr(0x1, 0, a
 u32 xt_or (xt_emit *e, u8 ar, u8 as, u8 at) { return emit24(e, enc_rrr(0x2, 0, ar, as, at)); }
 u32 xt_xor(xt_emit *e, u8 ar, u8 as, u8 at) { return emit24(e, enc_rrr(0x3, 0, ar, as, at)); }
 u32 xt_add(xt_emit *e, u8 ar, u8 as, u8 at) { return emit24(e, enc_rrr(0x8, 0, ar, as, at)); }
+u32 xt_addx2(xt_emit *e, u8 ar, u8 as, u8 at) { return emit24(e, enc_rrr(0x9, 0, ar, as, at)); }
+u32 xt_addx4(xt_emit *e, u8 ar, u8 as, u8 at) { return emit24(e, enc_rrr(0xA, 0, ar, as, at)); }
 u32 xt_sub(xt_emit *e, u8 ar, u8 as, u8 at) { return emit24(e, enc_rrr(0xC, 0, ar, as, at)); }
 u32 xt_mov(xt_emit *e, u8 ar, u8 as) { return xt_or(e, ar, as, as); }
 

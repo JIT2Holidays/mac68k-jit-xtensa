@@ -214,6 +214,8 @@ static void step(xt_sim *s) {
                 case 0x2: s->a[r] = s->a[sr] | s->a[t]; return;
                 case 0x3: s->a[r] = s->a[sr] ^ s->a[t]; return;
                 case 0x8: s->a[r] = s->a[sr] + s->a[t]; return;
+                case 0x9: s->a[r] = (s->a[sr] << 1) + s->a[t]; return;  /* ADDX2 */
+                case 0xA: s->a[r] = (s->a[sr] << 2) + s->a[t]; return;  /* ADDX4 */
                 case 0xC: s->a[r] = s->a[sr] - s->a[t]; return;
                 default: break;
             }
