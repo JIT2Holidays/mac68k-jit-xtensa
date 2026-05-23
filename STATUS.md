@@ -227,6 +227,52 @@ look better, and `--diff-jit-trace` divergence moved later (step 32
 6.80 to 3.92 (the prior figure was an artifact of the JIT running
 extra ops within the cycle bound due to undercounting).
 
+### Future work — outside this session's scope
+
+**Native block chaining on ESP32 target.** The largest unimplemented
+item from the user's high-gain list. Each compiled block currently
+returns to the dispatcher's `enter_block` loop, which polls VIA /
+interrupts, hash-looks-up the next block, then calls back into JIT
+code. The chain-prediction mechanism caches `predicted_next` per
+block, but the dispatcher round-trip itself is still ~50 host cycles
+of C code per block.
+
+On real ESP32, a block's epilogue could jump *directly* to the
+predicted next block's entry point (since both blocks live in IRAM)
+— eliminating the round-trip when prediction hits. Bench's
+`chain_hits / chain_misses = 708 K / 144 K` (83% hit rate) suggests
+~83% of block transitions would benefit.
+
+Implementation approach (for future work):
+* Patchable epilogue: each block's "return to dispatcher" tail is a
+  3-instruction stub that the dispatcher overwrites with a direct
+  `jx <predicted_next entry>` once predicted_next is set.
+* IRAM patching requires `XCHAL_INST_FETCH_WIDTH`-aligned writes
+  and a `__sync_synchronize` (or `dcache_writeback` + `icache_invalidate`)
+  to flush the instruction cache.
+* Even with chaining, the dispatcher must still run periodically
+  (every N blocks or every M cycles) to tick VIA and poll
+  interrupts. A simple counter in cpu state can gate this.
+
+Cannot be measured on host (`xt_sim` runs one block per invocation
+— a JX out of the current block's code memory exits the sim). The
+gain only materialises on real ESP32 hardware. Estimated impact:
+~83 % of block-to-block transitions save ~50 host cycles each;
+with chain throughput of ~12 M/s observed in the host bench, on
+ESP32 this would be a ~0.6 G host cycles saved per 60 M emulated
+cycles = ~12 % wall-clock improvement at 240 MHz.
+
+**Cross-block register caching.** The other unimplemented item.
+M6.10's regcache caches D/A regs *within* a block (loaded at
+prologue, flushed at epilogue). Extending across blocks would
+require dispatcher-level coordination to ensure consecutive blocks
+agree on which regs are cached and in which slots, plus a fast
+"compatible cache" check at chain time. Substantial infrastructure.
+
+Both items are real wins on the actual deployment target (ESP32-S3
+running the boot/Speedometer workloads), but lie outside the
+per-op-inline scope this session explored.
+
 The displayed metric is now diverging from real cost. Boot displayed
 *slightly worsened* in M6.45 (1.723 → 1.729) because the new bridges
 are a few bytes longer than the m68k_step bridge, yet REAL cost
