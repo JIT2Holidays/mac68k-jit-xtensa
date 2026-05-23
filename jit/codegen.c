@@ -11,6 +11,7 @@
 #include "m68k_interp.h"
 #include "mac_mem.h"
 #include <assert.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -2971,10 +2972,89 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
 
     /* 6. Epilogue: flush accumulated PC/cycles deltas, dirty cache slots
      * and R_SR back to cpu_state; restore the CALL0 return PC; JX back
-     * to the dispatcher. */
+     * to the dispatcher.
+     *
+     * On ESP32, before the return, try native block chaining: if the
+     * dispatcher's predicted_next matches cpu->pc and our chain budget
+     * isn't exhausted, JX directly to the next block's entry without
+     * round-tripping the dispatcher. Saves ~50 host cycles per chain
+     * hit (~83 % of block transitions in bench, ~97 % in boot per the
+     * existing chain-predictor stats).
+     *
+     * Host build (xt_sim) does NOT emit the chain check — sim runs one
+     * block per invocation and a JX out of the current block's code
+     * buffer would crash the sim. The cpu->current_block field is still
+     * set by dispatcher for parity, just unused on host. */
     emit_advance_flush(&e);
     emit_cache_flush(&e, &rc);
     emit_sr_flush(&e);
+#if defined(ESP_PLATFORM)
+    /* Native chain epilogue. Layout (~11 ops):
+     *   l32i a8, OFF_PC
+     *   l32i a9, OFF_CURRENT_BLOCK         (a9 = m68k_block*)
+     *   l32i a10, [a9 + predicted_next_pc] (a10 = predicted_next_pc)
+     *   xor a11, a8, a10                    (zero iff match)
+     *   bnez a11, FALLBACK
+     *   l32i a10, [a9 + predicted_next]     (a10 = m68k_block* next, or NULL)
+     *   beqz a10, FALLBACK
+     *   l32i a11, OFF_CHAIN_BUDGET
+     *   beqz a11, FALLBACK
+     *   addi a11, a11, -1
+     *   s32i a11, OFF_CHAIN_BUDGET
+     *   s32i a10, OFF_CURRENT_BLOCK         (next block is now current)
+     *   l32i a11, [a10 + code]              (a11 = next->code base)
+     *   l32i a12, [a10 + entry_off]
+     *   add a11, a11, a12
+     *   jx a11
+     * FALLBACK:
+     *   l32i a0, OFF_JITRETPC
+     *   jx a0
+     */
+    {
+        u32 off_pred_pc = (u32)offsetof(m68k_block, predicted_next_pc);
+        u32 off_pred    = (u32)offsetof(m68k_block, predicted_next);
+        u32 off_code    = (u32)offsetof(m68k_block, code);
+        u32 off_entry   = (u32)offsetof(m68k_block, entry_off);
+        u32 off_cur     = (u32)offsetof(m68k_cpu, current_block);
+        u32 off_budget  = (u32)offsetof(m68k_cpu, chain_budget);
+
+        xt_l32i(&e, 8,  R_CPU, OFF_PC);
+        xt_l32i(&e, 9,  R_CPU, off_cur);
+        xt_l32i(&e, 10, 9,     off_pred_pc);
+        /* a11 = 0 iff pc == predicted_next_pc */
+        xt_xor (&e, 11, 8, 10);
+        u32 bnez1_pos = e.len;
+        xt_bnez(&e, 11, 0);                  /* placeholder — backpatch to FALLBACK */
+        xt_l32i(&e, 10, 9, off_pred);        /* a10 = predicted_next ptr */
+        u32 beqz1_pos = e.len;
+        xt_beqz(&e, 10, 0);                  /* placeholder */
+        xt_l32i(&e, 11, R_CPU, off_budget);
+        u32 beqz2_pos = e.len;
+        xt_beqz(&e, 11, 0);                  /* placeholder */
+        xt_addi(&e, 11, 11, -1);
+        xt_s32i(&e, 11, R_CPU, off_budget);
+        xt_s32i(&e, 10, R_CPU, off_cur);     /* current_block = predicted_next */
+        xt_l32i(&e, 11, 10, off_code);
+        xt_l32i(&e, 12, 10, off_entry);
+        xt_add (&e, 11, 11, 12);
+        xt_jx  (&e, 11);
+        u32 fallback_off = e.len;
+
+        /* Back-patch the three early-exit branches to FALLBACK. */
+        for (u32 p_idx = 0; p_idx < 3; p_idx++) {
+            u32 pos = (p_idx == 0) ? bnez1_pos : (p_idx == 1) ? beqz1_pos : beqz2_pos;
+            i32 rel = (i32)(fallback_off - pos);     /* fallback - br */
+            i32 off = rel - 4;                       /* enc_bxxz adjustment */
+            u32 imm12 = (u32)off & 0xFFFu;
+            u8 sel_t = (p_idx == 0) ? 0x5 : 0x1;     /* bnez=5, beqz=1 */
+            u8 as    = (p_idx == 0) ? 11 : (p_idx == 1) ? 10 : 11;
+            u32 enc = ((u32)imm12 << 12) | ((u32)as << 8) | ((u32)sel_t << 4) | 0x6;
+            base[entry_off + pos    ] = (u8)enc;
+            base[entry_off + pos + 1] = (u8)(enc >> 8);
+            base[entry_off + pos + 2] = (u8)(enc >> 16);
+        }
+    }
+#endif
     xt_l32i(&e, 0, R_CPU, OFF_JITRETPC);
     xt_jx(&e, 0);
 

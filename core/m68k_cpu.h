@@ -58,6 +58,21 @@ typedef struct m68k_cpu {
     u32 jit_arg1;
     u32 jit_arg2;
 
+    /* JIT-chaining current-block pointer. The dispatcher sets this to
+     * the active m68k_block* before invoking the block; the block's
+     * epilogue (on ESP32 only) loads predicted_next from it and may
+     * jx directly to the next block's entry without round-tripping the
+     * dispatcher. Stored as void* to avoid m68k_block forward-decl
+     * here — see codegen.h for the actual struct. */
+    void *current_block;
+
+    /* Periodic-dispatcher-return counter. Even with native chaining
+     * the dispatcher must run mac_mem_tick / poll_interrupts. The block
+     * epilogue decrements this; when it hits zero, fall back to a
+     * dispatcher return regardless of chain prediction, and the
+     * dispatcher refills it. */
+    u32 chain_budget;
+
     struct mac_mem *mem;
 } m68k_cpu;
 

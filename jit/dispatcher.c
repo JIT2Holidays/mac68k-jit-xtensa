@@ -239,7 +239,18 @@ void m68k_dispatcher_shutdown(m68k_dispatcher *d) {
 /* Defined in port/esp32s3 — the CALL0<->windowed bridge. */
 extern void m68k_enter_block(u8 *entry, m68k_cpu *cpu);
 
+/* How many blocks the JIT may chain natively before falling back to the
+ * dispatcher (to tick VIA and poll interrupts). Higher = fewer dispatcher
+ * round-trips, but worse VIA/IRQ latency. 16 keeps timer latency under
+ * ~1 ms even on busy code paths. */
+#define M68K_JIT_CHAIN_BUDGET  16u
+
 static void enter_block(m68k_dispatcher *d, m68k_block *b) {
+    /* The block's epilogue may JX to predicted_next->entry directly
+     * (chain) instead of returning here. Hand it the current block and
+     * a chain budget so the chain knows when to break out for housekeeping. */
+    d->cpu->current_block = b;
+    d->cpu->chain_budget = M68K_JIT_CHAIN_BUDGET;
     m68k_enter_block(b->code + b->entry_off, d->cpu);
 }
 #else
@@ -294,6 +305,13 @@ static void sim_call(xt_sim *s, u32 fn_token) {
 }
 
 static void enter_block(m68k_dispatcher *d, m68k_block *b) {
+    /* Set current_block for parity with the ESP32 path. Host's xt_sim
+     * runs one block per invocation, so native chaining isn't emitted
+     * here, but keeping cpu state consistent helps any future host-side
+     * code that wants to introspect the active block. */
+    d->cpu->current_block = b;
+    d->cpu->chain_budget = 1;  /* host: never chain — one block per sim_run */
+
     xt_sim s;
     xt_sim_init(&s, b->code, b->code_size);
     s.pc = b->entry_off;
