@@ -63,6 +63,9 @@ typedef struct m68k_block {
     u8  *code;          /* literal pool + code, 4-byte aligned */
     u32  code_size;
     u32  entry_off;     /* offset of the first prologue instruction */
+    void *entry_addr;   /* precomputed `code + entry_off`. Native chain
+                         * epilogue (ESP32) does one l32i + jx instead of
+                         * l32i+l32i+add+jx — saves 2 LX7 ops per chain hit. */
 
     u32  inline_ops;    /* how many ops were translated inline       */
     u32  helper_ops;    /* how many fell back to the interpreter     */

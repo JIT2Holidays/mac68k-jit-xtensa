@@ -319,6 +319,16 @@ M6.54 native-chaining work. The chain path is now safe across:
  - predicted_next dangling (already handled in M6.54: smc_flush
    clears all predicted_next pointers when it runs)
 
+**M6.58 — chain epilogue: precomputed `entry_addr` (-2 ops per hit).**
+Tiny perf polish. Added a `void *entry_addr = code + entry_off` field
+to `m68k_block`, set at compile time. The chain epilogue now does
+`l32i a11, off_entry_addr; jx a11` instead of `l32i a11, code; l32i
+a12, entry_off; add a11,a11,a12; jx a11`. ESP32 only — saves 2 LX7
+ops per chain hit. Bench has ~64 K chain hits / 100 M cyc (~128 K ops
+saved), boot ~965 K / 100 M cyc (~1.93 M ops saved, ~1.2 % of boot
+JIT cost on real hardware). Host metrics unchanged (chain epilogue
+isn't emitted on host).
+
 **Cross-block register caching.** The other unimplemented item.
 M6.10's regcache caches D/A regs *within* a block (loaded at
 prologue, flushed at epilogue). Extending across blocks would

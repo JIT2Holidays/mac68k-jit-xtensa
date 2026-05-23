@@ -3013,8 +3013,7 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
     {
         u32 off_pred_pc = (u32)offsetof(m68k_block, predicted_next_pc);
         u32 off_pred    = (u32)offsetof(m68k_block, predicted_next);
-        u32 off_code    = (u32)offsetof(m68k_block, code);
-        u32 off_entry   = (u32)offsetof(m68k_block, entry_off);
+        u32 off_entry_addr = (u32)offsetof(m68k_block, entry_addr);
         u32 off_cur     = (u32)offsetof(m68k_cpu, current_block);
         u32 off_budget  = (u32)offsetof(m68k_cpu, chain_budget);
 
@@ -3041,9 +3040,10 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
          * next block would overwrite cpu->jit_ret_pc with garbage and
          * the eventual standard return would JX to a bad PC. */
         xt_l32i(&e, 0, R_CPU, OFF_JITRETPC);
-        xt_l32i(&e, 11, 10, off_code);
-        xt_l32i(&e, 12, 10, off_entry);
-        xt_add (&e, 11, 11, 12);
+        /* M6.58: one l32i instead of l32i+l32i+add — predicted_next's
+         * entry_addr field is precomputed at compile time. -2 LX7 ops
+         * per chain hit. Boot has ~965 K chain hits per 100 M cycles. */
+        xt_l32i(&e, 11, 10, off_entry_addr);
         xt_jx  (&e, 11);
         u32 fallback_off = e.len;
 
@@ -3086,6 +3086,7 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
     b->code = base;
     b->code_size = actual;
     b->entry_off = entry_off;
+    b->entry_addr = (void *)(base + entry_off);
     b->inline_ops = inline_ops;
     b->helper_ops = helper_ops;
     b->predicted_next = NULL;
