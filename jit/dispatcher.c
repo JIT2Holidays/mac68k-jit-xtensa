@@ -214,6 +214,7 @@ void m68k_dispatcher_shutdown(m68k_dispatcher *d) {
 #ifdef JIT_HELPER_HISTO
     {
         extern u32 m68k_helper_histo[65536];
+        extern u32 m68k_helper_first_pc[65536];
         typedef struct { u32 op; u32 cnt; } he_t;
         he_t top[20] = {0};
         for (u32 op = 0; op < 65536; op++) {
@@ -226,9 +227,10 @@ void m68k_dispatcher_shutdown(m68k_dispatcher *d) {
                 }
             }
         }
-        fprintf(stderr, "[helper-histo] top opcodes:\n");
+        fprintf(stderr, "[helper-histo] top opcodes (op  count  first-pc):\n");
         for (int i = 0; i < 20 && top[i].cnt > 0; i++)
-            fprintf(stderr, "  %04x  %u\n", top[i].op, top[i].cnt);
+            fprintf(stderr, "  %04x  %8u  pc=%06x\n",
+                    top[i].op, top[i].cnt, m68k_helper_first_pc[top[i].op]);
     }
 #endif
     if (mac_write_watch_ctx == d) {

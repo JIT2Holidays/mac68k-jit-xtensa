@@ -555,6 +555,10 @@ static void do_movem(m68k_cpu *cpu, u16 op) {
 
 #ifdef JIT_HELPER_HISTO
 u32 m68k_helper_histo[65536];
+/* For top-N opcodes, also record the first PC we saw them at — helps
+ * spot whether a hot histo entry comes from one site or is spread
+ * over many. Keyed by op; -1 means "not seen". */
+u32 m68k_helper_first_pc[65536];
 #endif
 
 /* JIT custom helper: ORI.B #imm,(d16,An) for MMIO destinations.
@@ -683,6 +687,7 @@ void m68k_step(m68k_cpu *cpu) {
     u32 op_pc = cpu->pc;
     u16 op = fetch16(cpu);
 #ifdef JIT_HELPER_HISTO
+    if (m68k_helper_histo[op] == 0) m68k_helper_first_pc[op] = op_pc;
     m68k_helper_histo[op]++;
 #endif
     cpu->cycles += 4;

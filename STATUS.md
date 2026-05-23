@@ -360,6 +360,58 @@ accurate" boundary) and **HyperCard** (bytecode interpreter on top of
 68k — double-interp stress, exercises every trap and the Resource
 Manager).
 
+**M6.59 — diagnostic: per-opcode first-PC in JIT_HELPER_HISTO.**
+Helper-histogram dump now records the first PC each opcode was seen
+at, helping spot whether a hot histo entry comes from one site or is
+spread over many. Behind `-DJIT_HELPER_HISTO`.
+
+### Investigation: 75 % of boot's real_helpers are bogus-PC wandering
+
+Histogram on the 100 M-cycle Mac Plus ROM boot under JIT:
+
+```
+[helper-histo] top opcodes (op  count  first-pc):
+  bfbf    173782  pc=12c01a05
+  10a8     12136  pc=400310
+  ...
+```
+
+`0xBFBF` is the open-bus value returned by the 24-bit memory map for
+unmapped regions (>= 0x500000 to ROM-base mirror, 0xC00000+, etc.).
+Decoded as "EOR.L D7, [mode 7 / reg 7]" — an illegal EA that
+`ea_decode` silently maps to `EA_MEM addr=0`, so the op falls through
+to the helper bridge and "executes" benignly. **75 % of all real
+m68k_step bridges (173 K out of 230 K) during boot are this opcode.**
+
+Tracking it back: the first transition into the bogus PC region
+happens at cycle 48,969,376. The previous JIT block was at PC=0x400974
+(`MOVE.L (0x118).W, (0x02A6).W; RTS`) — perfectly valid. The RTS
+popped 0x05FEFFFF (odd, high-memory) from the supervisor stack
+(A7=0x0007FC04). From there the JIT spent ~1 M cycles wandering
+through unmapped memory before recovering back to legitimate ROM at
+PC ~0x40113A (visible by cycle 300 M).
+
+**Root cause is not a JIT correctness bug.** The interp at 1 B
+cycles is still stuck at PC=0x4007BA (its own polling loop) — both
+engines simply take *different valid paths* through the boot ROM
+because `mac_mem_tick` runs at instruction-boundary in interp vs
+block-boundary in JIT. The JIT sees a VIA / IRQ edge slightly earlier
+than the interp, exits a polling spin sooner, and the resulting code
+path RTS's a stale stack value that the interp's path would have
+overwritten first. The 68000 would normally address-error on
+PC=0x05FEFFFF (bit 0 = 1, vector 3), but the emulator doesn't
+implement address-error.
+
+**Perf opportunity (~6 % boot real-cost):** detect "PC is unmapped
+or odd" and either (a) implement the address-error exception (the
+real-hardware behaviour), or (b) short-circuit a `chain_break +
+single-instruction step` until PC returns to a mapped region. Option
+(a) is correct, option (b) is conservative. Estimated drop:
+real_lx7_per_cyc 1.739 → ~1.63 (real_helpers 230 K → ~57 K).
+
+Not implemented this iteration — left as a future task. M6.59 added
+the diagnostic plumbing to keep finding cases like this.
+
 **Cross-block register caching.** The other unimplemented item.
 M6.10's regcache caches D/A regs *within* a block (loaded at
 prologue, flushed at epilogue). Extending across blocks would
