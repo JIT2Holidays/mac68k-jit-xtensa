@@ -499,7 +499,8 @@ static void emit_adda_w_imm(xt_emit *e, int an, i16 imm, bool is_sub, regcache *
         }
         xt_s32i(e, 8, R_CPU, OFF_A(an));
     }
-    emit_advance(e, 4, 8);
+    /* ADDA.W cycles = 8 (handler) + 4 (m68k_step base) = 12. */
+    emit_advance(e, 4, 12);
 }
 
 /* ADDA.W <Dm|Am>,An — a[an] += sign-extend-word(src register). No CCR. */
