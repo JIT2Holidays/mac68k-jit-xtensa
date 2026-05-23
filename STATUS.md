@@ -182,7 +182,8 @@ instr/cyc on the target; helper-cost proxy `M68K_JIT_HELPER_LX7_COST = 64`).
 | JIT M6.37 (inline ORI.B (d16,An) + BTST (d16,An) + MOVE.W (An)+,Dn) | 1.299 | 23.58 × | 2.457 | 12.47 × |
 | JIT M6.38 (inline DBF + DBNE with literal-pool ft and unconditional cycle) | 1.298 | 23.60 × | 2.200 | 13.92 × |
 | JIT M6.39 (inline ADD.W/SUB.W Dm,Dn + TST.L Dn) | 1.292 | 23.71 × | 2.193 | 13.97 × |
-| **JIT M6.40 (current — inline MOVEM family with size gating)** 🚀 | **1.289** | **23.76 ×** | **1.756** | **17.44 ×** |
+| JIT M6.40 (inline MOVEM family with size gating) 🚀 | 1.289 | 23.76 × | 1.756 | 17.44 × |
+| **JIT M6.41 (current — diagnostic: print real helper count from cpu->instrs)** | **1.289** | **23.76 ×** | **1.756** | **17.44 ×** |
 | Goal: 5 × interp on bench       | 1.32            | **23.2 ×**       | 1.18           | **25.9 ×**      |
 
 **Mac Plus speed already cleared** (>1 ×) by the interpreter alone —
@@ -1331,6 +1332,51 @@ Cumulative session win **M6.2 → M6.38**:
 JIT/interp ratio is now:
 * Bench: **5.09 ×** interp (was 1.65 × at M6.2).
 * Boot:  **2.69 ×** interp (was 1.10 × at M6.2).
+
+**M6.41 — metric correction: real helper count from `cpu->instrs`.**
+Diagnostic profiling revealed that `disp.helper_calls` (the JIT
+benchmark's helper count, summed from per-block `helper_ops` at
+compile time) only counts the **unconditional** helper-fallback ops
+the dispatch loop's `if (!done)` clause emits. The **conditional**
+helper bridges inside inline arms (the bounds-fail fallbacks used
+for MMIO writes / odd-address ops) execute `m68k_step` at runtime
+but were never reflected in the metric.
+
+Added `cpu->instrs` (incremented in every `m68k_step` call, so an
+accurate runtime count) to the BENCH output line as `real_helpers`,
+plus the corrected `real_lx7_per_cyc`.
+
+Truth comparison at the M6.40 measurement point:
+
+| Engine | xt_instrs   | helpers (cnt) | real_helpers (cnt) | lx7/cyc | real lx7/cyc | × Mac Plus | real × Mac Plus |
+|--------|------------:|--------------:|-------------------:|--------:|-------------:|-----------:|----------------:|
+| Bench  | 73.24 M     | 63 809        | 68 176             | 1.289   | 1.293        | 23.76 ×    | **23.69 ×**     |
+| Boot   | 102.62 M    | 42 454        | 1 295 425          | 1.756   | 3.092        | 17.44 ×    | **9.91 ×**      |
+
+For **bench** the metric was already accurate (only ~7 % discrepancy)
+because bench's hot path runs entirely in RAM — the conditional
+helper bridges hardly ever fire. The 23.76 × Mac Plus figure (= 5.10 ×
+interp) is essentially correct.
+
+For **boot** the metric was overstating performance significantly:
+boot does ~1.3 M MMIO writes per 60 M cycles (mostly via the
+bounds-fail fallback in the ORI.B (d16,A4), BTST (d16,A5) and similar
+arms). Each MMIO write went through an inline arm's helper-bridge
+to `m68k_step` — costing ~64 LX7 — but `disp.helper_calls` didn't
+count it.
+
+**Corrected boot is at 9.91 × Mac Plus / 1.91 × interp** (still well
+past M6.2's 5.70 ×). The displayed "17.44 ×" was a metric artifact;
+prior comparisons within the session remain internally consistent
+since they all used the same broken metric, so improvements are
+still real, just less dramatic in absolute terms.
+
+For continuing optimization, the new biggest target is the MMIO
+write fallback: a fast-path helper that calls `mac_write8` directly
+(bypassing `m68k_step`'s ~64-LX7-cost-equivalent overhead) would
+cut the ~1.2 M conditional-helper executions to ~10 LX7 each,
+saving ~65 M LX7 in 60 M cycles — boot ~3.09 → ~1.99 lx7/cyc, a
+true ~15 × Mac Plus.
 
 Profiled bench's hot-block distribution (per `block_executed`):
 

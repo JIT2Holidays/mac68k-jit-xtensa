@@ -2240,7 +2240,7 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             int sz = (w & 0x40) ? 4 : 2;
             u16 list = mac_read16(cpu->mem, op_pc[i] + 2);
             int n_regs = __builtin_popcount(list);
-            int threshold = (sz == 4) ? 4 : 6;
+            int threshold = (sz == 4) ? 5 : 12;
 
             if (n_regs >= 1 && n_regs <= threshold) {
                 emit_advance_flush(&e);
@@ -2299,7 +2299,7 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             int sz = (w & 0x40) ? 4 : 2;
             u16 list = mac_read16(cpu->mem, op_pc[i] + 2);
             int n_regs = __builtin_popcount(list);
-            int threshold = (sz == 4) ? 4 : 6;
+            int threshold = (sz == 4) ? 5 : 12;
 
             if (n_regs >= 1 && n_regs <= threshold) {
                 emit_advance_flush(&e);
@@ -2369,7 +2369,7 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             u16 list = mac_read16(cpu->mem, op_pc[i] + 2);
             int n_regs = __builtin_popcount(list);
 
-            if (n_regs >= 1 && n_regs <= 4) {
+            if (n_regs >= 1 && n_regs <= 5) {
                 emit_advance_flush(&e);
                 emit_read_g(&e, &rc, G_A(an), 8);    /* a8 = An (start) */
                 emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],

@@ -863,14 +863,23 @@ int main(int argc, char **argv) {
          * workload, per emulated 68000 cycle. Lower is a faster JIT. */
         u64 cost = disp.xt_instrs
                  + disp.helper_calls * (u64)M68K_JIT_HELPER_LX7_COST;
+        /* Corrected cost using cpu->instrs (the true count of m68k_step
+         * helper invocations — includes the conditional-helper bridges
+         * inside inline arms, which `disp.helper_calls` (a sum of
+         * compile-time helper_ops counts) does not). */
+        u64 real_cost = disp.xt_instrs
+                      + (u64)cpu.instrs * (u64)M68K_JIT_HELPER_LX7_COST;
         fprintf(stderr,
             "[BENCH] jit_cost=%llu lx7 (xt=%llu helpers=%llu) "
-            "cycles=%llu  lx7_per_cyc=%.3f\n",
+            "cycles=%llu  lx7_per_cyc=%.3f  "
+            "real_helpers=%llu real_lx7_per_cyc=%.3f\n",
             (unsigned long long)cost,
             (unsigned long long)disp.xt_instrs,
             (unsigned long long)disp.helper_calls,
             (unsigned long long)cpu.cycles,
-            cpu.cycles ? (double)cost / (double)cpu.cycles : 0.0);
+            cpu.cycles ? (double)cost / (double)cpu.cycles : 0.0,
+            (unsigned long long)cpu.instrs,
+            cpu.cycles ? (double)real_cost / (double)cpu.cycles : 0.0);
         m68k_dispatcher_shutdown(&disp);
     } else {
         /* Interp baseline: each m68k_step is one "helper-call" equivalent,
