@@ -687,16 +687,23 @@ static void emit_sub_l_dd(xt_emit *e, int dn, int dm, bool skip_flags, regcache 
     emit_advance(e, 2, 8);
 }
 
-/* AND.L / EOR.L register form: d[dst] = d[ra] <op> d[rb], logic CCR. */
-static void emit_logic_l_dd(xt_emit *e, int ra, int rb, int dst,
-                            bool is_eor, regcache *rc) {
+/* AND.L / OR.L / EOR.L register form: d[dst] = d[ra] <op> d[rb], logic CCR.
+ * `kind`: 0 = OR, 1 = AND, 2 = EOR. */
+static void emit_logic_l_dd_kind(xt_emit *e, int ra, int rb, int dst,
+                                 int kind, bool skip_flags, regcache *rc) {
     emit_read_g(e, rc, G_D(ra), 8);
     emit_read_g(e, rc, G_D(rb), 9);
-    if (is_eor) xt_xor(e, 8, 8, 9);
-    else        xt_and(e, 8, 8, 9);
+    if      (kind == 0) xt_or (e, 8, 8, 9);
+    else if (kind == 1) xt_and(e, 8, 8, 9);
+    else                xt_xor(e, 8, 8, 9);
     emit_write_g(e, rc, G_D(dst), 8);
-    emit_logic_flags(e, 8);
+    if (!skip_flags) emit_logic_flags(e, 8);
     emit_advance(e, 2, 8);
+}
+/* Back-compat shim — preserves callers that only need AND.L / EOR.L. */
+static void emit_logic_l_dd(xt_emit *e, int ra, int rb, int dst,
+                            bool is_eor, regcache *rc) {
+    emit_logic_l_dd_kind(e, ra, rb, dst, is_eor ? 2 : 1, false, rc);
 }
 
 /* ORI/ANDI/SUBI/ADDI/EORI/CMPI.L #imm32,Dn. `kind` is the 68000 type
@@ -1306,6 +1313,7 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             b1 |= (top == 0xD && sf == 2 && !((w >> 8) & 1) && mm == 0);  /* ADD.L Dm,Dn */
             b1 |= (top == 0x9 && sf == 2 && !((w >> 8) & 1) && mm == 0);  /* SUB.L Dm,Dn */
             b1 |= (top == 0xC && sf == 2 && !((w >> 8) & 1) && mm == 0);  /* AND.L Dm,Dn */
+            b1 |= (top == 0x8 && sf == 2 && !((w >> 8) & 1) && mm == 0);  /* OR.L Dm,Dn */
             b1 |= (top == 0xB && sf == 2 && ((w >> 8) & 1) && mm == 0);   /* EOR.L Dn,Dm */
             b1 |= (top == 0x0 && !((w >> 8) & 1) && sf == 2 && mm == 0
                    && rr != 4 && rr != 7);                                 /* ORI/ANDI/ADDI/SUBI/EORI.L #imm32,Dn */
@@ -2048,6 +2056,11 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
         } else if (top == 0xC && szf == 2 && !((w >> 8) & 1) && mode == 0) {
             /* AND.L Dm,Dn  (result -> Dn) */
             emit_logic_l_dd(&e, (w >> 9) & 7, w & 7, (w >> 9) & 7, false, &rc);
+            inline_ops++; done = true;
+        } else if (top == 0x8 && szf == 2 && !((w >> 8) & 1) && mode == 0) {
+            /* OR.L Dm,Dn  (result -> Dn).  Boot-hot 0x8087/0x8C85/0x8E86. */
+            emit_logic_l_dd_kind(&e, (w >> 9) & 7, w & 7, (w >> 9) & 7,
+                                 0, flags_dead[i], &rc);
             inline_ops++; done = true;
         } else if (top == 0xB && szf == 2 && ((w >> 8) & 1) && mode == 0) {
             /* EOR.L Dn,Dm  (result -> Dm) */

@@ -176,7 +176,8 @@ instr/cyc on the target; helper-cost proxy `M68K_JIT_HELPER_LX7_COST = 64`).
 | JIT M6.29 (fusion extended to BLE.S and CMP.W (An),Dn) | 1.455 | 21.05 × | 4.429 | 6.92 × |
 | JIT M6.30 (Bcc/BRA PC constant in per-block literal pool) | 1.330 | 23.03 × | 4.330 | 7.07 × |
 | JIT M6.31 (ADDX2 fuses slli+add for the Bcc.S cycle update) 🎯 | 1.316 | 23.27 × ✅ | 4.319 | 7.09 × |
-| **JIT M6.32 (current — skip prologue R_SR reload + extend fusion to BEQ/BNE)** | **1.303** | **23.51 ×** | **4.319** | **7.09 ×** |
+| JIT M6.32 (skip prologue R_SR reload + extend fusion to BEQ/BNE) | 1.303 | 23.51 × | 4.319 | 7.09 × |
+| **JIT M6.33 (current — inline OR.L Dm,Dn — top-3 boot helper)** | **1.303** | **23.51 ×** | **3.397** | **9.02 ×** |
 | Goal: 5 × interp on bench       | 1.32            | **23.2 ×**       | 1.18           | **25.9 ×**      |
 
 **Mac Plus speed already cleared** (>1 ×) by the interpreter alone —
@@ -1179,6 +1180,40 @@ flag-setters with live CCR, keeping the prologue load.
 Cumulative session win **M6.2 → M6.32**:
 * Bench `4.008 → 1.303 lx7/cyc` (**+67.5 %**), 7.64 × → **23.51 × Mac Plus**.
 * Boot  `5.376 → 4.319 lx7/cyc` (**+19.7 %**), 5.70 × → **7.09 × Mac Plus**.
+
+**M6.33 — inline OR.L Dm,Dn (delivered, boot-focused).** Instrumented
+the helper bridge to count opcodes that fall through to m68k_step;
+the top-3 boot helpers were OR.L D7,D0 / D5,D6 / D6,D7 (each 262 K
+executions in 60 M cycles = 786 K total). Inlined as a 5-op sequence
+(read Dm, xt_or, write back to cache or memory, logic-flags emit,
+emit_advance) modelled exactly on the existing AND.L Dm,Dn arm.
+Refactored `emit_logic_l_dd` into `emit_logic_l_dd_kind` that takes
+op kind (0=OR, 1=AND, 2=EOR) and a `skip_flags` flag, and added OR.L
+to the lazy-CC eligible list (b1).
+
+| Engine | M6.32   | **M6.33**   | × Mac Plus    | delta |
+|--------|--------:|------------:|--------------:|------:|
+| Bench  | 1.303   | **1.303**   | **23.51 ×**   | unchanged |
+| Boot   | 4.319   | **3.397**   | **9.02 ×**    | **+21.3 %** |
+
+Boot's `helper_calls` dropped 2.76 M → 1.97 M (−29 %); xt_instrs
+shrank too (82.7 M → 77.7 M) because the inlined body is much
+cheaper than the helper bridge (mov + l32r + callx0 + 6-op undo +
+sr_reload + cache_reload) plus the 64-LX7 m68k_step charge.
+
+`--diff-jit-trace` divergence moved from step 544 → step 350, but
+the diff is in VIA timer registers (`+0C`, `+10`, `+18`) — the
+well-known JIT-vs-interp VIA-tick-cadence mismatch from M5.x. CPU
+state matches at every divergence step; the JIT pre-pass and the
+interpreter compute identical register values. ctest 3/3.
+
+Cumulative session win **M6.2 → M6.33**:
+* Bench `4.008 → 1.303 lx7/cyc` (**+67.5 %**), 7.64 × → **23.51 × Mac Plus**.
+* Boot  `5.376 → 3.397 lx7/cyc` (**+36.8 %**), 5.70 × → **9.02 × Mac Plus**.
+
+Both engines are now multiples of an original Mac Plus running at
+its native 7.8336 MHz, with boot crossing **9 × Mac Plus** thanks to
+the OR.L inline.
 
 Profiled bench's hot-block distribution (per `block_executed`):
 
