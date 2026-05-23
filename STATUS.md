@@ -208,21 +208,24 @@ instr/cyc on the target; helper-cost proxy `M68K_JIT_HELPER_LX7_COST = 64`).
 | JIT M6.49 (MOVE.L push/pop extended to An source) | 1.287 | 23.80 × | 1.721 | 17.80 × |
 | JIT M6.50 (inline RTS — return from subroutine) | 1.281 | 23.91 × | 1.721 | 17.80 × |
 | JIT M6.51 (inline JMP (xxx).L) | 1.279 | 23.95 × | 1.721 | 17.80 × |
-| **JIT M6.52 (current — fix ADD.W/SUB.W cycle accounting bug)** | **1.279** | **23.95 ×** | **1.719** | **17.82 ×** |
+| JIT M6.52 (fix ADD.W/SUB.W cycle accounting) | 1.279 | 23.95 × | 1.719 | 17.82 × |
+| **JIT M6.53 (current — fix ADDA.W #imm,An cycle accounting)** | **1.279** | **23.95 ×** | **1.705** | **17.96 ×** |
 
 ### Real-cost view (from M6.41's `real_lx7_per_cyc`)
 
-| Engine | M6.40 | M6.45 | M6.49 | M6.51 | M6.52 | M6.52 × Mac Plus |
+| Engine | M6.40 | M6.45 | M6.49 | M6.51 | M6.53 | M6.53 × Mac Plus |
 |--------|------:|------:|------:|------:|------:|-----------------:|
 | Bench  | 1.293 | 1.289 | 1.288 | **1.279** | **1.279** | **23.95 ×**       |
-| Boot   | 3.092 | 1.945 | 1.727 | 1.727 | **1.725** | **17.76 ×** 🎯    |
+| Boot   | 3.092 | 1.945 | 1.727 | 1.727 | **1.711** | **17.90 ×** 🎯    |
 
-**M6.52 also fixes a pre-existing cycle-accounting bug** in M6.39's
-ADD.W/SUB.W Dm,Dn inline: the arm was emitting only 4 cycles when
-interp's full cycle is 8 (= 4 base + 4 handler). With the fix,
-`--diff-jit-trace` divergence moved from step 32 to step 36 — the
-VIA-tick-cadence drift now manifests later because ADD.W's contribution
-to total cycles is correctly synced.
+**M6.52 / M6.53 cycle-accounting fixes**: ADD.W/SUB.W Dm,Dn and
+ADDA.W/SUBA.W #imm,An were both undercounting cycles (4 vs 8, and
+8 vs 12 respectively). Now JIT correctly hits cpu->cycles=60M at the
+same emulated time as interp instead of overshooting — both metrics
+look better, and `--diff-jit-trace` divergence moved later (step 32
+→ 36). Long-run boot at 300M cycles dropped real_lx7_per_cyc from
+6.80 to 3.92 (the prior figure was an artifact of the JIT running
+extra ops within the cycle bound due to undercounting).
 
 The displayed metric is now diverging from real cost. Boot displayed
 *slightly worsened* in M6.45 (1.723 → 1.729) because the new bridges
