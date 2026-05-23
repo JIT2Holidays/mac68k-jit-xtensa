@@ -181,7 +181,8 @@ instr/cyc on the target; helper-cost proxy `M68K_JIT_HELPER_LX7_COST = 64`).
 | JIT M6.34 (inline ADDA.W/SUBA.W #imm + MOVE.L (An)+ ⇄ Dn) | 1.299 | 23.58 × | 3.014 | 10.16 × ✅ |
 | JIT M6.37 (inline ORI.B (d16,An) + BTST (d16,An) + MOVE.W (An)+,Dn) | 1.299 | 23.58 × | 2.457 | 12.47 × |
 | JIT M6.38 (inline DBF + DBNE with literal-pool ft and unconditional cycle) | 1.298 | 23.60 × | 2.200 | 13.92 × |
-| **JIT M6.39 (current — inline ADD.W/SUB.W Dm,Dn + TST.L Dn)** | **1.292** | **23.71 ×** | **2.193** | **13.97 ×** |
+| JIT M6.39 (inline ADD.W/SUB.W Dm,Dn + TST.L Dn) | 1.292 | 23.71 × | 2.193 | 13.97 × |
+| **JIT M6.40 (current — inline MOVEM family with size gating)** 🚀 | **1.289** | **23.76 ×** | **1.756** | **17.44 ×** |
 | Goal: 5 × interp on bench       | 1.32            | **23.2 ×**       | 1.18           | **25.9 ×**      |
 
 **Mac Plus speed already cleared** (>1 ×) by the interpreter alone —
