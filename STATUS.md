@@ -177,7 +177,8 @@ instr/cyc on the target; helper-cost proxy `M68K_JIT_HELPER_LX7_COST = 64`).
 | JIT M6.30 (Bcc/BRA PC constant in per-block literal pool) | 1.330 | 23.03 × | 4.330 | 7.07 × |
 | JIT M6.31 (ADDX2 fuses slli+add for the Bcc.S cycle update) 🎯 | 1.316 | 23.27 × ✅ | 4.319 | 7.09 × |
 | JIT M6.32 (skip prologue R_SR reload + extend fusion to BEQ/BNE) | 1.303 | 23.51 × | 4.319 | 7.09 × |
-| **JIT M6.33 (current — inline OR.L Dm,Dn — top-3 boot helper)** | **1.303** | **23.51 ×** | **3.397** | **9.02 ×** |
+| JIT M6.33 (inline OR.L Dm,Dn — top-3 boot helper) | 1.303 | 23.51 × | 3.397 | 9.02 × |
+| **JIT M6.34 (current — inline ADDA.W/SUBA.W #imm + MOVE.L (An)+ ⇄ Dn)** | **1.299** | **23.58 ×** | **3.014** | **10.16 ×** ✅ |
 | Goal: 5 × interp on bench       | 1.32            | **23.2 ×**       | 1.18           | **25.9 ×**      |
 
 **Mac Plus speed already cleared** (>1 ×) by the interpreter alone —
@@ -1214,6 +1215,41 @@ Cumulative session win **M6.2 → M6.33**:
 Both engines are now multiples of an original Mac Plus running at
 its native 7.8336 MHz, with boot crossing **9 × Mac Plus** thanks to
 the OR.L inline.
+
+**M6.34 — three boot inlines (delivered).** Used the M6.33 helper-
+histogram findings to inline three more boot-hot ops:
+
+1. **ADDA.W / SUBA.W #imm16,An** (mode 7/4 = #imm). 0xD0FC at 131 K
+   execs. Extended the existing `emit_adda_w` family with an immediate
+   variant: `a[an] ± sext(imm16)`, no CCR, 4 bytes / 8 cycles.
+
+2. **MOVE.L Dn,(An)+** (top=2, op6=3, mode=0). 0x20C1 at 262 K execs.
+   Bounds-checked store: read Dn, write 4 BE bytes, post-incr An by
+   4, emit logic flags when not dead.
+
+3. **MOVE.L (An)+,Dn** (top=2, op6=0, mode=3). The matching load
+   pattern: bounds-check, read 4 BE bytes, write Dn, post-incr An.
+
+Lazy-CC eligibility extended to `top==0x2 && op6 in {0, 3}`.
+
+| Engine | M6.33   | **M6.34**   | × Mac Plus    | delta |
+|--------|--------:|------------:|--------------:|------:|
+| Bench  | 1.303   | **1.299**   | **23.58 ×**   | **+0.3 %** |
+| Boot   | 3.397   | **3.014**   | **10.16 ×** ✅ | **+11.3 %** |
+
+Boot crossed **10 × Mac Plus** — a full order of magnitude over the
+original 7.8336 MHz hardware running the same boot workload. Helper
+calls dropped 1.97 M → 1.60 M (−18.6 %); xt_instrs grew slightly
+(77.7 M → 78.2 M) since the inlined bodies are still cheaper than
+the helper bridge but more than the previous zero.
+
+`--diff-jit-trace` divergence at step 84 in VIA timer registers
+only (pre-existing VIA-tick-cadence mismatch). CPU state matches.
+ctest 3/3.
+
+Cumulative session win **M6.2 → M6.34**:
+* Bench `4.008 → 1.299 lx7/cyc` (**+67.6 %**), 7.64 × → **23.58 × Mac Plus**.
+* Boot  `5.376 → 3.014 lx7/cyc` (**+43.9 %**), 5.70 × → **10.16 × Mac Plus**.
 
 Profiled bench's hot-block distribution (per `block_executed`):
 
