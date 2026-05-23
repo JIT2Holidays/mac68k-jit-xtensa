@@ -1339,6 +1339,7 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             b1 |= (top == 0x5 && sf == 1 && mm == 0);              /* ADDQ.W Dn */
             b1 |= (top == 0x3 && op6 == 0);                        /* MOVE.W Dn */
             b1 |= (top == 0x3 && op6 == 2);                        /* MOVE.W (As)→(Ad), Dn,(An) */
+            b1 |= (top == 0x2 && op6 == 3);                        /* MOVE.L Dn,(An)+ */
             b1 |= (top == 0xD && sf == 2 && !((w >> 8) & 1) && mm == 0);  /* ADD.L Dm,Dn */
             b1 |= (top == 0x9 && sf == 2 && !((w >> 8) & 1) && mm == 0);  /* SUB.L Dm,Dn */
             b1 |= (top == 0xC && sf == 2 && !((w >> 8) & 1) && mm == 0);  /* AND.L Dm,Dn */
@@ -1598,6 +1599,48 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + jmm_pos    ] = (u8)mmw;
             base[entry_off + jmm_pos + 1] = (u8)(mmw >> 8);
             base[entry_off + jmm_pos + 2] = (u8)(mmw >> 16);
+
+            inline_ops++; done = true;
+        } else if (top == 0x2 && ((w >> 6) & 7) == 3 && mode == 0) {
+            /* MOVE.L Dn,(An)+ — boot-hot 0x20C1 at 262 K execs / 60 M cycles.
+             * Bounds check the An address; on fast path do 4 byte writes
+             * (BE), post-increment An by 4, emit logic flags if needed. */
+            int an = (w >> 9) & 7;        /* dst An (post-incr) */
+            int dm = w & 7;               /* src Dn */
+
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(an), 8);            /* a8 = An */
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_lp = 2, op_cyc_lp = 8;
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_lp, op_cyc_lp)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_lp, op_cyc_lp);
+            u32 jlp_pos = e.len;
+            xt_j    (&e, 4);
+            /* Fast path: load Dn, write 4 BE bytes, post-incr An. */
+            emit_read_g(&e, &rc, G_D(dm), 10);           /* a10 = Dn */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);                       /* a9 = ram + An */
+            xt_extui(&e, 11, 10, 24, 7); xt_s8i(&e, 11, 9, 0);
+            xt_extui(&e, 11, 10, 16, 7); xt_s8i(&e, 11, 9, 1);
+            xt_extui(&e, 11, 10,  8, 7); xt_s8i(&e, 11, 9, 2);
+            xt_extui(&e, 11, 10,  0, 7); xt_s8i(&e, 11, 9, 3);
+            /* Post-increment An by 4. a8 still holds pre-incr An. */
+            xt_addi (&e, 8, 8, 4);
+            emit_write_g(&e, &rc, G_A(an), 8);
+            if (!flags_dead[i]) emit_logic_flags(&e, 10);
+            emit_advance(&e, op_pc_lp, op_cyc_lp);
+
+            u32 here = e.len;
+            i32 jo = (i32)(here - jlp_pos) - 4;
+            u32 jww = ((u32)((u32)jo & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jlp_pos    ] = (u8)jww;
+            base[entry_off + jlp_pos + 1] = (u8)(jww >> 8);
+            base[entry_off + jlp_pos + 2] = (u8)(jww >> 16);
 
             inline_ops++; done = true;
         } else if (top == 0x3 && ((w >> 6) & 7) == 2 && mode == 0) {
