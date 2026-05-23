@@ -1276,6 +1276,13 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             *(u32 *)(base + lit_off[LITERAL_BCC_PC]) = pc_const;
             g_pc_lit_val = pc_const;
             g_pc_lit_valid = true;
+        } else if (last_op == 0x4EF9) {
+            /* JMP (xxx).L — store the absolute 32-bit target in the literal
+             * pool so the inline arm can load it with a 1-op l32r. */
+            u32 pc_const = mac_read32(cpu->mem, op_pc[n_ops - 1] + 2);
+            *(u32 *)(base + lit_off[LITERAL_BCC_PC]) = pc_const;
+            g_pc_lit_val = pc_const;
+            g_pc_lit_valid = true;
         }
     }
 
@@ -1556,6 +1563,22 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             inline_ops++; done = true;
         } else if (w == 0x4E71) {          /* NOP */
             emit_advance(&e, 2, 4);
+            inline_ops++; done = true;
+        } else if (w == 0x4EF9) {
+            /* JMP (xxx).L — absolute long jump. Block terminator.
+             * Target is a compile-time constant; load via the literal pool
+             * (1 op) when set up by the M6.30 PC-literal logic, else fall
+             * back to emit_load_imm32 (10 ops). */
+            u32 target = mac_read32(cpu->mem, op_pc[i] + 2);
+            emit_advance_flush(&e);
+            if (g_pc_lit_valid && target == g_pc_lit_val) {
+                emit_l32r_at(&e, 8, g_pc_lit_off, g_pc_lit_entry_off + e.len);
+            } else {
+                emit_load_imm32(&e, 8, 9, target);
+            }
+            xt_s32i(&e, 8, R_CPU, OFF_PC);
+            emit_advance(&e, 0, 12);   /* JMP .L cycles = 8 + 4 = 12 */
+            sext_memo_invalidate();
             inline_ops++; done = true;
         } else if (w == 0x4E75) {
             /* RTS — pop 32-bit PC from stack, set cpu->pc, SP += 4.
