@@ -3034,6 +3034,13 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
         xt_addi(&e, 11, 11, -1);
         xt_s32i(&e, 11, R_CPU, off_budget);
         xt_s32i(&e, 10, R_CPU, off_cur);     /* current_block = predicted_next */
+        /* Restore a0 = jit_ret_pc BEFORE chaining: the next block's
+         * prologue does `s32i a0, OFF_JITRETPC` to save its own
+         * return-to-dispatcher address — but a0 has been clobbered by
+         * any helper CALLs in this block, so without this reload the
+         * next block would overwrite cpu->jit_ret_pc with garbage and
+         * the eventual standard return would JX to a bad PC. */
+        xt_l32i(&e, 0, R_CPU, OFF_JITRETPC);
         xt_l32i(&e, 11, 10, off_code);
         xt_l32i(&e, 12, 10, off_entry);
         xt_add (&e, 11, 11, 12);
