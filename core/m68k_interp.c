@@ -642,6 +642,20 @@ void m68k_jit_movem_w_to_mem(m68k_cpu *cpu) {
     /* (An) destination — no writeback of An. */
 }
 
+void m68k_jit_movem_l_to_mem(m68k_cpu *cpu) {
+    u16 list = (u16)cpu->jit_arg1;
+    int an = (int)(cpu->jit_arg2 & 7);
+    u32 addr = cpu->a[an];
+    for (int i = 0; i < 16; i++) {
+        if (list & (1 << i)) {
+            u32 v = (i < 8) ? cpu->d[i] : cpu->a[i - 8];
+            mac_write32(cpu->mem, addr, v);
+            addr += 4;
+        }
+    }
+    /* (An) destination — no writeback of An. */
+}
+
 void m68k_step(m68k_cpu *cpu) {
     /* Once the CPU has halted (e.g. the guest wrote the debug exit port),
      * further steps are no-ops. This keeps a JIT block — which may contain

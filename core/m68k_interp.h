@@ -22,6 +22,7 @@ void m68k_jit_btst_b_mmio(m68k_cpu *cpu);
 void m68k_jit_movem_l_postinc_to_regs(m68k_cpu *cpu);
 void m68k_jit_movem_l_predec_from_regs(m68k_cpu *cpu);
 void m68k_jit_movem_w_to_mem(m68k_cpu *cpu);
+void m68k_jit_movem_l_to_mem(m68k_cpu *cpu);
 
 /* Run the pure interpreter until cpu->cycles >= until or the CPU halts.
  * Polls interrupts and ticks the peripherals between instructions. */

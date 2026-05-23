@@ -2302,21 +2302,16 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                 xt_and (&e, 10, 10, 9);
                 emit_cache_flush(&e, &rc);
                 i32 op_pc_msm = 4, op_cyc_msm = 20;
-                /* Helper bridge: route MMIO bounds-fail to the fast helper.
-                 * Only .W has a fast helper (m68k_jit_movem_w_to_mem); for
-                 * .L (An) we keep m68k_step. */
-                if (sz == 2) {
-                    u32 msm_bridge_size = emit_movem_fast_bridge_size((u32)list, &rc);
-                    xt_beqz(&e, 10, (i32)(6u + msm_bridge_size));
-                    emit_load_imm(&e, 8, 9, (u32)list);
-                    emit_jit_fast_helper(&e, 8, an,
-                                         lit_off[HELPER_JIT_MOVEM_W_TO_MEM],
-                                         entry_off, &rc);
-                } else {
-                    xt_beqz(&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_msm, op_cyc_msm)));
-                    emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
-                                                      entry_off, &rc, op_pc_msm, op_cyc_msm);
-                }
+                /* Helper bridge: route MMIO bounds-fail to the appropriate
+                 * fast helper — sz=.W → movem_w_to_mem, sz=.L → movem_l_to_mem. */
+                literal_id mmio_helper = (sz == 2) ? HELPER_JIT_MOVEM_W_TO_MEM
+                                                   : HELPER_JIT_MOVEM_L_TO_MEM;
+                u32 msm_bridge_size = emit_movem_fast_bridge_size((u32)list, &rc);
+                xt_beqz(&e, 10, (i32)(6u + msm_bridge_size));
+                emit_load_imm(&e, 8, 9, (u32)list);
+                emit_jit_fast_helper(&e, 8, an, lit_off[mmio_helper],
+                                     entry_off, &rc);
+                (void)op_pc_msm; (void)op_cyc_msm;
                 u32 jmsm_pos = e.len;
                 xt_j(&e, 4);
                 /* Fast path: write each reg as sz BE bytes. */
@@ -2349,13 +2344,14 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                 base[entry_off + jmsm_pos + 2] = (u8)(jw_msm >> 16);
                 sext_memo_invalidate();
                 inline_ops++; done = true;
-            } else if (n_regs >= 1 && sz == 2) {
-                /* Large reglist .W: use fast helper instead of m68k_step. */
+            } else if (n_regs >= 1) {
+                /* Large reglist: use fast helper instead of m68k_step. */
+                literal_id mmio_helper = (sz == 2) ? HELPER_JIT_MOVEM_W_TO_MEM
+                                                   : HELPER_JIT_MOVEM_L_TO_MEM;
                 emit_advance_flush(&e);
                 emit_cache_flush(&e, &rc);
                 emit_load_imm(&e, 8, 9, (u32)list);
-                emit_jit_fast_helper(&e, 8, an,
-                                     lit_off[HELPER_JIT_MOVEM_W_TO_MEM],
+                emit_jit_fast_helper(&e, 8, an, lit_off[mmio_helper],
                                      entry_off, &rc);
                 emit_advance(&e, 4, 20);
                 inline_ops++; done = true;
