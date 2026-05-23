@@ -346,6 +346,10 @@ void mac_write8(mac_mem *m, u32 addr, u8 v) {
             } else if (off == MAC_DBG_EXIT && m->cpu) {
                 m->cpu->exit_code = v;
                 m->cpu->halted = M68K_HALT_GUEST_EXIT;
+                /* Break native JIT chaining so the dispatcher's halted-loop
+                 * check exits promptly instead of running another 1..N
+                 * chained blocks. */
+                m->cpu->chain_budget = 0;
             }
             return;
         }

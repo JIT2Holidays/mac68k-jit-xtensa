@@ -790,7 +790,7 @@ void m68k_step(m68k_cpu *cpu) {
     case 0x4: {
         /* Fixed-encoding instructions first. */
         if (op == 0x4E71) { return; }                       /* NOP */
-        if (op == 0x4E70) { cpu->halted = M68K_HALT_RESET;    return; } /* RESET -> stop */
+        if (op == 0x4E70) { cpu->halted = M68K_HALT_RESET; cpu->chain_budget = 0; return; } /* RESET -> stop */
         if (op == 0x4E73) {                                  /* RTE */
             bool was = m68k_is_super(cpu);
             u16 sr = mac_read16(cpu->mem, cpu->a[7]); cpu->a[7] += 2;
@@ -849,6 +849,12 @@ void m68k_step(m68k_cpu *cpu) {
             cpu->sr = sr;
             m68k_sync_sp(cpu, was);
             cpu->stopped = 1;
+            /* Break native JIT chaining (ESP32, M6.54): the chain epilogue
+             * does not check cpu->stopped, so without this the next chained
+             * block would execute when we should be idling waiting for an
+             * IRQ. The dispatcher's STOP wait happens only between
+             * non-chained returns. */
+            cpu->chain_budget = 0;
             return;
         }
         if ((op & 0xFFF8) == 0x4840) {                       /* SWAP Dn */

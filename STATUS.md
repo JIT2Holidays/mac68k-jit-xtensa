@@ -297,6 +297,28 @@ dispatcher, where `smc_flush` runs and drops the affected blocks.
 Host build is unaffected (no chain epilogue emitted; the write to
 `cpu->chain_budget` is dead state).
 
+**M6.57 — chain budget must yield on STOP / RESET / guest exit.**
+Same audit class as M6.56: any state change that should pause or
+terminate execution must break a running chain. STOP sets
+`cpu->stopped=1` expecting the dispatcher's idle-with-cycle-bump
+loop to run; RESET / guest debug-exit set `cpu->halted` expecting
+the dispatcher's `while (!cpu->halted)` to exit. With chaining,
+none of these are checked between chained blocks — so post-STOP
+we could spuriously execute the next block, and post-halt we'd run
+up to chain_budget=16 more blocks before noticing. Fix: zero
+`cpu->chain_budget` at every site that sets stopped/halted —
+`m68k_interp.c` STOP/RESET handlers and `mac_mem.c` debug-exit
+port. ctest pass, host perf unchanged (writes are dead state on
+host build).
+
+Together M6.55 / M6.56 / M6.57 close the correctness audit of the
+M6.54 native-chaining work. The chain path is now safe across:
+ - chain depth >= 2 (M6.55: a0 / jit_ret_pc preservation)
+ - SMC writes during a chain (M6.56)
+ - STOP and halt during a chain (M6.57)
+ - predicted_next dangling (already handled in M6.54: smc_flush
+   clears all predicted_next pointers when it runs)
+
 **Cross-block register caching.** The other unimplemented item.
 M6.10's regcache caches D/A regs *within* a block (loaded at
 prologue, flushed at epilogue). Extending across blocks would
