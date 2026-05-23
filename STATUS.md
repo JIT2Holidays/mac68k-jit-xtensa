@@ -227,10 +227,10 @@ look better, and `--diff-jit-trace` divergence moved later (step 32
 6.80 to 3.92 (the prior figure was an artifact of the JIT running
 extra ops within the cycle bound due to undercounting).
 
-### Future work — outside this session's scope
+### Future work
 
-**Native block chaining on ESP32 target.** The largest unimplemented
-item from the user's high-gain list. Each compiled block currently
+**M6.54 — Native block chaining on ESP32 target (DELIVERED for ESP32).**
+The largest unimplemented item from the user's high-gain list. Each compiled block currently
 returns to the dispatcher's `enter_block` loop, which polls VIA /
 interrupts, hash-looks-up the next block, then calls back into JIT
 code. The chain-prediction mechanism caches `predicted_next` per
@@ -261,6 +261,13 @@ gain only materialises on real ESP32 hardware. Estimated impact:
 with chain throughput of ~12 M/s observed in the host bench, on
 ESP32 this would be a ~0.6 G host cycles saved per 60 M emulated
 cycles = ~12 % wall-clock improvement at 240 MHz.
+
+**Implementation landed in M6.54.** New cpu->current_block and
+cpu->chain_budget fields, dispatcher sets them before invoking each
+block, epilogue (under `#ifdef ESP_PLATFORM`) emits the chain check
++ direct JX. Chain budget defaults to 16 — bounded to keep VIA/IRQ
+latency under ~1 ms. Host build skips the chain emit entirely;
+xt_sim still runs one block per invocation as before.
 
 **Cross-block register caching.** The other unimplemented item.
 M6.10's regcache caches D/A regs *within* a block (loaded at
