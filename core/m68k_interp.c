@@ -578,6 +578,18 @@ void m68k_jit_ori_b_mmio(m68k_cpu *cpu) {
     m68k_set_ccr(cpu, ccr);
 }
 
+/* JIT custom helper: BTST #imm,(d16,An) for MMIO destinations.
+ * Tests bit at (imm & 7) of mem[addr]; sets only Z (other flags
+ * preserved). PC/cycle advance is handled by the JIT's accumulator. */
+void m68k_jit_btst_b_mmio(m68k_cpu *cpu) {
+    u32 addr = cpu->jit_arg1;
+    u32 bit = cpu->jit_arg2 & 7;
+    u8 d = mac_read8(cpu->mem, addr);
+    u8 ccr = m68k_get_ccr(cpu) & (u8)~CCR_Z;
+    if (((d >> bit) & 1) == 0) ccr |= CCR_Z;
+    m68k_set_ccr(cpu, ccr);
+}
+
 void m68k_step(m68k_cpu *cpu) {
     /* Once the CPU has halted (e.g. the guest wrote the debug exit port),
      * further steps are no-ops. This keeps a JIT block — which may contain

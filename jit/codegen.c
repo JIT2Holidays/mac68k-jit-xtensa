@@ -2626,9 +2626,24 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             xt_and(&e, 10, 8, 9);
             emit_cache_flush(&e, &rc);
             i32 op_pc_bt = 6, op_cyc_bt = 8;
-            xt_beqz(&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_bt, op_cyc_bt)));
-            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
-                                              entry_off, &rc, op_pc_bt, op_cyc_bt);
+            /* Custom MMIO helper bridge (mirrors the ORI.B M6.42 pattern). */
+            u32 btst_bridge_size = 3*7;  /* mov, l32r, callx0, sr_reload, 3 setup */
+            if (g_sr_dirty) btst_bridge_size += 3;
+            btst_bridge_size += (u32)rc.active * 3;
+            xt_beqz(&e, 10, (i32)(6u + btst_bridge_size));
+            /* --- Custom MMIO BTST helper bridge. --- */
+            sext_memo_invalidate();
+            emit_sr_flush(&e);
+            xt_s32i(&e, 8, R_CPU, OFF_JIT_ARG1);   /* arg1 = addr */
+            xt_movi(&e, 9, bit);
+            xt_s32i(&e, 9, R_CPU, OFF_JIT_ARG2);   /* arg2 = bit position */
+            xt_mov (&e, R_ARG, R_CPU);
+            emit_l32r_at(&e, R_HELP, lit_off[HELPER_JIT_BTST_B_MMIO],
+                         entry_off + e.len);
+            xt_callx0(&e, R_HELP);
+            emit_sr_reload(&e);
+            emit_cache_reload(&e, &rc);
+            /* --- end custom bridge --- */
             u32 jbt_pos = e.len;
             xt_j(&e, 4);
             /* Fast path: read byte, extract bit, update Z. */
