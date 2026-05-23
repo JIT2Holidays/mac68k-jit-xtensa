@@ -329,6 +329,37 @@ saved), boot ~965 K / 100 M cyc (~1.93 M ops saved, ~1.2 % of boot
 JIT cost on real hardware). Host metrics unchanged (chain epilogue
 isn't emitted on host).
 
+### Future bench targets (InfiniteHD apps to script)
+
+The only third-party app currently in the bench rotation is
+Speedometer 4 (`roms/disks/speedo-bench.snap`) — which is exactly the
+one that surfaced the M6.X-form-flag bug. To broaden differential
+coverage, two more InfiniteHD6 apps worth adding as `*.snap` workloads:
+
+* **MacBench 4.0** (`Utilities/MacBench 4.0/`) — multi-domain ZD
+  benchmark: CPU integer, SANE FP (no FPU on Mac Plus → emulated
+  softfloat / BCD extended-precision sequences that hit corners of
+  the ISA almost nothing else exercises), QuickDraw, disk. Different
+  instruction-mix profile to Speedometer's tight ALU loops.
+* **THINK C** compile (`Developer/THINK C/`) — long, branch-heavy,
+  register-pressured *application* workload, not a benchmark's hot
+  inner loop. Hits every addressing mode, lots of MOVEM, deep call
+  stacks, linker SMC patches → exercises M6.45 MOVEM bridge and
+  M6.56 SMC-breaks-chain together. Different per-block residency
+  pattern (more arena churn) from Speedometer.
+
+Setup pattern follows `speedo-bench.snap`: boot Mac → drive 2 auto-
+mounts at cycle 1e9 → `MAC68K_MOUSESCRIPT` event file launches the
+app → `MAC68K_SNAP` freezes mid-workload. Each is ~30-event mouse
+script + ~5 min scripted run + one snapshot. Not done this session.
+
+Alternative real-software pair if synthetic benchmarks aren't the
+goal: **Dark Castle** (VIA-timer-driven sound + raster bit-banging
+— tests M3's "good enough to pace 60 Hz VBL, not instruction-cycle-
+accurate" boundary) and **HyperCard** (bytecode interpreter on top of
+68k — double-interp stress, exercises every trap and the Resource
+Manager).
+
 **Cross-block register caching.** The other unimplemented item.
 M6.10's regcache caches D/A regs *within* a block (loaded at
 prologue, flushed at epilogue). Extending across blocks would
