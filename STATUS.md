@@ -175,7 +175,8 @@ instr/cyc on the target; helper-cost proxy `M68K_JIT_HELPER_LX7_COST = 64`).
 | JIT M6.28 (CMP.W (d16,An),Dn + BLT.S fusion) | 1.550 | 19.76 × | 4.429 | 6.92 × |
 | JIT M6.29 (fusion extended to BLE.S and CMP.W (An),Dn) | 1.455 | 21.05 × | 4.429 | 6.92 × |
 | JIT M6.30 (Bcc/BRA PC constant in per-block literal pool) | 1.330 | 23.03 × | 4.330 | 7.07 × |
-| **JIT M6.31 (current — ADDX2 fuses slli+add for the Bcc.S cycle update)** 🎯 | **1.316** | **23.27 ×** ✅ | **4.319** | **7.09 ×** |
+| JIT M6.31 (ADDX2 fuses slli+add for the Bcc.S cycle update) 🎯 | 1.316 | 23.27 × ✅ | 4.319 | 7.09 × |
+| **JIT M6.32 (current — skip prologue R_SR reload + extend fusion to BEQ/BNE)** | **1.303** | **23.51 ×** | **4.319** | **7.09 ×** |
 | Goal: 5 × interp on bench       | 1.32            | **23.2 ×**       | 1.18           | **25.9 ×**      |
 
 **Mac Plus speed already cleared** (>1 ×) by the interpreter alone —
@@ -1148,6 +1149,36 @@ baseline at every step. The optimisation surface is now well-mapped;
 further low-effort wins are possible (CMP+Bcc fusion cc coverage for
 BEQ/BNE/BGE/BGT, prologue R_SR-reload skip, more literal-pool uses),
 but the headline goal is in hand.
+
+**M6.32 — prologue R_SR-reload skip + BEQ/BNE fusion (delivered).**
+Two complementary additions:
+
+1. **Extended CMP+Bcc fusion** to cc=6 (NE) and cc=7 (EQ). The branchless
+   condition compute becomes a 3-op sequence: `movi a8, X; bnez r, +6;
+   movi a8, !X` where X is the polarity. Replaces ~14 ops of unfused
+   flag-emit + emit_cond + tail.
+
+2. **Skip prologue `emit_sr_reload`** when no inline op reads or writes
+   R_SR. A pre-pass classifies each op (SET / CONS / Bcc-cc) and
+   accounts for the fused CMP+Bcc terminator (which doesn't touch R_SR
+   inline — helper bridge reloads). For bench's hot blocks (all fused-
+   terminator + only flags_dead setters before), the load is dead,
+   saved ~813 K l16ui executions.
+
+| Engine | M6.31   | **M6.32**   | × Mac Plus    | delta |
+|--------|--------:|------------:|--------------:|------:|
+| Bench  | 1.316   | **1.303**   | **23.51 ×**   | **+1.0 %** |
+| Boot   | 4.319   | **4.319**   | **7.09 ×**    | unchanged |
+
+Boot's xt_instrs barely moved (−239 ops): the conservative
+classifier correctly determines that most boot blocks have inline
+flag-setters with live CCR, keeping the prologue load.
+
+`--diff-jit-trace` matches baseline through step 544. ctest 3/3.
+
+Cumulative session win **M6.2 → M6.32**:
+* Bench `4.008 → 1.303 lx7/cyc` (**+67.5 %**), 7.64 × → **23.51 × Mac Plus**.
+* Boot  `5.376 → 4.319 lx7/cyc` (**+19.7 %**), 5.70 × → **7.09 × Mac Plus**.
 
 Profiled bench's hot-block distribution (per `block_executed`):
 

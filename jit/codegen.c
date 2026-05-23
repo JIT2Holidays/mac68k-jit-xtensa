@@ -804,6 +804,8 @@ static void emit_immlogic_bw_dn(xt_emit *e, int dn, u32 imm, int size,
 static u32 fused_helper_bcc_tail_size(int cc) {
     u32 cond_size;
     switch (cc) {
+        case 6:  cond_size = 9;  break;  /* NE: extui Z + movi 1 + xor */
+        case 7:  cond_size = 6;  break;  /* EQ: extui Z + mov */
         case 13: cond_size = 9;  break;  /* BLT: extui V + extui N + xor */
         case 15: cond_size = 15; break;  /* BLE: extui V + extui Z + extui N + xor + or */
         default: return 0;
@@ -827,15 +829,31 @@ static void emit_cmp_cond_fused(xt_emit *e, int cc, u8 s, u8 d, u8 r) {
      *   V at bit 31 = (s^d) & (d^r)
      *   N at bit 31 = r itself
      *   Z = (r == 0)
-     * BLT (13) = N^V; BLE (15) = Z | (N^V). */
-    xt_xor (e, 11, s, d);
-    xt_xor (e, 12, d, r);
-    xt_and (e, 11, 11, 12);            /* bit 31 = V */
-    xt_xor (e, 11, 11, r);             /* bit 31 = N^V */
-    xt_extui(e, 8, 11, 31, 0);         /* a8 = N^V (0 or 1) */
-    if (cc == 15) {                    /* BLE — OR in Z */
-        xt_bnez(e, r, 6);              /* skip movi if r != 0 */
-        xt_movi(e, 8, 1);              /* a8 = 1 (Z is set; cond = 1) */
+     * Supported:
+     *   NE (6)  = !Z  — cond = (r != 0)
+     *   EQ (7)  = Z   — cond = (r == 0)
+     *   BLT (13) = N^V
+     *   BLE (15) = Z | (N^V)
+     */
+    if (cc == 6) {                     /* NE: r != 0 */
+        xt_movi(e, 8, 1);
+        xt_bnez(e, r, 6);              /* if r != 0, skip the movi below */
+        xt_movi(e, 8, 0);              /* r == 0 → cond = 0 */
+    } else if (cc == 7) {              /* EQ: r == 0 */
+        xt_movi(e, 8, 0);
+        xt_bnez(e, r, 6);              /* if r != 0, skip the movi below */
+        xt_movi(e, 8, 1);              /* r == 0 → cond = 1 */
+    } else {
+        /* Sign-comparison family: needs (s, d, r) and bit-31 analysis. */
+        xt_xor (e, 11, s, d);
+        xt_xor (e, 12, d, r);
+        xt_and (e, 11, 11, 12);        /* bit 31 = V */
+        xt_xor (e, 11, 11, r);         /* bit 31 = N^V */
+        xt_extui(e, 8, 11, 31, 0);     /* a8 = N^V (0 or 1) */
+        if (cc == 15) {                /* BLE — OR in Z */
+            xt_bnez(e, r, 6);          /* skip movi if r != 0 */
+            xt_movi(e, 8, 1);          /* a8 = 1 (Z is set; cond = 1) */
+        }
     }
     sext_memo_invalidate();
 }
@@ -1169,18 +1187,6 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
     xt_emit e;
     xt_init(&e, base + entry_off, total - entry_off);
 
-    /* 4. Prologue: a3 = cpu_state base; stash the CALL0 return PC;
-     * load R_SR from cpu->sr; load every D/A cache slot from its assigned
-     * guest reg. Reset accumulators. */
-    g_sr_dirty = false;
-    g_pc_acc = 0;
-    g_cyc_acc = 0;
-    g_sext_valid = false;
-    g_sext_src_reg = -1;
-    emit_l32r_at(&e, R_CPU, lit_off[ADDR_CPU_BASE], entry_off + e.len);
-    xt_s32i(&e, 0, R_CPU, OFF_JITRETPC);
-    emit_sr_reload(&e);
-
     /* 5. Lazy-CCR analysis. Backward scan. For each op, the setter side
      * happens "after" the consumer side in execution order — but in a
      * backward scan that means we observe the setter FIRST (downstream)
@@ -1357,6 +1363,65 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             rc.active++;
         }
         (void)inline_count; (void)helper_count;
+    }
+
+    /* 5d. Determine whether the prologue's R_SR reload is needed. Skip
+     * when no inline op reads or writes R_SR — for fused-CMP+Bcc-
+     * terminated blocks where every other op has flags_dead, the
+     * prologue load is dead (helper-bridge fallbacks reload R_SR on
+     * their own). Saves 1 op per execution of such blocks. */
+    bool block_needs_sr_load = false;
+    bool terminator_fused = false;
+    if (n_ops >= 2) {
+        u16 last = op_word[n_ops - 1];
+        u16 prev = op_word[n_ops - 2];
+        if ((last >> 12) == 0x6) {
+            int cc = (last >> 8) & 0xF;
+            i32 disp = (i8)(last & 0xFF);
+            if ((cc == 6 || cc == 7 || cc == 13 || cc == 15) && disp != 0 && disp != -1) {
+                int ptop = (prev >> 12) & 0xF;
+                int pmode = (prev >> 3) & 7;
+                int pszf = (prev >> 6) & 3;
+                int pbit8 = (prev >> 8) & 1;
+                if (ptop == 0xB && pszf == 1 && pbit8 == 0 && (pmode == 2 || pmode == 5)) {
+                    terminator_fused = true;
+                }
+            }
+        }
+    }
+    for (u32 k = 0; k < n_ops; k++) {
+        /* Skip the fused CMP and Bcc — their fast path does no R_SR
+         * access, and the helper-path bridge reloads R_SR before
+         * touching it. */
+        if (terminator_fused && k >= n_ops - 2) continue;
+        u16 w = op_word[k];
+        u32 cls = classify_op(w);
+        /* SET op writes R_SR via read-modify-write unless flags are dead. */
+        if ((cls & 1u) && !flags_dead[k]) {
+            block_needs_sr_load = true; break;
+        }
+        /* CONS op reads R_SR. */
+        if (cls & 2u) {
+            block_needs_sr_load = true; break;
+        }
+        /* Bcc.S (cc != 0 BRA, != 1 BSR) reads R_SR via emit_cond. */
+        if ((w >> 12) == 0x6) {
+            int cc = (w >> 8) & 0xF;
+            if (cc >= 2) { block_needs_sr_load = true; break; }
+        }
+    }
+
+    /* 4. Prologue: a3 = cpu_state base; stash the CALL0 return PC;
+     * load R_SR (when block needs it); load every D/A cache slot. */
+    g_sr_dirty = false;
+    g_pc_acc = 0;
+    g_cyc_acc = 0;
+    g_sext_valid = false;
+    g_sext_src_reg = -1;
+    emit_l32r_at(&e, R_CPU, lit_off[ADDR_CPU_BASE], entry_off + e.len);
+    xt_s32i(&e, 0, R_CPU, OFF_JITRETPC);
+    if (block_needs_sr_load) {
+        emit_sr_reload(&e);
     }
 
     /* 5c. Emit the cache-load epilogue-of-prologue: one l32i per cached
@@ -1627,7 +1692,7 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                     /* BLT (cc=13) — bench's 0x03DF58 / 0x03DF5E.
                      * BLE (cc=15) — bench's 0x03DF40 (paired with the other
                      *               CMP arm but BLE also possible here). */
-                    if ((cc == 13 || cc == 15) && disp != 0 && disp != -1) {
+                    if ((cc == 6 || cc == 7 || cc == 13 || cc == 15) && disp != 0 && disp != -1) {
                         fuse = true;
                         fuse_cc = cc;
                         fuse_disp = disp;
@@ -1722,7 +1787,7 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                 if ((nw >> 12) == 0x6) {
                     int cc = (nw >> 8) & 0xF;
                     i32 disp = (i8)(nw & 0xFF);
-                    if ((cc == 13 || cc == 15) && disp != 0 && disp != -1) {
+                    if ((cc == 6 || cc == 7 || cc == 13 || cc == 15) && disp != 0 && disp != -1) {
                         fuse = true;
                         fuse_cc = cc;
                         fuse_disp = disp;
