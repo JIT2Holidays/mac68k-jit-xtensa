@@ -994,6 +994,21 @@ static void emit_addq_an(xt_emit *e, int an, int delta, regcache *rc) {
     emit_advance(e, 2, 8);
 }
 
+/* M6.135 — CMP.W Dm,Dn — compares low 16 of Dn against low 16 of Dm.
+ * Shift-to-high-16 trick: sign-extend each to .L by shifting left 16
+ * bits (so sign bit lands at bit 31), then sub. emit_addsub_flags_long
+ * derives N/Z/V/C correctly from the .L-sized result. CMP doesn't
+ * touch X. Cycles 8 = base 4 + handler 4 (matches m68k_interp). */
+static void emit_cmp_w_dd(xt_emit *e, int dn, int dm, regcache *rc, u8 cc_mask) {
+    emit_read_g(e, rc, G_D(dm), 8);
+    emit_read_g(e, rc, G_D(dn), 9);
+    xt_slli(e, 8, 8, 16);   /* a8 = Dm.W in high 16 */
+    xt_slli(e, 9, 9, 16);   /* a9 = Dn.W in high 16 */
+    xt_sub (e, 10, 9, 8);   /* a10 = (Dn - Dm) in high 16 */
+    emit_addsub_flags_long_masked(e, true, true, 8, 9, 10, cc_mask);
+    emit_advance(e, 2, 8);
+}
+
 /* CMP.L Dm,Dn — compares (Dn - Dm); sets N/Z/V/C, leaves X and the
  * registers untouched. Direct-cache fast path: read both operands
  * in-place (no movs) and compute (Dn - Dm) into a10. */
@@ -5996,6 +6011,11 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
         } else if (top == 0xB && szf == 2 && !((w >> 8) & 1) && mode == 0) {
             /* CMP.L Dm,Dn */
             emit_cmp_l_dd(&e, (w >> 9) & 7, w & 7, &rc, flags_needed[i]);
+            inline_ops++; done = true;
+        } else if (top == 0xB && szf == 1 && !((w >> 8) & 1) && mode == 0) {
+            /* M6.135 — CMP.W Dm,Dn. Boot's 0xB242 (CMP.W D2,D1) at
+             * 383 helpers / 100 M cyc. */
+            emit_cmp_w_dd(&e, (w >> 9) & 7, w & 7, &rc, flags_needed[i]);
             inline_ops++; done = true;
         } else if (top == 0x9 && szf == 2 && !((w >> 8) & 1) && (mode == 0 || mode == 1)) {
             /* SUB.L Dm/Am,Dn — M6.104 extends to An source (bench 0x948A). */
