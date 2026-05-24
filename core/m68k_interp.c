@@ -1523,6 +1523,15 @@ m68k_decoded m68k_decode_at(m68k_cpu *cpu, u32 pc) {
              * Bits 11-9 distinguish: 000=MOVE-from-SR, 001=MOVE-from-CCR,
              * 010=MOVE-to-CCR, 011=MOVE-to-SR. */
             if ((op & 0xF1C0) == 0x40C0) ea_sz = 2;
+            /* M6.124b — CHK.W <ea>,Dn (op = 0100 ddd 110 mmm rrr =
+             * 0x41C0-base with bits 8-6 = 110, i.e. (op & 0xF1C0) == 0x4180).
+             * On 68000 CHK is always .W, but the szf bits 7-6 = 10 map to
+             * sz=4 in the generic decoder. For CHK.W #imm,Dn the imm is
+             * 2 bytes (.W), not 4. Same trap class as the MOVE-SR fix:
+             * mis-bounded block decodes the next 2 bytes as a phantom
+             * opcode. CHK is rare so this hasn't shown up in bench/boot
+             * helper-histo, but fix for forward robustness. */
+            if ((op & 0xF1C0) == 0x4180) ea_sz = 2;
             d.length += ea_ext_bytes(cpu, pc, mode, reg, ea_sz);
             break;
         }

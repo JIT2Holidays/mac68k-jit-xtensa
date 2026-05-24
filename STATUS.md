@@ -1,14 +1,68 @@
 # Status
 
-## Where things stand right now (post-M6.124)
+## Where things stand right now (post-M6.125)
 
 | Engine | lx7 / cyc | × interp baseline |
 |--------|----------:|------------------:|
 | **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.172** | **5.51 ×** ✅ |
 | **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.197** | **5.40 ×** ✅ |
-| **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.700** | **3.80 ×** |
-| **Boot** (Mac Plus ROM, 5 M cycles, PC=`0x40032C` deterministic)    | **2.218** | **2.66 ×** |
+| **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.699** | **3.80 ×** |
+| **Boot** (Mac Plus ROM, 5 M cycles, PC=`0x40032C` deterministic)    | **2.216** | **2.92 ×** |
 | **Boot** (Mac Plus ROM, 300 K cycles, PC=`0x40032C` deterministic)  | **1.975** | **2.99 ×** |
+
+## M6.125 — extend selective cache_reload to MOVE-to-mem arms
+
+Follow-up to M6.123. The MOVE-to-mem arms (MOVE.B/.W Dn,(An),
+MOVE.B/.W Dn,(d16,An), MOVE.W Dn,-(An)) have helpers that modify NO
+guest D/A reg (memory + CCR only, plus An for pre-decrement). Narrowed
+`g_helper_touched_mask`:
+
+* MOVE.B Dn,(An)        — touched_mask = 0 (no reg touched)
+* MOVE.W Dn,(An)        — touched_mask = 0
+* MOVE.W Dn,(d16,An)    — touched_mask = 0
+* MOVE.W Dn,-(An)       — touched_mask = {An} (pre-decrement)
+
+## M6.124b — CHK.W length fix (forward-robust)
+
+Sibling fix to M6.124. CHK opcode pattern `(op & 0xF1C0) == 0x4180`
+has fixed bits 8-6 = 110 (CHK code), so bits 7-6 = 10 → szf=2 → sz=4
+in the generic decoder. But CHK on 68000 is always .W (sz=2). For
+CHK.W #imm,Dn the imm is 2 bytes, not 4. Same trap class as M6.122
+and M6.124. CHK is rare (not in bench/boot helper-histo) so this
+hasn't manifested, but fix for forward robustness.
+
+## M6.124 — m68k_decode_at length fix for ADDA.L/SUBA.L/CMPA.L #imm32 — boot 5 M det 2.223 → 2.218 lx7/cyc (−0.22 %)
+
+Sibling bug to M6.122's MOVE-to-SR length fix. For top=0x9 (SUB),
+top=0xB (CMP), top=0xD (ADD) family with szf=3:
+
+* szf=3 disambiguates by `top`:
+  - top=0x8/0xC : DIVU/DIVS/MULU/MULS — always .W operand (sz=2)
+  - top=0x9/0xB/0xD : ADDA/SUBA/CMPA — sz depends on bit 8
+    - bit 8 = 0 → .W (sz=2); bit 8 = 1 → .L (sz=4)
+
+Pre-M6.124, the decoder used `(szf==3)?2:sz` — forcing sz=2 for ALL
+szf=3 ops including ADDA.L/SUBA.L/CMPA.L. Decoder mis-bounded these
+ops with #imm32 source, walking 2 bytes past the actual imm and
+decoding the next 2 as a phantom opcode (same trap class as M6.122).
+
+**Triple-diff:** ctest 7/7, `--diff-jit-trace` clean through 11 038 cyc.
+
+**Perf:**
+
+| Workload | M6.123 | M6.124+125 | Δ |
+|----------|------:|----------:|--:|
+| Bench (20 M)        | 1.172 | **1.172** | unchanged |
+| Bench (100 M)       | 1.197 | **1.197** | unchanged |
+| **Boot 5 M det**    | 2.223 | **2.216** | **−0.31 %** ✅ (real workload) |
+| Boot 100 M          | 1.700 | **1.699** | within noise |
+
+Cumulative M6.84 → M6.125:
+* Bench (20 M): 1.257 → **1.172** (−6.8 %)
+* Bench (100 M): 1.396 → **1.197** (−14.3 %)
+* Boot 300 K det: 2.170 → **1.975** (−9.0 %)
+* Boot 5 M det:   2.471 → **2.216** (**−10.3 %**) 🎯
+* Boot 100 M:     1.734 → **1.699** (−2.0 %)
 
 ## M6.124 — m68k_decode_at length fix for ADDA.L/SUBA.L/CMPA.L #imm32 — boot 5 M det 2.223 → 2.218 lx7/cyc (−0.22 %)
 

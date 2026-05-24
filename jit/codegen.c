@@ -3734,9 +3734,14 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             xt_and  (&e, 10, an_reg, 9);
             emit_cache_flush(&e, &rc);
             i32 op_pc_b2 = 2, op_cyc_b2 = 8;
+            /* M6.125 — MOVE.B Dn,(An) modifies no D/A reg. The helper
+             * reads Dn and An, writes mem[An], updates CCR. Cache slots
+             * for D/A are unchanged — skip all reload. */
+            g_helper_touched_mask = 0u;
             xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_b2, op_cyc_b2)));
             emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
                                               entry_off, &rc, op_pc_b2, op_cyc_b2);
+            g_helper_touched_mask = 0xFFFFu;
             u32 jb2_pos = e.len;
             xt_j    (&e, 4);
 
@@ -3959,11 +3964,14 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             xt_and  (&e, 10, 8, 9);
             emit_cache_flush(&e, &rc);   /* before conditional helper */
             i32 op_pc_dnan = 2, op_cyc_dnan = 8;
+            /* M6.125 — MOVE.W Dn,(An) modifies no D/A reg. */
+            g_helper_touched_mask = 0u;
             xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_dnan, op_cyc_dnan)));
 
             /* Helper. */
             emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
                                               entry_off, &rc, op_pc_dnan, op_cyc_dnan);
+            g_helper_touched_mask = 0xFFFFu;
 
             /* j over fast — backpatch. */
             u32 jw_pos = e.len;
@@ -4026,10 +4034,13 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             xt_and  (&e, 10, 8, 9);
             emit_cache_flush(&e, &rc);
             i32 op_pc_dwdn = 4, op_cyc_dwdn = 8;
+            /* M6.125 — MOVE.W Dn,(d16,An) modifies no D/A reg. */
+            g_helper_touched_mask = 0u;
             xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_dwdn, op_cyc_dwdn)));
 
             emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
                                               entry_off, &rc, op_pc_dwdn, op_cyc_dwdn);
+            g_helper_touched_mask = 0xFFFFu;
             u32 jdwn_pos = e.len;
             xt_j    (&e, 4);
 
@@ -4072,11 +4083,14 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             xt_and  (&e, 10, 8, 9);
             emit_cache_flush(&e, &rc);
             i32 op_pc_pdw = 2, op_cyc_pdw = 8;
+            /* M6.125 — MOVE.W Dn,-(An) modifies only An (pre-decrement). */
+            g_helper_touched_mask = (u16)(1u << G_A(an));
             xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_pdw, op_cyc_pdw)));
 
             /* Helper. */
             emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
                                               entry_off, &rc, op_pc_pdw, op_cyc_pdw);
+            g_helper_touched_mask = 0xFFFFu;
             u32 jpdw_pos = e.len;
             xt_j    (&e, 4);
 
