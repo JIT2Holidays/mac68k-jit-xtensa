@@ -1,5 +1,40 @@
 # Status
 
+## M6.98 — LSR.B / ASR.B #imm,Dn inline (delivered)
+
+Extends the M6.97 LSR/ASR.W arm to also handle .B size. The shared
+emit logic is parametrized on `size_bits` (8 for .B, 16 for .W) and
+the up-shift count for sign-extension is `32 - size_bits`. The merge
+back into Dn uses `srli size_bits; slli size_bits` to clear the low
+size_bits before OR-ing in the result.
+
+Boot's 0xE208 (ASR.B #1,D0) at 780 hits is the main hot variant.
+
+**Triple-diff workflow:**
+
+* ctest: 7/7
+* `--diff-jit-trace`: clean through 11 038 cycles
+* Boot 300 K det: 113 → 105 helpers (−8)
+* Boot 5 M det: 185 → 177 helpers (−8)
+* Boot 100 M: 190 225 → 189 149 (**−1 076**)
+
+**Perf:**
+
+| Workload | M6.97 | **M6.98** | Δ |
+|----------|------:|----------:|--:|
+| Bench (any size) | 1.183 lx7/cyc | unchanged | — |
+| Boot @ 300 K det | 1.982 lx7/cyc | **1.980** | −0.1 % |
+| Boot @ 5 M det   | 2.236 lx7/cyc | **2.236** | unchanged |
+| Boot @ 100 M     | 1.719 lx7/cyc | **1.718** | −0.06 % |
+
+Marginal increment — the .B shift hits are scattered across many
+PCs. The .W variant (M6.97) captured the dominant hot path; .B
+adds the long tail.
+
+Remaining .L sizes would need a slightly different code path (no
+merge, direct in-place srai/srli). Worth adding when a .L shift
+becomes a measured hot helper.
+
 ## M6.97 — LSR.W / ASR.W #imm,Dn inline (delivered)
 
 The boot 5M det helper count dropped from **2 923 → 185** (a 94 %
