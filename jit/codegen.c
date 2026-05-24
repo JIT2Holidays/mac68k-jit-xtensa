@@ -2814,12 +2814,20 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             xt_and  (&e, 10, 8, 9);
             emit_cache_flush(&e, &rc);
             i32 op_pc_lan = 2, op_cyc_lan = 8;
-            /* M6.127 — MOVE.L (An),Dn modifies only Dn (An is read). */
+            /* M6.127 — MOVE.L (An),Dn modifies only Dn (An is read).
+             * M6.144 — slow path uses m68k_jit_move_l_an_to_dn_mmio fast
+             * helper instead of m68k_step. Trajectory-safe per the
+             * full-helper-histo scan: pattern (top=2, bits 8-6=0, mode=2)
+             * is STRICTLY ABSENT from boot 100M. Bench's 0x2014 fires
+             * 156x at the slow path (A4 → MMIO). */
             g_helper_touched_mask = (u16)(1u << G_D(dn));
-            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_lan, op_cyc_lan)));
-            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
-                                              entry_off, &rc, op_pc_lan, op_cyc_lan);
+            u32 lan_bridge_size = emit_jit_fast_helper_size(&rc);
+            xt_beqz (&e, 10, (i32)(6u + lan_bridge_size));
+            emit_jit_fast_helper(&e, 8, dn,
+                                 lit_off[HELPER_JIT_MOVE_L_AN_TO_DN_MMIO],
+                                 entry_off, &rc);
             g_helper_touched_mask = 0xFFFFu;
+            (void)op_pc_lan; (void)op_cyc_lan;
             u32 jlan_pos = e.len;
             xt_j    (&e, 4);
             /* Fast path: read 4 BE bytes into a10 (.L value). */

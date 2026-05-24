@@ -58,6 +58,7 @@ typedef enum {
     HELPER_JIT_MOVE_B_ADDR_TO_AN_MMIO,    /* M6.134 — MOVE.B addr→(Am) fast helper */
     HELPER_JIT_MOVE_B_IMM_TO_ADDR_MMIO,   /* M6.135 — MOVE.B #imm,addr fast helper */
     HELPER_JIT_FLINE_TRAP,                /* M6.137 — F-line exception fast helper */
+    HELPER_JIT_MOVE_L_AN_TO_DN_MMIO,      /* M6.144 — MOVE.L (An),Dn MMIO fast helper */
     /* M6.76 — ROM-source read fast path. Used by the MOVE.L (An)+,(Am)+
      * mem-to-mem inline arm so that bench's ROM-resident pointer-table
      * reads (~71K hits/20M cyc) can take a fast path instead of falling

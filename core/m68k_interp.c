@@ -699,6 +699,24 @@ void m68k_jit_rts_mmio(m68k_cpu *cpu) {
     cpu->a[7] += 4;
 }
 
+/* M6.144 — MOVE.L (An),Dn MMIO fast helper. Replaces the m68k_step
+ * bridge in M6.127's slow path. Bench's 0x2014 (MOVE.L (A4),D0) at
+ * 156 hits/100M cyc all target MMIO. Pattern (top=2, bits 8-6=0,
+ * mode=2) is STRICTLY ABSENT from boot 100M per the trajectory-safety
+ * scan.
+ *
+ * Args: jit_arg1 = src addr (= cpu->a[an]); jit_arg2 = dn (0..7). */
+void m68k_jit_move_l_an_to_dn_mmio(m68k_cpu *cpu) {
+    int dn = (int)(cpu->jit_arg2 & 7);
+    u32 addr = cpu->jit_arg1;
+    u32 v = mac_read32(cpu->mem, addr);
+    cpu->d[dn] = v;
+    u8 ccr = m68k_get_ccr(cpu) & CCR_X;
+    if (v == 0)             ccr |= CCR_Z;
+    if (v & 0x80000000u)    ccr |= CCR_N;
+    m68k_set_ccr(cpu, ccr);
+}
+
 /* M6.137 — F-line trap fast helper. Bench-hot 0xFFFF at 21 808 hits /
  * 100 M cyc (the bench's M6.66-equivalent divergence zone fetches
  * 0xFFFF from unmapped memory, which top-nibble F decodes to line-F).
