@@ -1,0 +1,9 @@
+{
+	"InstallScripts" : 
+	[
+		"/Users/yukidama/github/mac68k-jit-xtensa/build_histo/cmake_install.cmake",
+		"/Users/yukidama/github/mac68k-jit-xtensa/build_histo/tests/cmake_install.cmake",
+		"/Users/yukidama/github/mac68k-jit-xtensa/build_histo/gui/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

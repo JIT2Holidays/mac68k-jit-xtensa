@@ -699,6 +699,20 @@ void m68k_jit_rts_mmio(m68k_cpu *cpu) {
     cpu->a[7] += 4;
 }
 
+/* M6.137 — F-line trap fast helper. Bench-hot 0xFFFF at 21 808 hits /
+ * 100 M cyc (the bench's M6.66-equivalent divergence zone fetches
+ * 0xFFFF from unmapped memory, which top-nibble F decodes to line-F).
+ * Replaces m68k_step's F-line dispatch path:
+ *   - cpu->instrs NOT incremented (real_helpers drops 21 K for bench)
+ *   - cpu->pc set by JIT's emit_advance_flush to op_pc; m68k_exception
+ *     pushes that, then sets cpu->pc to vector 11's value
+ *   - m68k_exception itself adds 34 cycles; JIT's emit_advance(0, 4)
+ *     adds the m68k_step base 4 to total 38 (same as m68k_step path) */
+void m68k_jit_fline_trap(m68k_cpu *cpu) {
+    /* cpu->pc was set by emit_advance_flush to the faulting op_pc. */
+    m68k_exception(cpu, 11);
+}
+
 void m68k_jit_bsr_s_mmio(m68k_cpu *cpu) {
     /* BSR.S: SP -= 4, push (cpu->pc + 2) to (SP), pc = target.
      * Caller's emit_advance_flush has set cpu->pc = source_pc, so the

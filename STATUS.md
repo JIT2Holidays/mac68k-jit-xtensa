@@ -1,13 +1,47 @@
 # Status
 
-## Where things stand right now (post-M6.135)
+## Where things stand right now (post-M6.137)
 
 | Engine | lx7 / cyc | real_lx7 / cyc | × interp baseline (host) |
 |--------|----------:|---------------:|-------------------------:|
 | **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.168** | **1.169** | **5.53 ×** ✅ |
-| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.197** | **1.212** | **5.40 ×** ✅ |
+| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.184** | **1.184** | **5.46 ×** ✅ |
 | **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.665** | **1.666** | **3.88 ×** |
 | **Boot** (Mac Plus ROM, 5 M cycles, PC=`0x40032C` deterministic)    | **2.197** | **2.197** | **2.94 ×** |
+
+## M6.137 — F-line trap fast helper — bench 100 M real_lx7 1.197 → 1.184 (−1.09 %) 🎯
+
+Bench 100 M's top helper by far is 0xFFFF at 21 808 hits / 100 M cyc,
+first_pc 0x342212c2 (bogus — post-divergence zone fetches unmapped
+memory as 0xFFFF, which decodes as F-line). Each fire was an m68k_step
+call costing 64 LX7 in the host metric.
+
+New fast helper `m68k_jit_fline_trap` does just `m68k_exception(cpu, 11)`:
+
+* skips m68k_step's per-op decode + dispatch
+* does NOT increment cpu->instrs (real_helpers drops 21 808)
+* m68k_exception itself adds 34 cycles; the inline arm emits
+  `emit_advance(0, 4)` for the m68k_step base cost, totalling 38 (same
+  as the m68k_step path)
+* cpu->pc was set to the faulting op_pc by emit_advance_flush;
+  m68k_exception pushes that, then sets cpu->pc to vector 11
+* block terminator (ends_block already set for line-F class)
+
+**Triple-diff:** ctest 7/7, `--diff-jit-trace 11038` clean. The
+divergence at cycle 12 202 (in `--diff-jit-trace 500000`) is the
+documented post-VIA-tick artifact, pre-existing on `main`.
+
+**Perf:**
+
+| Workload | lx7/cyc pre | lx7/cyc post | Δ |
+|----------|------------:|-------------:|--:|
+| **Bench (100 M)** | 1.197 | **1.184** | **−1.09 %** 🎯 |
+| Bench (20 M)      | 1.168 | 1.168      | unchanged (F-line not in pre-divergence window) |
+| Boot (100 M)      | 1.665 | 1.665      | unchanged (no F-line in boot's histogram) |
+| Boot (5 M det)    | 2.197 | 2.197      | unchanged |
+
+**Helper count:** bench 100 M `helpers` 25 957 → 4 149 (−21 808 = the
+F-line fires); `real_helpers` 26 265 → 4 457 (−21 808).
 
 ## High-gain backlog — the next structural moves
 

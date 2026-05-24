@@ -2050,6 +2050,34 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
         if (top == 0x7) {                  /* MOVEQ */
             emit_moveq(&e, w, flags_dead[i], &rc);
             inline_ops++; done = true;
+        } else if (top == 0xF) {
+            /* M6.137 — F-line trap. Bench-hot 0xFFFF at 21 808 hits /
+             * 100 M cyc (the bench's M6.66-equivalent divergence zone
+             * fetches unmapped 0xFFFF and decodes as line-F). Custom
+             * fast helper m68k_jit_fline_trap does just m68k_exception(
+             * cpu, 11) — skips m68k_step's per-op decode + the cpu->instrs
+             * increment. Cycles: 4 (m68k_step base) emitted via the
+             * JIT's emit_advance + 34 from m68k_exception = 38 total
+             * (matches the m68k_step path exactly).
+             *
+             * Block terminator — m68k_exception sets cpu->pc to vector
+             * 11. ends_block is set by m68k_decode_at for the entire
+             * line-F class (see m68k_dispatch_op case 0xF). */
+            emit_advance_flush(&e);   /* cpu->pc = op_pc[i] */
+            emit_cache_flush(&e, &rc);
+            /* Helper modifies cpu->pc, cpu->sr, cpu->a[7], cpu->ssp/usp. */
+            g_helper_touched_mask = (u16)(1u << G_A(7));
+            /* The fast helper takes no args — emit_jit_fast_helper writes
+             * jit_arg1/jit_arg2 anyway but the helper ignores them. */
+            emit_jit_fast_helper(&e, 8, 0,
+                                 lit_off[HELPER_JIT_FLINE_TRAP],
+                                 entry_off, &rc);
+            g_helper_touched_mask = 0xFFFFu;
+            /* pc_delta = 0: helper sets cpu->pc to vector 11 directly.
+             * cyc_delta = 4: m68k_step base 4; m68k_exception adds 34. */
+            emit_advance(&e, 0, 4);
+            sext_memo_invalidate();
+            inline_ops++; done = true;
         } else if (w == 0x4E71) {          /* NOP */
             emit_advance(&e, 2, 4);
             inline_ops++; done = true;
