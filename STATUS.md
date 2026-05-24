@@ -1,11 +1,108 @@
 # Status
 
-## Where things stand right now (post-M6.84)
+## M6.85 — MOVEA + ADDA fusion (delivered)
+
+Bench's hot block at PC `0x03DF40` (~405 K hits / 20 M cyc) is dominated
+by two patterns:
+
+```
+MOVEA.L A4,A0           ; A0 = A4
+ADDA.W  D6,A0           ; A0 += sext_w(D6)
+                        ↓ fused into
+                        ; A0 = A4 + sext_w(D6)         (one xt_add)
+
+MOVEA.L A4,A3           ; A3 = A4
+ADDA.W  D6,A3           ; A3 += sext_w(D6)
+ADDA.W  D6,A3           ; A3 += sext_w(D6)
+                        ↓ fused into
+                        ; A3 = A4 + 2·sext_w(D6)       (one xt_addx2)
+```
+
+Implemented in the existing MOVEA.L arm of the dispatch chain: peek
+ahead at the next op (and optionally the one after) and absorb the
+ADDA.W into the MOVEA's emit if same destination Am. Cycles and PC
+delta accumulate (8 c + 12 c [+ 12 c]; 2 b + 2 b [+ 2 b]).
+
+Triple-fusion needs `xt_addx2` which already existed (used by M6.31 for
+DBcc cycle math) — Xtensa LX7's `ADDX2 ar, as, at` computes
+`ar = (as << 1) + at` in one cycle, so two `xt_add`s collapse to one.
+
+**Triple-diff workflow:**
+
+* ctest: 7/7
+* `--diff-jit-trace`: match through 11 038 cycles (321 blocks), no
+  divergence before the documented M6.66 boundary
+* Boot @ 300 K / 5 M deterministic: byte-identical to M6.84 (same
+  final PC `0x40032C`, same `inline_ops` and `helper_ops`) — the
+  fusion doesn't fire on the deterministic boot window (mostly ROM
+  init with non-MOVEA/ADDA opcode mixes)
+
+**Perf:**
+
+| Workload | M6.84 | **M6.85** | Δ |
+|----------|------:|----------:|--:|
+| Bench @ 5 M cyc   | 1.411 lx7/cyc | **1.394 lx7/cyc** | **−1.2 %** lx7 |
+| Bench @ 20 M cyc  | 1.257 lx7/cyc | **1.237 lx7/cyc** | **−1.6 %** lx7 |
+| Bench @ 100 M cyc | 1.396 lx7/cyc | **1.378 lx7/cyc** | **−1.3 %** lx7 |
+| Boot @ 300 K det  | 2.159 lx7/cyc | **2.159 lx7/cyc** | identical |
+| Boot @ 5 M det    | 12 352 738 lx7 | **12 352 738 lx7** | identical |
+| Boot @ 100 M cyc  | 1.734 lx7/cyc | **1.734 lx7/cyc** | identical |
+
+`inline_ops` dropped from 1767 → 1764: each absorbed ADDA loses its
+own counted entry, so 3 ADDA.W ops were fused away across the 898
+bench blocks. With those 3 fusion sites in the 0x03DF40 family (each
+running ~405 K iters) the savings amortise to ~1.2 M LX7 over 20 M
+cycles ≈ the 1.6 % drop observed.
+
+**Bench is now 1.237 lx7/cyc @ 20 M cyc = 5.224 × interp baseline**
+(6.462 / 1.237). First fusion-driven win since M6.30's CMP+Bcc family.
+
+### Why this matters as a class
+
+The "absorb the cheap MOV into the dependent ALU" pattern generalises
+to any `MOVE Rs,Rd ; OP src2,Rd` where `OP` is the only consumer of Rd
+in the immediate window AND `OP` has a three-operand form. Future
+candidates:
+
+* `MOVE.L Dn,Dm ; ADD.L Dx,Dm` → `xt_add Dm, Dn, Dx`
+* `MOVEA.L (d16,An),Am ; ADDA.W Dx,Am` (one of M6.75's hot paths) →
+  same idea but with the memory load folded in
+* `LEA <ea>,An ; ADDA.W Dn,An` (bench's 0x03DF4E-50 sibling) →
+  collapsing the LEA's index-disp computation with the trailing ADDA
+
+## High-gain backlog (notes for the optimisation loop)
+
+These are the next-tier levers identified after M6.84. Recorded here
+so the autonomous loop has a stable target list rather than re-deriving
+them each iteration.
+
+1. **Full register caching of hot D/A regs across a block** — eliminates
+   intra-block `l32i` / `s32i` pairs. The current per-block cache is
+   limited to 4 slots picked by the prologue's `cache_sig` heuristic;
+   widening this (or making it adaptive per-block) is the biggest
+   single remaining structural win. Likely 10-20 % on bench, smaller
+   on boot.
+2. **Comprehensive lazy-CC classifier** that correctly models helper
+   CCR usage per opcode (currently the SET/CONS table is conservative —
+   anything that touches the helper bridge defaults to SET|CONS even
+   when the helper itself doesn't write CCR). Tightening this lets
+   `flags_dead[i]` skip more emit-flag passes.
+3. **Native block chaining on the ESP32 target** — eliminates the
+   dispatcher round-trip per chained block on real hardware. Already
+   landed under `#ifdef ESP_PLATFORM`; host's xt_sim runs one block
+   per invocation so it can't be measured here, but on real hardware
+   this is an estimated ~12 % wall-clock win.
+4. **Instruction fusion (aka dynamic recompiling)** — emit dependent
+   pairs/triples of 68k ops as a single LX7 sequence, eliminating the
+   intermediate register writeback. See M6.85 below for the first
+   fusion lever in this class.
+
+## Where things stand right now (post-M6.85)
 
 | Engine | lx7 / cyc | × interp baseline |
 |--------|----------:|------------------:|
-| **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.257** | **5.14 ×** ✅ |
-| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.396** | **4.63 ×** |
+| **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.237** | **5.22 ×** ✅ |
+| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.378** | **4.69 ×** |
 | **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.734** | **3.40 ×** |
 | **Boot** (Mac Plus ROM, 5 M cycles, PC=`0x40032C` deterministic)    | **2.471** | **2.39 ×** |
 | **Boot** (Mac Plus ROM, 300 K cycles, PC=`0x40032C` deterministic)  | **2.159** | **2.73 ×** |

@@ -532,6 +532,82 @@ static void emit_movea_l_reg(xt_emit *e, int an, int src, bool src_is_an, regcac
     emit_advance(e, 2, 8);
 }
 
+/* M6.85 — Fusion: MOVEA.L An|Dn,Am  +  ADDA.W Dx|Ax,Am  [+ ADDA.W Dx|Ax,Am].
+ *
+ * Bench's hot block 0x03DF40 (405 K hits / 20 M cyc) is dominated by
+ * three patterns of this shape:
+ *   MOVEA.L A4,A0 ; ADDA.W D6,A0                      → A0 = A4 + sext_w(D6)
+ *   MOVEA.L A4,A3 ; ADDA.W D6,A3 ; ADDA.W D6,A3       → A3 = A4 + 2*sext_w(D6)
+ *
+ * Standard emit: 2-3 LX7 ops (xt_mov + xt_add[+xt_add], assuming both
+ * dst and src cached and the sext-memo is already live). Fused emit
+ * collapses the MOVEA's xt_mov into the ADDA's xt_add: a single
+ *   xt_add Am, src_movea, a13                   (double-fuse)
+ *   xt_addx2 Am, a13, src_movea                 (triple-fuse, 2*sext + src)
+ *
+ * Cycle accounting absorbs both/all ops in the fused emit: MOVEA.L = 8,
+ * ADDA.W = 12 each, so double = 20 c / 4 bytes, triple = 32 c / 6 bytes.
+ *
+ * Wins (cached dst+src, typical case):
+ *   Double: 1 LX7 saved (xt_mov gone)
+ *   Triple: 2 LX7 saved (xt_mov + 1 xt_add gone)
+ *
+ * On bench's 0x03DF40 (one double + one triple per iter, 405K iters):
+ *   1.2 M LX7 / 20 M cyc = ~0.06 lx7_per_cyc improvement (~5 %).
+ *
+ * The fusion is no-op-equivalent for CCR (neither MOVEA nor ADDA touch
+ * flags) and the cache dirty-marking still happens. */
+static void emit_movea_adda_fused(xt_emit *e, int an, int movea_src, bool movea_src_is_an,
+                                  int adda_src, bool adda_src_is_an, bool triple,
+                                  regcache *rc) {
+    int g_msrc = movea_src_is_an ? G_A(movea_src) : G_D(movea_src);
+    int g_asrc = adda_src_is_an  ? G_A(adda_src)  : G_D(adda_src);
+    int g_dst  = G_A(an);
+
+    /* Ensure sext_w(g_asrc) is live in a13. Reuse if memoized. */
+    if (!g_sext_valid || g_sext_src_reg != g_asrc) {
+        emit_read_g(e, rc, g_asrc, 13);
+        xt_slli(e, 13, 13, 16);
+        xt_srai(e, 13, 13, 16);
+        g_sext_src_reg = g_asrc;
+        g_sext_valid = true;
+    }
+
+    int xt_msrc = cache_lookup(rc, g_msrc);
+    int xt_dst  = cache_lookup(rc, g_dst);
+
+    /* Get MOVEA src into a host reg `src_reg`. If cached, use the slot
+     * directly; else load into a8. */
+    u8 src_reg;
+    if (xt_msrc >= 0) {
+        src_reg = (u8)xt_msrc;
+    } else {
+        if (g_msrc < 8) xt_l32i(e, 8, R_CPU, OFF_D(g_msrc));
+        else            xt_l32i(e, 8, R_CPU, OFF_A(g_msrc - 8));
+        src_reg = 8;
+    }
+
+    if (xt_dst >= 0) {
+        u8 d = (u8)xt_dst;
+        /* Triple-fuse only if requested AND xt_addx2 won't clobber the
+         * sext source (it can't — d is the dst, a13 is the as, src_reg
+         * is at). */
+        if (triple) xt_addx2(e, d, 13, src_reg);   /* d = 2*sext + src */
+        else        xt_add  (e, d, src_reg, 13);   /* d = src + sext   */
+        for (int i = 0; i < rc->active; i++)
+            if (rc->guest[i] == (u8)g_dst) { rc->dirty |= (u16)(1u << i); break; }
+    } else {
+        if (triple) xt_addx2(e, 9, 13, src_reg);
+        else        xt_add  (e, 9, src_reg, 13);
+        xt_s32i(e, 9, R_CPU, OFF_A(an));
+    }
+
+    /* PC delta: 2 (MOVEA) + 2 (ADDA) [+ 2 (ADDA)].
+     * Cycles:   8 + 12 [+ 12]. */
+    if (triple) emit_advance(e, 6, 32);
+    else        emit_advance(e, 4, 20);
+}
+
 /* ADDA.W / SUBA.W #imm16,An — a[an] ± sign-extend(imm16). No CCR.
  * Boot-hot 0xD0FC (ADDA.W #imm,A0) at 131 K execs / 60 M cycles. */
 static void emit_adda_w_imm(xt_emit *e, int an, i16 imm, bool is_sub, regcache *rc) {
@@ -1878,7 +1954,41 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             emit_move_l_dd(&e, (w >> 9) & 7, w & 7, flags_dead[i], &rc);
             inline_ops++; done = true;
         } else if (top == 0x2 && ((w >> 6) & 7) == 1 && mode <= 1) {
-            emit_movea_l_reg(&e, (w >> 9) & 7, w & 7, mode == 1, &rc);
+            /* M6.85 — Peek for fusion: MOVEA.L <Dm|Am>,Am followed by
+             * ADDA.W <Dx|Ax>,Am (same Am). If the op after the ADDA is
+             * ALSO ADDA.W with the same Ax,Am, triple-fuse via xt_addx2.
+             * No CCR concerns (neither op touches flags). */
+            int am = (w >> 9) & 7;
+            bool fused = false;
+            if (i + 1 < n_ops) {
+                u16 nw = op_word[i + 1];
+                if (((nw >> 12) & 0xF) == 0xD
+                    && ((nw >> 6) & 7) == 3
+                    && ((nw >> 3) & 7) <= 1
+                    && ((nw >> 9) & 7) == am) {
+                    int adda_src     = nw & 7;
+                    bool adda_src_an = ((nw >> 3) & 7) == 1;
+                    bool triple = false;
+                    if (i + 2 < n_ops) {
+                        u16 nw2 = op_word[i + 2];
+                        if (((nw2 >> 12) & 0xF) == 0xD
+                            && ((nw2 >> 6) & 7) == 3
+                            && ((nw2 >> 3) & 7) <= 1
+                            && ((nw2 >> 9) & 7) == am
+                            && (nw2 & 7) == adda_src
+                            && (((nw2 >> 3) & 7) == 1) == adda_src_an) {
+                            triple = true;
+                        }
+                    }
+                    emit_movea_adda_fused(&e, am, w & 7, mode == 1,
+                                          adda_src, adda_src_an, triple, &rc);
+                    i += triple ? 2 : 1;   /* skip absorbed ADDA(s) */
+                    fused = true;
+                }
+            }
+            if (!fused) {
+                emit_movea_l_reg(&e, am, w & 7, mode == 1, &rc);
+            }
             inline_ops++; done = true;
         } else if (top == 0xD && szf == 3 && !((w >> 8) & 1) && mode <= 1) {
             /* ADDA.W <Dm|Am>,An */
