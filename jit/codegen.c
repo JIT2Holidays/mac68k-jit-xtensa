@@ -1784,12 +1784,21 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                     break; \
                 } \
                 _r; })
-            if (t == 0x6 && cc == 0) {
-                /* BRA.S — single known target. */
+            if (t == 0x6 && cc == 0 && (last_op & 0xFF) != 0
+                && (last_op & 0xFF) != 0xFF) {
+                /* BRA.S — single known target. (0x6000 = BRA.W, 0x60FF =
+                 * BRA.L — both have multi-word displacements and were
+                 * mis-handled by the i8-cast; gate on the i8-form here.) */
                 i32 disp = (i8)(last_op & 0xFF);
                 u32 next_pc = op_pc[n_ops - 1] + 2 + (u32)disp;
                 if (PC_OVERWRITES_CCR(next_pc)) need_initial = false;
-            } else if (t == 0x6 && cc >= 2) {
+            } else if (t == 0x6 && cc == 0 && (last_op & 0xFF) == 0) {
+                /* M6.140 — BRA.W — disp16 follows the opcode. */
+                i32 disp = (i16)mac_read16(cpu->mem, op_pc[n_ops - 1] + 2);
+                u32 next_pc = op_pc[n_ops - 1] + 2 + (u32)disp;
+                if (PC_OVERWRITES_CCR(next_pc)) need_initial = false;
+            } else if (t == 0x6 && cc >= 2 && (last_op & 0xFF) != 0
+                       && (last_op & 0xFF) != 0xFF) {
                 /* Bcc.S — two targets (taken and fall-through). CCR set
                  * by upstream setter is dead AFTER the Bcc iff BOTH
                  * destinations overwrite CCR with their first op. The
@@ -1800,6 +1809,25 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                 u32 ft_pc    = op_pc[n_ops - 1] + 2;
                 if (PC_OVERWRITES_CCR(taken_pc) && PC_OVERWRITES_CCR(ft_pc))
                     need_initial = false;
+            } else if (t == 0x6 && cc >= 2 && (last_op & 0xFF) == 0) {
+                /* M6.140 — Bcc.W — disp16 in the ext word. */
+                i32 disp = (i16)mac_read16(cpu->mem, op_pc[n_ops - 1] + 2);
+                u32 taken_pc = op_pc[n_ops - 1] + 2 + (u32)disp;
+                u32 ft_pc    = op_pc[n_ops - 1] + 4;
+                if (PC_OVERWRITES_CCR(taken_pc) && PC_OVERWRITES_CCR(ft_pc))
+                    need_initial = false;
+            } else if (last_op == 0x4EF9) {
+                /* M6.140 — JMP (xxx).L — target is the 32-bit absolute
+                 * long following the opcode. Sibling of BRA.S cross-block
+                 * analysis: if the target's first op overwrites CCR, the
+                 * current block's last setter's flags are dead. */
+                u32 target = mac_read32(cpu->mem, op_pc[n_ops - 1] + 2);
+                if (PC_OVERWRITES_CCR(target)) need_initial = false;
+            } else if (last_op == 0x4EFA) {
+                /* M6.140 — JMP (d16,PC) — target = op_pc + 2 + sext16(d16). */
+                i32 disp = (i16)mac_read16(cpu->mem, op_pc[n_ops - 1] + 2);
+                u32 target = op_pc[n_ops - 1] + 2 + (u32)disp;
+                if (PC_OVERWRITES_CCR(target)) need_initial = false;
             } else if (t != 0x6 && (last_op != 0x4E75) && (last_op != 0x4E73)
                        && (last_op != 0x4E77) && ((last_op & 0xFFC0) != 0x4EC0)
                        && ((last_op & 0xFFC0) != 0x4E80)
