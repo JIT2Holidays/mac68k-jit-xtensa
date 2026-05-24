@@ -49,3 +49,35 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/roms/disks/speedo-bench.snap")
                      --max-cycles 11000
              WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endif()
+
+# M6.153 — extra bench snapshots that broaden differential coverage
+# beyond Speedometer's tight ALU loop. See STATUS.md §"Future bench
+# targets" — the originally proposed MacBench 4.0 / THINK C targets
+# remained blocked on the M6.67 Finder app-launch wall, so these two
+# boot-phase snapshots stand in for them. Both pass the full 11K
+# --diff-jit-trace --no-irq window and exercise distinct code paths:
+#
+#   * boot-rom-init.snap     pc=0x40032C — boot-ROM memory-test loop,
+#                            dominated by BTST.B #imm,(d16,An) (op 082D).
+#   * boot-system-load.snap  pc=0x401F6E — post-System-load ROM phase,
+#                            ROM trap arg-passing (MOVE.L 2F72 heavy).
+#
+# Both snapshots are 1.18 MB and gitignored (regenerate via the
+# scripts/snap-extra-bench.sh script in this directory).
+if(EXISTS "${CMAKE_SOURCE_DIR}/roms/disks/boot-rom-init.snap")
+    add_test(NAME diff_jit_boot_rom_init_lockstep
+             COMMAND $<TARGET_FILE:mac68k_host>
+                     --diff-jit-trace --no-irq
+                     --load-snapshot ${CMAKE_SOURCE_DIR}/roms/disks/boot-rom-init.snap
+                     --max-cycles 11000
+             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+endif()
+
+if(EXISTS "${CMAKE_SOURCE_DIR}/roms/disks/boot-system-load.snap")
+    add_test(NAME diff_jit_boot_system_load_lockstep
+             COMMAND $<TARGET_FILE:mac68k_host>
+                     --diff-jit-trace --no-irq
+                     --load-snapshot ${CMAKE_SOURCE_DIR}/roms/disks/boot-system-load.snap
+                     --max-cycles 11000
+             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+endif()

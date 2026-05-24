@@ -1,6 +1,51 @@
 # Status
 
-## Where things stand right now (post-M6.152)
+## M6.153 — extra-bench snapshots wired into ctest 🎯
+
+Two new boot-phase snapshots stand in for the long-blocked MacBench 4.0
+and THINK C targets (`Future bench targets` section below — both
+remained blocked on the M6.67 Finder app-launch wall). Both
+pass the full 11K `--diff-jit-trace --no-irq` window and exercise
+distinct ROM code paths from `speedo-bench.snap`'s tight ALU loop.
+
+| Snapshot | PC | Cycle (captured) | Blocks | Hot opcode |
+|----------|----|------------------|-------:|------------|
+| `roms/disks/boot-rom-init.snap` | `0x40032C` | 4 M | 500 | `082D` BTST.B #imm,(d16,An) — memory-test loop |
+| `roms/disks/boot-system-load.snap` | `0x401F6E` | 60 M | 241 | `2F72` MOVE.L (d8,An,Xn),(d16,SP) — ROM trap arg-passing |
+
+`ctest` went from 7 → 9 tests:
+
+```
+6/9 Test #6: diff_jit_bench_lockstep_prefetch        Passed
+7/9 Test #7: diff_jit_bench_lockstep_prefetch_chain  Passed
+8/9 Test #8: diff_jit_boot_rom_init_lockstep         Passed   (new)
+9/9 Test #9: diff_jit_boot_system_load_lockstep      Passed   (new)
+```
+
+Both snapshots are gitignored (copyrighted ROM bytes) but regenerated
+deterministically by `scripts/snap-extra-bench.sh` — runs the
+interpreter through a cold System 6 boot, dumps a snapshot every 2 M
+cycles, promotes the cycle-4M and cycle-60M ones, and verifies each
+passes the 11K-cycle differential before declaring success.
+
+**Why not MacBench 4.0 / THINK C?** The Finder app-launch wall from
+M6.67 §2809 remains: folder open works, but double-click /
+Cmd-O on an *application* icon doesn't fire the OS Open action.
+Boot-phase snapshots provide the same broadened-differential value
+(distinct opcode mix from Speedometer) without that wall, and they
+hit the CPU-bound ROM code which is exactly where most JIT inline
+arms get exercised. Updating the MacBench / THINK C path remains
+listed as a separate future-work item; their value would be opcode
+mix that boot-ROM doesn't reach (SANE softfloat for MacBench, deep
+call stacks + MOVEM-heavy for THINK C).
+
+The two new tests immediately broaden differential coverage: in
+combination with `speedo-bench.snap` they exercise three disjoint
+hot-code regions (0x40032C ROM init, 0x401F6E post-System-load, and
+0x41E0E6 Speedometer ALU) so a JIT regression in any of them surfaces
+on `ctest` instead of slipping through to a boot/bench run.
+
+## Where things stand right now (post-M6.153)
 
 | Engine | lx7 / cyc | real_lx7 / cyc | × interp baseline (host) |
 |--------|----------:|---------------:|-------------------------:|
@@ -2715,6 +2760,12 @@ JIT cost on real hardware). Host metrics unchanged (chain epilogue
 isn't emitted on host).
 
 ### Future bench targets (InfiniteHD apps to script)
+
+**M6.153 update:** the two-extra-benchmarks slot was filled by
+`boot-rom-init.snap` and `boot-system-load.snap` (see the top of this
+file). The MacBench 4.0 / THINK C app-launch path remains blocked by
+the M6.67 wall and is now an *additional* coverage target, not a
+ctest gap.
 
 The only third-party app currently in the bench rotation is
 Speedometer 4 (`roms/disks/speedo-bench.snap`) — which is exactly the
