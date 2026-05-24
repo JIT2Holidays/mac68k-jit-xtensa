@@ -3867,6 +3867,66 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + jb4_pos + 2] = (u8)(jw_b4 >> 16);
 
             inline_ops++; done = true;
+        } else if (top == 0x1 && ((w >> 6) & 7) == 5
+                   && mode == 7 && (w & 7) == 4) {
+            /* M6.135 — MOVE.B #imm,(d16,An). Boot's 0x137C (MOVE.B
+             * #imm,(d16,A0)) at 390 helpers / 100 M cyc.
+             *
+             * Length 6 (op + imm.W + d16.W); cycles 8. Compile-time-
+             * known imm (low 8 bits of next 16-bit word). dst_addr =
+             * An + sext16(d16). Write byte; MOVE-family CCR. */
+            int an = (w >> 9) & 7;
+            u16 imm_w = mac_read16(cpu->mem, op_pc[i] + 2);
+            u8 imm = (u8)(imm_w & 0xFF);
+            u16 ext_d16 = mac_read16(cpu->mem, op_pc[i] + 4);
+            i32 d16 = (i16)ext_d16;
+
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(an), 8);
+            if (d16 >= -128 && d16 <= 127) {
+                xt_addi(&e, 8, 8, d16);
+            } else {
+                emit_load_imm(&e, 11, 12, (u32)d16);
+                xt_add  (&e, 8, 8, 11);
+            }
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS_BYTE],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_mib = 6, op_cyc_mib = 8;
+            /* MMIO fast helper: skips m68k_step decode, touches no
+             * D/A reg (just mem + CCR). */
+            g_helper_touched_mask = 0u;
+            u32 mib_bridge_size = emit_jit_fast_helper_size(&rc);
+            xt_beqz (&e, 10, (i32)(6u + mib_bridge_size));
+            emit_jit_fast_helper(&e, 8, imm,
+                                 lit_off[HELPER_JIT_MOVE_B_IMM_TO_ADDR_MMIO],
+                                 entry_off, &rc);
+            g_helper_touched_mask = 0xFFFFu;
+            (void)op_pc_mib; (void)op_cyc_mib;
+            u32 jmib_pos = e.len;
+            xt_j    (&e, 4);
+
+            /* Fast path: a8 has dst_addr; write imm.B to mem[a8]. */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);
+            xt_movi (&e, 10, imm);
+            xt_s8i  (&e, 10, 9, 0);
+            if (!flags_dead[i]) {
+                /* imm is compile-time known — use the const-flag path. */
+                emit_logic_flags_const(&e, (u32)imm << 24);
+            }
+            emit_advance(&e, op_pc_mib, op_cyc_mib);
+
+            u32 here_mib = e.len;
+            i32 jo_mib = (i32)(here_mib - jmib_pos) - 4;
+            u32 jw_mib = ((u32)((u32)jo_mib & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jmib_pos    ] = (u8)jw_mib;
+            base[entry_off + jmib_pos + 1] = (u8)(jw_mib >> 8);
+            base[entry_off + jmib_pos + 2] = (u8)(jw_mib >> 16);
+
+            inline_ops++; done = true;
         } else if (top == 0x1 && ((w >> 6) & 7) == 2 && mode == 0) {
             /* M6.92 — MOVE.B Dn,(An) — boot-warm 0x1082 (MOVE.B D2,(A0))
              * at 3 K helpers / 100 M cyc. Sibling of MOVE.B (An),Dn but

@@ -753,6 +753,18 @@ void m68k_jit_move_l_dn_to_anpi_mmio(m68k_cpu *cpu) {
     m68k_set_ccr(cpu, ccr);
 }
 
+void m68k_jit_move_b_imm_to_addr_mmio(m68k_cpu *cpu) {
+    /* MOVE.B #imm,addr — writes compile-time-known imm byte to addr.
+     * jit_arg1 = addr, jit_arg2 = imm.B (low 8 bits). */
+    u32 addr = cpu->jit_arg1;
+    u8 v = (u8)(cpu->jit_arg2 & 0xFF);
+    mac_write8(cpu->mem, addr, v);
+    u8 ccr = m68k_get_ccr(cpu) & CCR_X;
+    if (v == 0)        ccr |= CCR_Z;
+    if (v & 0x80)      ccr |= CCR_N;
+    m68k_set_ccr(cpu, ccr);
+}
+
 void m68k_jit_move_b_addr_to_an_mmio(m68k_cpu *cpu) {
     /* MOVE.B src_addr→(Am) — mem-to-mem byte copy. Used by the M6.91
      * MOVE.B (d16,An),(Am) arm. Boot's 0x10A8 (MOVE.B (d16,A0),(A0))
