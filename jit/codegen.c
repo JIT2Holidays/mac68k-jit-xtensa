@@ -3918,6 +3918,123 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             /* SUB.L Dm,Dn */
             emit_sub_l_dd(&e, (w >> 9) & 7, w & 7, flags_dead[i], &rc);
             inline_ops++; done = true;
+        } else if (top == 0xC && szf == 3
+                   && mode == 7 && (w & 7) == 4) {
+            /* MULS.W / MULU.W #imm16, Dn — bench-hot at
+             *   0xC0FC = MULU.W #imm16, D0 (bit 8 = 0)  at 1002 hits
+             *   0xC1FC = MULS.W #imm16, D0 (bit 8 = 1)  much rarer
+             * per the M6.81 helper histo on the corrected path.
+             *
+             * Uses the new xt_mull encoder (added this iteration).
+             * MULS sign-extends both operands to 32 bits before the
+             * MULL; MULU zero-extends. Either way, the LOW 32 bits of
+             * the product are correct for the destination Dn (full .L
+             * write). MOVE-family CCR. Length 4 (op + imm), 74 cycles
+             * (interp base 4 + handler 70 — the 68000's notoriously
+             * slow MUL).
+             *
+             * Bit-field decode lesson (per memory/triple-differential.md):
+             *   0xC0FC = 1100_0000_1111_1100  (bit 8 = 0 → MULU!)
+             *   0xC1ED = 1100_0001_1110_1101  (bit 8 = 1 → MULS)
+             * First M6.81 cut required `(w>>8)&1` and missed 0xC0FC
+             * entirely — the helper histo still showed 1002 hits at
+             * that opcode after the "inline". */
+            bool sgn = (w >> 8) & 1;
+            int dn = (w >> 9) & 7;
+            u16 imm = mac_read16(cpu->mem, op_pc[i] + 2);
+            u32 imm_ext = sgn ? (u32)(i32)(i16)imm : (u32)imm;
+
+            emit_read_g(&e, &rc, G_D(dn), 8);
+            if (sgn) {
+                xt_slli (&e, 9, 8, 16);
+                xt_srai (&e, 9, 9, 16);          /* a9 = sext(Dn.W) */
+            } else {
+                xt_extui(&e, 9, 8, 0, 15);        /* a9 = zext(Dn.W) */
+            }
+            emit_load_imm(&e, 10, 11, imm_ext);
+            xt_mull (&e, 11, 9, 10);              /* a11 = .L product */
+            emit_write_g(&e, &rc, G_D(dn), 11);
+            if (!flags_dead[i]) emit_logic_flags(&e, 11);
+            emit_advance(&e, 4, 74);
+            inline_ops++; done = true;
+        } else if (top == 0xC && szf == 3 && mode == 5) {
+            /* MULS.W / MULU.W (d16,An), Dn — bench-hot 0xC1ED (MULS.W
+             * (d16,A5),D0) at 1000 hits/20 M cyc (M6.81). Sibling of the
+             * #imm16 arm above but src is a .W memory read. Source can
+             * be in ROM, so use the M6.76 unified RAM/ROM bounds + base
+             * selector. Length 4 (op + d16), 74 cycles. */
+            bool sgn = (w >> 8) & 1;
+            int dn = (w >> 9) & 7;
+            int src_an = w & 7;
+            u16 ext = mac_read16(cpu->mem, op_pc[i] + 2);
+            i32 d16 = (i16)ext;
+
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(src_an), 8);
+            if (d16 >= -128 && d16 <= 127) {
+                xt_addi(&e, 8, 8, d16);
+            } else {
+                emit_load_imm(&e, 11, 12, (u32)d16);
+                xt_add (&e, 8, 8, 11);
+            }
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_l32r_at(&e, 9, lit_off[LITERAL_ROM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 11, 8, 9);
+            emit_l32r_at(&e, 9, lit_off[LITERAL_ROM_BASE],
+                         entry_off + e.len);
+            xt_xor  (&e, 11, 11, 9);
+            xt_and  (&e, 12, 10, 11);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_mulm = 4, op_cyc_mulm = 74;
+            xt_beqz (&e, 12, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_mulm, op_cyc_mulm)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_mulm, op_cyc_mulm);
+            u32 jmulm_pos = e.len;
+            xt_j    (&e, 4);
+            /* Fast path: pick base via a10. */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_beqz (&e, 10, 6);
+            emit_l32r_at(&e, 9, lit_off[ADDR_ROM_HOST_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);
+            /* Read mem.W → a11. */
+            xt_l8ui (&e, 11, 9, 0);
+            xt_l8ui (&e, 12, 9, 1);
+            xt_slli (&e, 11, 11, 8);
+            xt_or   (&e, 11, 11, 12);
+            /* Extend mem.W → a10 (sext for MULS, zext for MULU). */
+            if (sgn) {
+                xt_slli (&e, 10, 11, 16);
+                xt_srai (&e, 10, 10, 16);
+            } else {
+                xt_extui(&e, 10, 11, 0, 15);
+            }
+            /* Read Dn, extend low .W → a8 (matching sign/unsigned). */
+            emit_read_g(&e, &rc, G_D(dn), 8);
+            if (sgn) {
+                xt_slli (&e, 8, 8, 16);
+                xt_srai (&e, 8, 8, 16);
+            } else {
+                xt_extui(&e, 8, 8, 0, 15);
+            }
+            /* MULL → a11 = .L product. */
+            xt_mull (&e, 11, 8, 10);
+            emit_write_g(&e, &rc, G_D(dn), 11);
+            if (!flags_dead[i]) emit_logic_flags(&e, 11);
+            emit_advance(&e, op_pc_mulm, op_cyc_mulm);
+
+            u32 here_mulm = e.len;
+            i32 jo_mulm = (i32)(here_mulm - jmulm_pos) - 4;
+            u32 jw_mulm = ((u32)((u32)jo_mulm & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jmulm_pos    ] = (u8)jw_mulm;
+            base[entry_off + jmulm_pos + 1] = (u8)(jw_mulm >> 8);
+            base[entry_off + jmulm_pos + 2] = (u8)(jw_mulm >> 16);
+
+            inline_ops++; done = true;
         } else if (top == 0xC && szf == 2 && !((w >> 8) & 1) && mode == 0) {
             /* AND.L Dm,Dn  (result -> Dn) */
             emit_logic_l_dd(&e, (w >> 9) & 7, w & 7, (w >> 9) & 7, false, &rc);

@@ -1,11 +1,11 @@
 # Status
 
-## Where things stand right now (post-M6.80)
+## Where things stand right now (post-M6.81)
 
 | Engine | lx7 / cyc | × interp baseline |
 |--------|----------:|------------------:|
-| **Bench** (Speedometer frozen snapshot, 20 M cycles, PC=`0x03DF58`) | **1.288** | **5.02 ×** ✅ |
-| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.438** | **4.49 ×** |
+| **Bench** (Speedometer frozen snapshot, 20 M cycles, PC=`0x03DF58`) | **1.284** | **5.03 ×** ✅ |
+| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.436** | **4.50 ×** |
 | **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.779** | **3.31 ×** |
 
 **Important note — M6.77 reset.** The bench numbers in this table
@@ -1342,6 +1342,68 @@ next significant lever is one of:
   transitions in 20 M cyc with only 3.3 % matching prev->cache_sig
   (vs boot's 99.7 %). Reducing chain-transition cost by even a few
   ops would yield millions of lx7.
+
+ctest: **7 / 7** pass.
+
+**M6.81 — xt_mull + sim decode + MULS/MULU.W #imm16 / (d16,An).**
+
+Added the Xtensa Mul32-option MULL instruction (op0=0, op1=2, op2=8)
+to:
+
+* the encoder (`xt_mull` in `jit/emit_xtensa.{h,c}`)
+* the host sim (`s->a[r] = s->a[sr] * s->a[t]` for the op1=2/op2=8
+  RRR slot in `jit/xtensa_sim.c`)
+
+Then inlined two bench-hot multiply variants — combined **2002
+helpers/20 M cyc**:
+
+* **`0xC0FC` MULU.W #imm16, D0** at 1002 hits, plus the rarer signed
+  sibling `0xC1FC` MULS.W. Compile-time imm; sign- or zero-extend
+  Dn's low .W to 32, sign- or zero-extend imm.W to 32, one MULL.
+  Write .L to Dn; MOVE-family CCR. 74 cycles, length 4.
+
+* **`0xC1ED` MULS.W (d16,A5), D0** at 1000 hits, plus the rarer
+  unsigned sibling `0xC0ED` MULU.W (d16,An), Dn. RAM-or-ROM source
+  bounds (M6.76 shape) for the .W memory read; same sext/zext-then-
+  MULL pattern after. 74 cycles, length 4.
+
+**Bit-field decode trap, caught mid-iteration:** First M6.81 cut
+gated the arms on `(w >> 8) & 1 == 1` (the "MULS" bit), miss-decoding
+the hot `0xC0FC` as MULS.W. Re-decoding bit by bit per
+`memory/triple-differential.md`:
+
+```
+0xC0FC = 1100_0000_1111_1100  (bit 8 = 0 → MULU, NOT MULS)
+0xC1ED = 1100_0001_1110_1101  (bit 8 = 1 → MULS, as expected)
+```
+
+So `0xC0FC` is actually `MULU.W #imm16, D0` (unsigned). The first
+build still showed 1002 helpers at `0xC0FC` post-inline — fixed by
+dropping the `(w >> 8) & 1` constraint from the outer condition and
+branching internally on the sign flag.
+
+**Triple-diff workflow:**
+
+* ctest: 7/7
+* `--diff-jit-trace`: only the documented M6.66 cycle-11898 divergence
+* Boot @ 300 K / 5 M deterministic: byte-identical to M6.80
+
+**Perf:**
+
+| Workload | M6.80 | **M6.81** | Δ |
+|----------|------:|----------:|--:|
+| Bench @ 5 M cyc   | 10 100 h, 1.455 lx7/cyc | **9 091 h, 1.447 lx7/cyc** | **−1 009 h, −0.55 %** |
+| Bench @ 20 M cyc  | 12 074 h, 1.288 lx7/cyc | **10 065 h, 1.284 lx7/cyc** | **−2 009 h, −0.31 %** |
+| Bench @ 100 M cyc | 321 031 h, 1.438 lx7/cyc | **316 022 h, 1.436 lx7/cyc** | **−5 009 h, −0.14 %** |
+| Boot @ 100 M cyc  | 1.779 | 1.779 | unchanged |
+
+The 20 M helper drop of 2009 matches the predicted savings exactly
+(1002 MULU.W + 1000 MULS.W + 7 incidental).
+
+**Bench is now `1.284 lx7/cyc` at 20 M cyc = `5.032 × interp`**
+(6.462 / 1.284). The new MULL instruction unlocks future multiply-
+heavy inlines (DIVS/DIVU need a divide instruction, which Xtensa
+LX7 doesn't have natively — those will stay as helpers).
 
 ctest: **7 / 7** pass.
 

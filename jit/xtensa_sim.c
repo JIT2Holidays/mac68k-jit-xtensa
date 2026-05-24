@@ -221,6 +221,12 @@ static void step(xt_sim *s) {
             }
         }
 
+        /* Mul32 option: MULL (op1=2, op2=8). Low 32 of the product. */
+        if (op1 == 0x2 && op2 == 0x8) {
+            s->a[r] = s->a[sr] * s->a[t];
+            return;
+        }
+
         /* Shifts (canonical encoding):
          *   SLLI: op1=1, bits 21..23 = 0, sa_hi1 at bit 20.
          *         → op2 ∈ {0, 1}; sa1 = (op2 << 4) | t; sa = 32 - sa1.

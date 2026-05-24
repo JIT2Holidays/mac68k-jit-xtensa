@@ -52,6 +52,12 @@ u32 xt_and(xt_emit *e, u8 ar, u8 as, u8 at);
 u32 xt_or (xt_emit *e, u8 ar, u8 as, u8 at);
 u32 xt_xor(xt_emit *e, u8 ar, u8 as, u8 at);
 
+/* MULL — 32 × 32 → low 32 multiply. Xtensa Mul32 option; present on
+ * ESP32-S3 LX7. Sign-agnostic at this width: the low 32 bits of the
+ * product are the same for signed and unsigned operands (it's the
+ * high half that differs, and we don't read it). */
+u32 xt_mull(xt_emit *e, u8 ar, u8 as, u8 at);
+
 /* Shifts (immediate). LX7 has SLLI/SRLI/SRAI. */
 u32 xt_slli(xt_emit *e, u8 ar, u8 as, u8 sa);       /* sa = 1..31 */
 u32 xt_srli(xt_emit *e, u8 ar, u8 as, u8 sa);       /* sa = 0..15  */

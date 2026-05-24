@@ -113,6 +113,9 @@ u32 xt_addx2(xt_emit *e, u8 ar, u8 as, u8 at) { return emit24(e, enc_rrr(0x9, 0,
 u32 xt_addx4(xt_emit *e, u8 ar, u8 as, u8 at) { return emit24(e, enc_rrr(0xA, 0, ar, as, at)); }
 u32 xt_sub(xt_emit *e, u8 ar, u8 as, u8 at) { return emit24(e, enc_rrr(0xC, 0, ar, as, at)); }
 u32 xt_mov(xt_emit *e, u8 ar, u8 as) { return xt_or(e, ar, as, as); }
+/* MULL: Xtensa Mul32-option encoding op0=0, op1=0x2, op2=0x8.
+ * ar = (as * at) & 0xFFFFFFFF — low 32 bits of the product. */
+u32 xt_mull(xt_emit *e, u8 ar, u8 as, u8 at) { return emit24(e, enc_rrr(0x8, 0x2, ar, as, at)); }
 
 /* --- RRI8 family. op0=2; r selects op. --- */
 /*  L8UI  r=0   S8I  r=4   L16UI r=1   S16I r=5
