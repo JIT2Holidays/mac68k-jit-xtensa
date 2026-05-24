@@ -1,14 +1,42 @@
 # Status
 
-## Where things stand right now (post-M6.126)
+## Where things stand right now (post-M6.128)
 
 | Engine | lx7 / cyc | × interp baseline |
 |--------|----------:|------------------:|
 | **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.169** | **5.53 ×** ✅ |
 | **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.197** | **5.40 ×** ✅ |
-| **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.668** | **3.87 ×** 🎯 |
-| **Boot** (Mac Plus ROM, 5 M cycles, PC=`0x40032C` deterministic)    | **2.216** | **2.92 ×** |
+| **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.667** | **3.87 ×** 🎯 |
+| **Boot** (Mac Plus ROM, 5 M cycles, PC=`0x40032C` deterministic)    | **2.214** | **2.92 ×** |
 | **Boot** (Mac Plus ROM, 300 K cycles, PC=`0x40032C` deterministic)  | **1.975** | **2.99 ×** |
+
+## M6.128 — inline JSR (An) and JMP (An) — boot 100 M real_helpers −1047
+
+Two new block-terminator inline arms for the dispatch-table-style
+indirect-call/jump patterns common in Mac OS Toolbox dispatch:
+
+* **JSR (An)** (`(w & 0xFFF8) == 0x4E90`) — push return PC, cpu->pc = An.
+  Length 2; cycles 20 (m68k_step base 4 + handler 16). Boot 780 hits.
+* **JMP (An)** (`(w & 0xFFF8) == 0x4ED0`) — cpu->pc = An. No SP.
+  Length 2; cycles 12.
+
+Both are block terminators with chain-preservation benefit.
+
+**Triple-diff:** ctest 7/7, `--diff-jit-trace` clean.
+
+**Perf:**
+
+| Workload | M6.127 | **M6.128** | Δ |
+|----------|------:|----------:|--:|
+| Bench (100 M)       | 1.197 | **1.197** | helpers −104 |
+| Boot 5 M det        | 2.214 | **2.214** | helpers −5 |
+| **Boot 100 M**      | 1.668 | **1.667** | helpers −1047 |
+
+Cumulative M6.84 → M6.128:
+* Bench (20 M): 1.257 → **1.169** (−7.0 %)
+* Bench (100 M): 1.396 → **1.197** (−14.3 %)
+* Boot 5 M det:   2.471 → **2.214** (−10.4 %)
+* Boot 100 M:     1.734 → **1.667** (**−3.9 %**)
 
 ## M6.126 — m68k_decode_at length fix for ORI/ANDI/EORI #imm,CCR/SR — boot 100 M 1.699 → 1.668 lx7/cyc (−1.83 %) + real_helpers 679 K → 217 K 🎯
 
