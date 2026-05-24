@@ -412,6 +412,34 @@ real_lx7_per_cyc 1.739 → ~1.63 (real_helpers 230 K → ~57 K).
 Not implemented this iteration — left as a future task. M6.59 added
 the diagnostic plumbing to keep finding cases like this.
 
+**M6.60 — attempt to short-circuit bogus PCs backfired (reverted).**
+Tried gating `get_block` to return NULL on `(pc & 1) || (pc & 0xFF000000)`,
+expecting the dispatcher's interp_fallback path to single-step
+the wander region cheaply (avoiding the JIT-block-compile overhead).
+Boot real_lx7_per_cyc *worsened* 1.739 → 4.931 (30× more m68k_step
+calls, 230 K → 6.4 M). Root cause: the dispatcher's per-iteration
+`mac_mem_tick` + `m68k_poll_interrupts` see VIA edges at much finer
+granularity in interp_fallback mode, which routes the boot down a
+*third*, even-longer-pathological trajectory.
+
+Take-away: the boot's host-perf number (1.739 lx7/cyc) is highly
+path-dependent — it measures the trajectory chosen by the
+combination of (JIT semantics + VIA tick granularity), not just JIT
+efficiency. ANY change that alters VIA-tick granularity will change
+the boot path, and trajectories vary unpredictably in cost.
+
+This means the "6 % boot perf opportunity" identified in M6.59 isn't
+extractable by tweaking the JIT alone — it would require making JIT
+timing exactly match interp timing (tick mac_mem per instruction
+inside blocks, far more expensive than the savings) or implementing
+real-hardware-faithful address-error traps and trusting the Mac OS
+handler to recover gracefully (risk: could halt boot).
+
+For ongoing perf work, **the boot host metric must be treated as an
+indicator, not a clean optimization target.** The bench number
+(1.279, the curated Speedometer snapshot) is the cleaner signal —
+it runs the same opcodes regardless of VIA timing.
+
 **Cross-block register caching.** The other unimplemented item.
 M6.10's regcache caches D/A regs *within* a block (loaded at
 prologue, flushed at epilogue). Extending across blocks would
