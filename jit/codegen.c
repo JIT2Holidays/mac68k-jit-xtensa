@@ -5844,6 +5844,56 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             }
             emit_advance(&e, 2, 4);
             inline_ops++; done = true;
+        } else if (top == 0x4 && ((w >> 8) & 0xF) == 0x2
+                   && (szf == 0 || szf == 1 || szf == 2) && mode == 0) {
+            /* M6.139 — CLR.B/W/L Dn. Bench 5M's 0x4240 (CLR.W D0, 85 hits)
+             * is the most common; CLR.B and CLR.L Dn for completeness.
+             * Semantics: clear the low size bits of Dn (preserve the
+             * higher bits for .B/.W; .L zeros the whole register).
+             * CCR: Z=1, N=V=C=0, X preserved.
+             * Length 2; cycles 8 (m68k_step base 4 + handler 4 — m68k_interp
+             * uses a flat 4 for all sizes, matched here). */
+            int dn = w & 7;
+            int size_bits = (szf == 0) ? 8 : (szf == 1) ? 16 : 32;
+            int dn_xt = cache_lookup(&rc, G_D(dn));
+            if (size_bits == 32) {
+                /* CLR.L: dst = 0. */
+                if (dn_xt >= 0) {
+                    xt_movi(&e, (u8)dn_xt, 0);
+                    for (int s = 0; s < rc.active; s++)
+                        if (rc.guest[s] == (u8)G_D(dn)) { rc.dirty |= (u16)(1u << s); break; }
+                } else {
+                    xt_movi(&e, 8, 0);
+                    emit_write_g(&e, &rc, G_D(dn), 8);
+                }
+            } else {
+                /* CLR.B/W: dst = (src & ~size_mask). Use srli/slli to clear
+                 * the low size_bits and preserve the upper bits. */
+                u8 src_reg = (dn_xt >= 0) ? (u8)dn_xt : 8;
+                if (dn_xt < 0) emit_read_g(&e, &rc, G_D(dn), 8);
+                xt_srli(&e, 9, src_reg, size_bits);
+                xt_slli(&e, 9, 9, size_bits);
+                u8 dst_reg = (dn_xt >= 0) ? (u8)dn_xt : 8;
+                if (dst_reg != 9) xt_mov(&e, dst_reg, 9);
+                if (dn_xt >= 0) {
+                    for (int s = 0; s < rc.active; s++)
+                        if (rc.guest[s] == (u8)G_D(dn)) { rc.dirty |= (u16)(1u << s); break; }
+                } else {
+                    emit_write_g(&e, &rc, G_D(dn), 9);
+                }
+            }
+            if (!flags_dead[i]) {
+                /* CCR: clear N/Z/V/C (bits 0..3), preserve X (bit 4),
+                 * then set Z (bit 2). */
+                xt_movi(&e, 12, -16);
+                xt_and (&e, R_SR, R_SR, 12);
+                xt_movi(&e, 12, 0x04);
+                xt_or  (&e, R_SR, R_SR, 12);
+                g_sr_dirty = true;
+                sext_memo_invalidate();
+            }
+            emit_advance(&e, 2, 8);
+            inline_ops++; done = true;
         } else if (top == 0x4 && ((w >> 8) & 0xF) == 0xA && szf == 1 && mode == 0) {
             /* M6.138 — TST.W Dn — boot 5 M det's biggest helper (4a45 =
              * TST.W D5 at 38 hits / 5 M cyc, ≈41 % of all det-window
