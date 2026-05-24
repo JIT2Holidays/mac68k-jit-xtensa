@@ -1,5 +1,40 @@
 # Status
 
+## M6.103 — MOVEA.L (An),Am inline
+
+Adds the mode 2 ((An)) source variant to the MOVEA.L family — sibling
+of M6.75's (d16,An), M6.91's (An)+ and M6.101's MOVE.L (An),Dn but
+writing the 32-bit result to Am instead of Dn. MOVEA never touches
+CCR so no flag emit.
+
+Boot's 0x2050 (MOVEA.L (A0),A0) at 390 helpers / 100 M cyc — a
+common pattern in ROM-table pointer-chasing where the same An is
+used as both src and dst.
+
+**Same-An edge case:** for `MOVEA.L (A0),A0` the read of (A0) happens
+through a8 = A0 (loaded into scratch), then 4 bytes read from (a8),
+then result stored into A0's cache slot. The order naturally preserves
+the original A0 for the read before overwriting.
+
+**Triple-diff workflow (full SOP):**
+
+* ctest: 7/7
+* `--diff-jit-trace`: clean through 11 038 cycles
+* Boot 300 K / 5 M det: unchanged
+* **Boot 100 M**: 186 390 → **185 999** helpers (−391, matches the
+  0x2050 histo count); lx7/cyc unchanged at resolution; no cycle-drift
+  trap (per memory/move-cycle-drift-gotcha.md SOP)
+
+**Perf:**
+
+| Workload | M6.102 | **M6.103** | Δ |
+|----------|------:|----------:|--:|
+| Bench (20 M)     | 1.179 | **1.178** | **−0.08 %** lx7 |
+| Bench (100 M)    | 1.314 | **1.314** | unchanged |
+| Boot @ 100 M     | 1.717 | **1.717** | unchanged |
+
+Bench 20 M crosses **5.49 × interp**.
+
 ## M6.102 — DBEQ inline (bench 100 M −1.1 %)
 
 Extends the M6.38 DBcc inline (which previously handled cc=1 (DBF) and
@@ -850,11 +885,11 @@ them each iteration.
    intermediate register writeback. See M6.85 below for the first
    fusion lever in this class.
 
-## Where things stand right now (post-M6.102)
+## Where things stand right now (post-M6.103)
 
 | Engine | lx7 / cyc | × interp baseline |
 |--------|----------:|------------------:|
-| **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.179** | **5.48 ×** ✅ |
+| **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.178** | **5.49 ×** ✅ |
 | **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.314** | **4.92 ×** |
 | **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.717** | **3.44 ×** |
 | **Boot** (Mac Plus ROM, 5 M cycles, PC=`0x40032C` deterministic)    | **2.236** | **2.64 ×** |

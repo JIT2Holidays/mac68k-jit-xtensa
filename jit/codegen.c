@@ -2457,6 +2457,60 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + jlan_pos + 2] = (u8)(jw_lan >> 16);
 
             inline_ops++; done = true;
+        } else if (top == 0x2 && ((w >> 6) & 7) == 1 && mode == 2) {
+            /* M6.103 — MOVEA.L (An),Am — boot-warm 0x2050 (MOVEA.L (A0),A0)
+             * at 390 helpers / 100 M cyc. Sibling of M6.101's
+             * MOVE.L (An),Dn but writes 32-bit result to Am (MOVEA never
+             * touches CCR). Same RAM-only bounds; ROM-source variant
+             * could be added later via the M6.76 unified-bounds shape.
+             *
+             * Length 2, cycles 8. Same-An edge case (e.g. 0x2050 reads
+             * from A0 and writes to A0): the read happens before the
+             * write, so order is preserved naturally — emit_read_g
+             * reads A0 into a8, then we read 4 bytes from (a8), then
+             * emit_write_g writes the result back to A0's cache slot. */
+            int dst_am = (w >> 9) & 7;
+            int src_an = w & 7;
+
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(src_an), 8);
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_maan = 2, op_cyc_maan = 8;
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_maan, op_cyc_maan)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_maan, op_cyc_maan);
+            u32 jmaan_pos = e.len;
+            xt_j    (&e, 4);
+
+            /* Fast path: read 4 BE bytes into a10 (.L value). */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);
+            xt_l8ui (&e, 11, 9, 0);
+            xt_l8ui (&e, 12, 9, 1);
+            xt_slli (&e, 10, 11, 24);
+            xt_slli (&e, 12, 12, 16);
+            xt_or   (&e, 10, 10, 12);
+            xt_l8ui (&e, 11, 9, 2);
+            xt_l8ui (&e, 12, 9, 3);
+            xt_slli (&e, 11, 11, 8);
+            xt_or   (&e, 10, 10, 11);
+            xt_or   (&e, 10, 10, 12);                    /* a10 = .L value */
+            emit_write_g(&e, &rc, G_A(dst_am), 10);
+            /* MOVEA — no flags. */
+            emit_advance(&e, op_pc_maan, op_cyc_maan);
+
+            u32 here_maan = e.len;
+            i32 jo_maan = (i32)(here_maan - jmaan_pos) - 4;
+            u32 jw_maan = ((u32)((u32)jo_maan & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jmaan_pos    ] = (u8)jw_maan;
+            base[entry_off + jmaan_pos + 1] = (u8)(jw_maan >> 8);
+            base[entry_off + jmaan_pos + 2] = (u8)(jw_maan >> 16);
+
+            inline_ops++; done = true;
         } else if (top == 0x2 && ((w >> 6) & 7) == 0 && mode == 3) {
             /* MOVE.L (An)+,Dn — common pair to the 0x20C1 store pattern.
              * Bounds-check the An address; on fast path read 4 BE bytes
