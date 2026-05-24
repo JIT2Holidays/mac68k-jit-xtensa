@@ -2706,6 +2706,71 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             int data = (w >> 9) & 7; if (data == 0) data = 8;
             emit_addq_w_dn(&e, w & 7, data, (w >> 8) & 1, flags_dead[i], &rc);
             inline_ops++; done = true;
+        } else if (top == 0x5 && szf == 0 && mode == 0) {
+            /* M6.160 — ADDQ.B / SUBQ.B #imm,Dn. Pure register-op,
+             * sibling of the ADDQ.W arm above.
+             *
+             * Bench 0x5205 (ADDQ.B #1,D5) at 37 hits / 100M cyc + a
+             * handful of other ADDQ.B/SUBQ.B variants. Boot 100M shows
+             * 0x5801 (ADDQ.B #4,D1) at 40 hits / pc=0x40fca6 in the
+             * real-code ROM trap area.
+             *
+             * An earlier M6.142 ADDQ.B attempt was reverted on a +2.2%
+             * boot 100M regression. That predated the M6.149+ era which
+             * established that pure-register-op extensions are safe
+             * regardless of boot fire count. We verify empirically.
+             *
+             * Implementation: shift-to-high-8 pattern (analogue of the
+             * .W shift-to-high-16 in emit_addq_w_dn). For .B operands at
+             * bits 24-31, the carry-out from bit 31 IS the .B carry,
+             * the N flag is bit 31 of result (= MSB of .B result),
+             * and V derives correctly from MSB-sign XOR. So
+             * emit_addsub_flags_long can be used unchanged on the
+             * shifted values.
+             *
+             * Length 2; cycles 8 (m68k_step base 4 + handler 4 — flat
+             * per m68k_interp's ADDQ/SUBQ Dn path at line 1239). */
+            int data = (w >> 9) & 7; if (data == 0) data = 8;
+            int dn = w & 7;
+            bool is_sub = (w >> 8) & 1;
+
+            if (flags_dead[i]) {
+                /* Lean value-only path. */
+                u8 src_reg = emit_read_g_in(&e, &rc, G_D(dn), 8);
+                int xt_dst = cache_lookup(&rc, G_D(dn));
+                u8 dst_reg = (xt_dst >= 0) ? (u8)xt_dst : 8;
+
+                xt_extui(&e, 9, src_reg, 0, 7);                  /* a9 = Dn.B */
+                xt_addi (&e, 9, 9, is_sub ? -data : data);
+                xt_extui(&e, 9, 9, 0, 7);                         /* mask to 8 b */
+                xt_srli (&e, 10, src_reg, 8);
+                xt_slli (&e, 10, 10, 8);                          /* a10 = Dn & ~0xFF */
+                xt_or   (&e, dst_reg, 10, 9);
+
+                if (xt_dst >= 0) {
+                    for (int s = 0; s < rc.active; s++)
+                        if (rc.guest[s] == (u8)G_D(dn)) { rc.dirty |= (u16)(1u << s); break; }
+                } else {
+                    xt_s32i(&e, dst_reg, R_CPU, OFF_D(dn));
+                }
+            } else {
+                /* Full-CCR path: shift-to-high-8 mirror of emit_addq_w_dn. */
+                emit_read_g(&e, &rc, G_D(dn), 11);
+                xt_slli(&e, 9, 11, 24);              /* a9 = Dn.B << 24 */
+                xt_movi(&e, 8, data);
+                xt_slli(&e, 8, 8, 24);                /* a8 = imm << 24 */
+                if (is_sub) xt_sub(&e, 10, 9, 8);
+                else        xt_add(&e, 10, 9, 8);
+                /* Merge result.B into Dn (preserve high 24 bits). */
+                xt_srli(&e, 12, 10, 24);              /* a12 = result.B in low 8 */
+                xt_srli(&e, 11, 11, 8);
+                xt_slli(&e, 11, 11, 8);                /* a11 = Dn & ~0xFF */
+                xt_or  (&e, 11, 11, 12);
+                emit_write_g(&e, &rc, G_D(dn), 11);
+                emit_addsub_flags_long(&e, is_sub, false);
+            }
+            emit_advance(&e, 2, 8);
+            inline_ops++; done = true;
         } else if (top == 0x3 && ((w >> 6) & 7) == 0 && mode == 0) {
             /* MOVE.W Dm,Dn — aggressive (held back under --diff-jit).
              *
