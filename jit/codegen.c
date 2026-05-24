@@ -5844,6 +5844,24 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             }
             emit_advance(&e, 2, 4);
             inline_ops++; done = true;
+        } else if (top == 0x4 && ((w >> 8) & 0xF) == 0xA && szf == 1 && mode == 0) {
+            /* M6.138 — TST.W Dn — boot 5 M det's biggest helper (4a45 =
+             * TST.W D5 at 38 hits / 5 M cyc, ≈41 % of all det-window
+             * helpers). N from bit 15, Z from (Dn & 0xFFFF) == 0,
+             * V=C=0, X preserved. Length 2, 4 cycles. Sibling of the
+             * existing TST.B / TST.L Dn arms. */
+            int dn = w & 7;
+            u8 dn_reg = emit_read_g_in(&e, &rc, G_D(dn), 9);
+            if (!flags_dead[i]) {
+                /* Shift Dn.W's bit 15 to bit 31 for emit_logic_flags;
+                 * the shift-left also zeroes the high 16, so the Z=0
+                 * test on the shifted value collapses to Dn & 0xFFFF
+                 * == 0 exactly. */
+                xt_slli(&e, 8, dn_reg, 16);
+                emit_logic_flags(&e, 8);
+            }
+            emit_advance(&e, 2, 4);
+            inline_ops++; done = true;
         } else if (top == 0x4 && ((w >> 8) & 0xF) == 0xA && szf == 2 && mode == 0) {
             /* TST.L Dn — bench-warm 0x4A80/0x4A81 (~4 K). N/Z from Dn,
              * V=C=0, X preserved.
