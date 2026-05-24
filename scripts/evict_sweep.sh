@@ -15,7 +15,7 @@ BOOT_CYCLES=100000000
 
 # Arena sizes in KB: doubling sequence covering "much too small" to
 # "comfortably fits everything".
-SIZES="16 32 64 128 256 512 1024 2048 4096"
+SIZES="1 2 4 8 16 32 64 128 256 512 1024 2048 4096"
 POLICIES="none lru fifo"
 
 echo "workload,policy,arena_kb,lx7_per_cyc,real_lx7_per_cyc,blocks,interp_fallbacks,smc_inv,resets"
