@@ -768,6 +768,82 @@ default if any prefetch is enabled. `static` remains available for
 A/B comparison but is strictly dominated by `chain` on the "no
 wasted compiles" axis.
 
+**M6.73 — batch of hot-opcode native emits (helper → inline).**
+Targeted seven 68k opcodes that the `JIT_HELPER_HISTO` build flagged
+as bench- or boot-warm but were still falling through to `m68k_step`:
+
+| Opcode | Form | 20 M-cyc bench count |
+|--------|------|--------------------:|
+| `0x4258` | `CLR.W (A0)+` (memset-zero loop body) | 5003 (one-shot) |
+| `0x4480-7` | `NEG.L Dn` | ~1500 |
+| `0x303C+reg<<9` | `MOVE.W #imm16,Dn` | ~1000 |
+| `0x3040+ra<<9+rd` | `MOVEA.W Dn,An` (sign-extend) | ~1000 |
+| `0x3B40+ra<<9+rd` | `MOVE.W Dn,-(An)` | ~1500 |
+| `0x202F+rd<<9+ra` | `MOVE.L (d16,An),Dn` (stack-frame .L read) | ~1000 |
+| `0x2F41+rd<<9+ra` | `MOVE.L Dn|Am,(d16,An)` (stack-frame .L write) | ~1000 |
+
+Each emit follows the existing fast-path-with-bounds-check shape
+(beqz over a helper bridge → fast inline write or read of BE bytes
+with An post-increment / pre-decrement / d16 displacement).
+
+**Bug found and fixed: `xt_movi` only encodes signed 12-bit (-2048..
++2047).** First implementation of `MOVE.W #imm16,Dn` used
+`xt_movi(a10, (i32)(i16)imm)` for the immediate, which silently
+wrapped any imm ∉ [-2048,2047] to its low 12 bits — corrupting Dn.
+The buggy emit passed the 11 K-cycle `diff_jit_bench_lockstep` ctest
+(its imm16 stream stays small), but boot's init code with
+`MOVE.W #0xXXXX, Dn` for various Toolbox masks hit it immediately.
+
+Diagnosed by **boot-path bisection at 300 K cycles (pre-VBL,
+deterministic):** enabled emits one at a time, watched for boot's
+final PC to differ from baseline. The buggy emit drove the boot to
+PC=`0x4002C2` (helpers=122 — far too few) instead of baseline's
+PC=`0x40032C` (helpers=1195). Fix: replace `xt_movi` with
+`emit_load_imm(dst, tmp, (u32)imm)`, which falls back to
+`emit_load_imm32`'s multi-op build for values out of the 12-bit
+range.
+
+**Per-emit triple-differential workflow that found the bug:**
+
+1. Wrote each emit.
+2. `ctest` — 7/7 (passes the 11 K-cycle `diff_jit_bench_lockstep`).
+3. Boot @ 300 K cycles (deterministic window pre-first-VBL): the
+   final PC, helper count, and `jit_cost` should match the previous
+   commit exactly. Any difference is a register-corruption
+   correctness bug, surfaced before VIA path-dependence enters.
+
+This 3rd step was the new lesson — ctest's 11 K bench window doesn't
+exercise `MOVE.W #imm16,Dn` with large immediates (the snapshot's
+imm stream stays small there); the **deterministic boot 300 K window**
+does. It's now part of the recommended workflow alongside `ctest`
+and `--diff-jit-trace`.
+
+**Perf delta (post-fix, all seven emits enabled):**
+
+| Workload | Pre-M6.73 | M6.73 | Δ |
+|----------|----------:|------:|--:|
+| Boot @ 5 M cyc (deterministic; PC=`0x40032C` both)   | 25279 helpers, 2.604 lx7/cyc | 25240 helpers, 2.603 lx7/cyc | −39 helpers (−0.04 % lx7) |
+| Boot @ 100 M cyc (path-dependent past first VBL)     | ~225 K helpers, 1.735 lx7/cyc | ~223 K helpers, 1.734 lx7/cyc | −2 K helpers (negligible lx7) |
+| Bench @ 11 K cyc (deterministic; pre-divergence)     | 405 helpers, 3.959 lx7/cyc | 405 helpers, 3.959 lx7/cyc | identical (emits don't fire in this window) |
+| Bench @ 5 M / 100 M cyc                              | path-dependent | path-dependent | not measurable — VIA-tick granularity (M6.66) |
+
+The per-emit gain on real, deterministic workloads is small because
+boot's hot opcodes don't include these forms heavily — they're
+**bench-hot** by the histogram, but **bench is path-dependent past
+cycle 11 898** so the steady-state perf number can't be read
+directly. The correct outcome here is: emits are inline-correct
+(triple-diff passes + boot-path matches), bench helpers go down by
+the per-call count when the emit fires, and the ESP32 wall-clock
+will reflect the inline savings on real hardware.
+
+**Lessons recorded:** `memory/triple-differential.md` already
+existed; `memory/xtensa-movi-range.md` added to catch the
+`xt_movi` 12-bit pitfall before it ships again. Two new emits
+(NEG.L Dn, CLR.W (An)+) are also templates for future similar
+helper-eviction work.
+
+ctest: **7 / 7** pass.
+
 Alternative real-software pair if synthetic benchmarks aren't the
 goal: **Dark Castle** (VIA-timer-driven sound + raster bit-banging
 — tests M3's "good enough to pace 60 Hz VBL, not instruction-cycle-

@@ -1722,6 +1722,42 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             }
             emit_advance(&e, 2, 8);
             inline_ops++; done = true;
+        } else if (top == 0x3 && ((w >> 6) & 7) == 0 && mode == 7 && (w & 7) == 4) {
+            /* MOVE.W #imm16,Dn — bench-warm 0x303C+reg<<9 at ~1000 helpers
+             * in 20M cyc (M6.73). Replace low 16 of Dn with imm16, full
+             * MOVE-family flags (N from imm.W, Z if imm==0, V=C=0, X kept).
+             *
+             * IMPORTANT: xt_movi only encodes -2048..2047. For arbitrary
+             * imm16 we MUST go via emit_load_imm (which falls back to a
+             * multi-op build for values out of the 12-bit range). The
+             * silent wrap of xt_movi for |imm| > 2047 corrupted Dn during
+             * boot and was caught by boot-path divergence vs the interp. */
+            int dn = (w >> 9) & 7;
+            u16 imm = mac_read16(cpu->mem, op_pc[i] + 2);
+            emit_read_g(&e, &rc, G_D(dn), 11);     /* a11 = old Dn */
+            xt_srli (&e, 11, 11, 16);
+            xt_slli (&e, 11, 11, 16);               /* keep high 16, clear low */
+            emit_load_imm(&e, 10, 12, (u32)imm);    /* a10 = imm (zero-ext) */
+            xt_or   (&e, 11, 11, 10);
+            emit_write_g(&e, &rc, G_D(dn), 11);
+            if (!flags_dead[i]) {
+                xt_slli (&e, 8, 10, 16);            /* sign of .W in bit 31 */
+                emit_logic_flags(&e, 8);
+            }
+            emit_advance(&e, 4, 8);                 /* length 4 (op + imm16) */
+            inline_ops++; done = true;
+        } else if (top == 0x3 && ((w >> 6) & 7) == 1 && mode == 0) {
+            /* MOVEA.W Dn,An — bench-warm 0x3040+ at ~1000 helpers in 20M
+             * (M6.73). Sign-extend Dn's low .W to 32 and store in An;
+             * MOVEA never touches flags. */
+            int an = (w >> 9) & 7;
+            int dn = w & 7;
+            emit_read_g(&e, &rc, G_D(dn), 8);       /* a8 = Dn */
+            xt_slli (&e, 9, 8, 16);                  /* a9 = Dn.W << 16 */
+            xt_srai (&e, 9, 9, 16);                  /* a9 = sign-ext .W */
+            emit_write_g(&e, &rc, G_A(an), 9);
+            emit_advance(&e, 2, 8);
+            inline_ops++; done = true;
         } else if (top == 0x3 && ((w >> 6) & 7) == 2 && mode == 2) {
             /* MOVE.W (As),(Ad) — bench-hot 0x3692 (~3.5 %).
              * Combined bounds: (src|dst) & RAM_BOUNDS == 0 iff both
@@ -1969,6 +2005,107 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + jlp_pos + 2] = (u8)(jww >> 16);
 
             inline_ops++; done = true;
+        } else if (top == 0x2 && ((w >> 6) & 7) == 0 && mode == 5) {
+            /* MOVE.L (d16,An),Dn — bench-warm 0x202F+ at ~1000 helpers in
+             * 20M cyc (M6.73). Stack-frame .L read pattern. EA = An +
+             * sext16(d16); read 4 BE bytes into Dn; MOVE-family flags. */
+            int dn = (w >> 9) & 7;
+            int an = w & 7;
+            u16 ext = mac_read16(cpu->mem, op_pc[i] + 2);
+            i32 d16 = (i16)ext;
+
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(an), 8);                /* a8 = An */
+            if (d16 >= -128 && d16 <= 127) {
+                xt_addi(&e, 8, 8, d16);
+            } else {
+                emit_load_imm(&e, 11, 12, (u32)d16);
+                xt_add(&e, 8, 8, 11);
+            }
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_dr = 4, op_cyc_dr = 8;
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_dr, op_cyc_dr)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_dr, op_cyc_dr);
+            u32 jdr_pos = e.len;
+            xt_j    (&e, 4);
+            /* Fast path: 4 BE byte loads. */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);                            /* a9 = ram + addr */
+            xt_l8ui (&e, 11, 9, 0);
+            xt_l8ui (&e, 12, 9, 1);
+            xt_slli (&e, 10, 11, 24);
+            xt_slli (&e, 12, 12, 16);
+            xt_or   (&e, 10, 10, 12);
+            xt_l8ui (&e, 11, 9, 2);
+            xt_l8ui (&e, 12, 9, 3);
+            xt_slli (&e, 11, 11, 8);
+            xt_or   (&e, 10, 10, 11);
+            xt_or   (&e, 10, 10, 12);                         /* a10 = .L */
+            emit_write_g(&e, &rc, G_D(dn), 10);
+            if (!flags_dead[i]) emit_logic_flags(&e, 10);
+            emit_advance(&e, op_pc_dr, op_cyc_dr);
+
+            u32 here_dr = e.len;
+            i32 jo_dr = (i32)(here_dr - jdr_pos) - 4;
+            u32 jw_dr = ((u32)((u32)jo_dr & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jdr_pos    ] = (u8)jw_dr;
+            base[entry_off + jdr_pos + 1] = (u8)(jw_dr >> 8);
+            base[entry_off + jdr_pos + 2] = (u8)(jw_dr >> 16);
+
+            inline_ops++; done = true;
+        } else if (top == 0x2 && ((w >> 6) & 7) == 5 && (mode == 0 || mode == 1)) {
+            /* MOVE.L Dn|Am,(d16,An) — bench-warm 0x2F41+ at ~1000 helpers in
+             * 20M cyc (M6.73). Stack-frame .L write. EA = An + sext16(d16);
+             * write 4 BE bytes; MOVE-family flags. */
+            int dst_an = (w >> 9) & 7;
+            int dm = w & 7;
+            int g_src = (mode == 1) ? G_A(dm) : G_D(dm);
+            u16 ext = mac_read16(cpu->mem, op_pc[i] + 2);
+            i32 d16 = (i16)ext;
+
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(dst_an), 8);             /* a8 = An */
+            if (d16 >= -128 && d16 <= 127) {
+                xt_addi(&e, 8, 8, d16);
+            } else {
+                emit_load_imm(&e, 11, 12, (u32)d16);
+                xt_add(&e, 8, 8, 11);
+            }
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_dw = 4, op_cyc_dw = 8;
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_dw, op_cyc_dw)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_dw, op_cyc_dw);
+            u32 jdw_pos = e.len;
+            xt_j    (&e, 4);
+            /* Fast path: 4 BE byte stores. */
+            emit_read_g(&e, &rc, g_src, 10);                  /* a10 = src .L */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);
+            xt_extui(&e, 11, 10, 24, 7); xt_s8i(&e, 11, 9, 0);
+            xt_extui(&e, 11, 10, 16, 7); xt_s8i(&e, 11, 9, 1);
+            xt_extui(&e, 11, 10,  8, 7); xt_s8i(&e, 11, 9, 2);
+            xt_extui(&e, 11, 10,  0, 7); xt_s8i(&e, 11, 9, 3);
+            if (!flags_dead[i]) emit_logic_flags(&e, 10);
+            emit_advance(&e, op_pc_dw, op_cyc_dw);
+
+            u32 here_dw = e.len;
+            i32 jo_dw = (i32)(here_dw - jdw_pos) - 4;
+            u32 jw_dw = ((u32)((u32)jo_dw & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jdw_pos    ] = (u8)jw_dw;
+            base[entry_off + jdw_pos + 1] = (u8)(jw_dw >> 8);
+            base[entry_off + jdw_pos + 2] = (u8)(jw_dw >> 16);
+
+            inline_ops++; done = true;
         } else if (top == 0x3 && ((w >> 6) & 7) == 2 && mode == 0) {
             /* MOVE.W Dn,(An) — bench-hot 0x3484 (~3.5 %).
              *
@@ -2018,6 +2155,107 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + jw_pos    ] = (u8)jww;
             base[entry_off + jw_pos + 1] = (u8)(jww >> 8);
             base[entry_off + jw_pos + 2] = (u8)(jww >> 16);
+
+            inline_ops++; done = true;
+        } else if (top == 0x3 && ((w >> 6) & 7) == 4 && mode == 0) {
+            /* MOVE.W Dn,-(An) — bench-warm 0x3B40+ at ~1500 helpers in 20M
+             * cyc (M6.73). Pre-decrement An by 2, write Dn's low 16 bits BE
+             * at the new address, MOVE-family flags. Mirrors MOVE.W Dn,(An)
+             * with the pre-dec. */
+            int an = (w >> 9) & 7;
+            int dn = w & 7;
+
+            emit_advance_flush(&e);                  /* before An read */
+            emit_read_g(&e, &rc, G_A(an), 8);
+            xt_addi(&e, 8, 8, -2);                   /* pre-decrement */
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_pdw = 2, op_cyc_pdw = 8;
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_pdw, op_cyc_pdw)));
+
+            /* Helper. */
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_pdw, op_cyc_pdw);
+            u32 jpdw_pos = e.len;
+            xt_j    (&e, 4);
+
+            /* Fast path: write .W BE bytes, commit pre-decremented An. */
+            emit_read_g(&e, &rc, G_D(dn), 10);       /* a10 = Dn */
+            xt_extui(&e, 11, 10, 8, 7);              /* a11 = .W high */
+            xt_extui(&e, 12, 10, 0, 7);              /* a12 = .W low  */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);
+            xt_s8i  (&e, 11, 9, 0);
+            xt_s8i  (&e, 12, 9, 1);
+            emit_write_g(&e, &rc, G_A(an), 8);       /* commit -2 An */
+            if (!flags_dead[i]) {
+                xt_slli (&e, 8, 10, 16);
+                emit_logic_flags(&e, 8);
+            }
+            emit_advance(&e, op_pc_pdw, op_cyc_pdw);
+
+            u32 here_pdw = e.len;
+            i32 jo_pdw = (i32)(here_pdw - jpdw_pos) - 4;
+            u32 jw_pdw = ((u32)((u32)jo_pdw & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jpdw_pos    ] = (u8)jw_pdw;
+            base[entry_off + jpdw_pos + 1] = (u8)(jw_pdw >> 8);
+            base[entry_off + jpdw_pos + 2] = (u8)(jw_pdw >> 16);
+
+            inline_ops++; done = true;
+        } else if (top == 0x4 && ((w >> 8) & 0xF) == 0x2 && szf == 1 && mode == 3) {
+            /* CLR.W (An)+ — bench-hot 0x4258 at ~23 % of all helpers (M6.73).
+             * Speedometer runs a memset-zero loop body that hammers this.
+             * Same shape as MOVE.W Dn,(An) but the value is a hard-coded 0,
+             * with a 2-byte post-increment on An, and a CLR-specific flag
+             * emit (Z=1, N=V=C=0, X preserved). */
+            int an = w & 7;
+
+            emit_advance_flush(&e);                  /* before An read */
+            emit_read_g(&e, &rc, G_A(an), 8);
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);   /* before conditional helper */
+            i32 op_pc_clr = 2, op_cyc_clr = 8;
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_clr, op_cyc_clr)));
+
+            /* Helper. */
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_clr, op_cyc_clr);
+            u32 jclr_pos = e.len;
+            xt_j    (&e, 4);
+
+            /* Fast path: write two zero bytes at [ram_base + An], An += 2. */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);
+            xt_movi (&e, 11, 0);
+            xt_s8i  (&e, 11, 9, 0);
+            xt_s8i  (&e, 11, 9, 1);
+            /* Post-increment An by 2. a8 still holds pre-incr An. */
+            xt_addi (&e, 8, 8, 2);
+            emit_write_g(&e, &rc, G_A(an), 8);
+            if (!flags_dead[i]) {
+                /* CLR flags: clear X-preserve mask (-16 keeps bit 4 and up),
+                 * then OR in Z=0x04. Cheaper than emit_logic_flags(zero). */
+                xt_movi (&e, 12, -16);
+                xt_and  (&e, R_SR, R_SR, 12);
+                xt_movi (&e, 12, 0x04);
+                xt_or   (&e, R_SR, R_SR, 12);
+                g_sr_dirty = true;
+                sext_memo_invalidate();
+            }
+            emit_advance(&e, op_pc_clr, op_cyc_clr);
+
+            u32 here_clr = e.len;
+            i32 jo_clr = (i32)(here_clr - jclr_pos) - 4;
+            u32 jw_clr = ((u32)((u32)jo_clr & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jclr_pos    ] = (u8)jw_clr;
+            base[entry_off + jclr_pos + 1] = (u8)(jw_clr >> 8);
+            base[entry_off + jclr_pos + 2] = (u8)(jw_clr >> 16);
 
             inline_ops++; done = true;
         } else if (top == 0xB && szf == 3 && ((w >> 8) & 1) == 0 && mode == 5) {
@@ -2813,6 +3051,20 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             emit_read_g(&e, &rc, G_D(dn), 8);
             if (!flags_dead[i]) emit_logic_flags(&e, 8);
             emit_advance(&e, 2, 4);
+            inline_ops++; done = true;
+        } else if (top == 0x4 && ((w >> 8) & 0xF) == 0x4 && szf == 2 && mode == 0) {
+            /* NEG.L Dn — bench-warm 0x4480-0x4487 at ~1500 helpers in 20M cyc
+             * (M6.73). r = 0 - Dn; full CCR via the existing SUB-style flag
+             * helper with s=Dn (operand being subtracted) and d=0. The
+             * interp's set_flags_sub(sz, d, 0, r) matches this register
+             * order. */
+            int dn = w & 7;
+            emit_read_g(&e, &rc, G_D(dn), 8);      /* a8 = s = Dn */
+            xt_movi(&e, 9, 0);                      /* a9 = d = 0 */
+            xt_sub (&e, 10, 9, 8);                  /* a10 = r = 0 - Dn */
+            emit_write_g(&e, &rc, G_D(dn), 10);
+            if (!flags_dead[i]) emit_addsub_flags_long(&e, true, false);
+            emit_advance(&e, 2, 8);                 /* base 4 + handler 4 */
             inline_ops++; done = true;
         } else if (top == 0xB && szf == 2 && !((w >> 8) & 1) && mode == 0) {
             /* CMP.L Dm,Dn */
