@@ -3055,9 +3055,13 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             xt_and  (&e, 10, 8, 9);
             emit_cache_flush(&e, &rc);
             i32 op_pc_lp = 2, op_cyc_lp = 8;
+            /* M6.123 — MOVE.L Dn|Am,(An)+ modifies only An (post-incr).
+             * The src reg is READ, not written; m68k_step doesn't touch it. */
+            g_helper_touched_mask = (u16)(1u << G_A(an));
             xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_lp, op_cyc_lp)));
             emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
                                               entry_off, &rc, op_pc_lp, op_cyc_lp);
+            g_helper_touched_mask = 0xFFFFu;
             u32 jlp_pos = e.len;
             xt_j    (&e, 4);
             /* Fast path: load src reg, write 4 BE bytes, post-incr An. */
