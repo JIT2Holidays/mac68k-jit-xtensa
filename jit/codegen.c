@@ -2107,6 +2107,61 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + jdr_pos + 2] = (u8)(jw_dr >> 16);
 
             inline_ops++; done = true;
+        } else if (top == 0x2 && ((w >> 6) & 7) == 1 && mode == 5) {
+            /* MOVEA.L (d16,An),Am — bench-warm 0x246F (MOVEA.L (d16,SP),A3)
+             * at ~13 K helpers in 20M cyc (M6.75). Sibling of the M6.73
+             * MOVE.L (d16,An),Dn arm — same address compute + .L read,
+             * but writes 32-bit result to Am and skips the flag emit
+             * (MOVEA never touches CCR). */
+            int dst_am = (w >> 9) & 7;
+            int src_an = w & 7;
+            u16 ext = mac_read16(cpu->mem, op_pc[i] + 2);
+            i32 d16 = (i16)ext;
+
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(src_an), 8);
+            if (d16 >= -128 && d16 <= 127) {
+                xt_addi(&e, 8, 8, d16);
+            } else {
+                emit_load_imm(&e, 11, 12, (u32)d16);
+                xt_add(&e, 8, 8, 11);
+            }
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_mAd = 4, op_cyc_mAd = 8;
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_mAd, op_cyc_mAd)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_mAd, op_cyc_mAd);
+            u32 jmAd_pos = e.len;
+            xt_j    (&e, 4);
+            /* Fast path: 4 BE byte loads. */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);
+            xt_l8ui (&e, 11, 9, 0);
+            xt_l8ui (&e, 12, 9, 1);
+            xt_slli (&e, 10, 11, 24);
+            xt_slli (&e, 12, 12, 16);
+            xt_or   (&e, 10, 10, 12);
+            xt_l8ui (&e, 11, 9, 2);
+            xt_l8ui (&e, 12, 9, 3);
+            xt_slli (&e, 11, 11, 8);
+            xt_or   (&e, 10, 10, 11);
+            xt_or   (&e, 10, 10, 12);                         /* a10 = .L */
+            emit_write_g(&e, &rc, G_A(dst_am), 10);
+            /* MOVEA — no flags. */
+            emit_advance(&e, op_pc_mAd, op_cyc_mAd);
+
+            u32 here_mAd = e.len;
+            i32 jo_mAd = (i32)(here_mAd - jmAd_pos) - 4;
+            u32 jw_mAd = ((u32)((u32)jo_mAd & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jmAd_pos    ] = (u8)jw_mAd;
+            base[entry_off + jmAd_pos + 1] = (u8)(jw_mAd >> 8);
+            base[entry_off + jmAd_pos + 2] = (u8)(jw_mAd >> 16);
+
+            inline_ops++; done = true;
         } else if (top == 0x2 && ((w >> 6) & 7) == 5 && (mode == 0 || mode == 1)) {
             /* MOVE.L Dn|Am,(d16,An) — bench-warm 0x2F41+ at ~1000 helpers in
              * 20M cyc (M6.73). Stack-frame .L write. EA = An + sext16(d16);

@@ -902,6 +902,53 @@ ctest: **7 / 7** pass.
   ~25 K helpers in 5 M cyc; adding a second mask for the overlay's
   RAM-at-0x600000 placement would knock ≥ 80 % of those out.
 
+**M6.75 — MOVEA.L (d16,An),Am + helper-histo opcode-decode lesson.**
+Attempted the M6.74-followup "ROM-extended bounds check on MOVEA.L
+(An)+,Am", landed it green through ctest + boot-deterministic 300 K,
+then measured: bench helpers unchanged (468 K). Bisected by
+re-decoding the bench's `0x28D8` from the histogram — I'd misread
+it as `MOVEA.L (A0)+, A4` in M6.74's STATUS commentary, but the
+correct decode is **`MOVE.L (A0)+, (A4)+`** (memory-to-memory
+post-incr, dst_mode=3, NOT dst_mode=1). The M6.74 MOVEA.L inline
+was correct *for the rare actual MOVEA.L (An)+,Am calls*, but the
+71 K hot helpers on bench were a different op entirely.
+
+Reverted the M6.75 ROM-check (slight regression — extra inline ops
+with no hits to eliminate) and pivoted to the *actually-hot*
+MOVEA.L variant: `0x246F (MOVEA.L (d16,SP),A3)` at **13 241 hits
+in 20 M cyc** with no inline emit. Direct sibling of M6.73's
+`MOVE.L (d16,An),Dn` arm — same `An + sext16(d16)` address compute
+and `.L` read, with the result written to Am instead of Dn and
+the flag emit dropped (MOVEA doesn't touch CCR).
+
+Match condition: `top == 0x2 && (w >> 6) & 7 == 1 && mode == 5`.
+2-byte+ext (length 4), 8 cycles (interp base 4 + handler 4).
+
+**Verification:**
+- ctest 7/7
+- diff_jit_trace: only the documented M6.66 cycle-11898 divergence
+- Boot @ 300 K: PC=`0x40032C`, helpers=1192 — byte-identical to M6.74
+- Boot @ 5 M: PC=`0x40032C`, helpers=25240 — byte-identical to M6.74
+
+**Perf:**
+
+| Workload | M6.74 | **M6.75** | Δ |
+|----------|------:|----------:|---|
+| Bench @ 5 M cyc (PC=`0x401F52` both) | 115 036 h, 2.932 lx7/cyc | **106 316 h, 2.850 lx7/cyc** | **−8 720 h, −2.8 %** |
+| Bench @ 20 M cyc (PC=`0x40115E` both) | 468 562 h, 2.950 lx7/cyc | **434 122 h, 2.868 lx7/cyc** | **−34 440 h, −2.8 %** |
+| Boot @ 5 M / 100 M cyc | unchanged | identical | — (not boot-hot) |
+
+**Lesson recorded** in `memory/triple-differential.md`: when iterating
+on opcode-eviction work driven by the `JIT_HELPER_HISTO` dump, always
+**re-decode** the opcode's bit field semantics before assuming the
+M6.X comments are right. Histogram entries are 16-bit raw words —
+the same nibble pattern can map to different `dst_mode` arms (MOVEA
+vs MOVE-to-(An)+) and the wrong-target emit silently passes ctest
++ the deterministic-boot check because the actually-hot op was
+never tested.
+
+ctest: **7 / 7** pass.
+
 Alternative real-software pair if synthetic benchmarks aren't the
 goal: **Dark Castle** (VIA-timer-driven sound + raster bit-banging
 — tests M3's "good enough to pace 60 Hz VBL, not instruction-cycle-
