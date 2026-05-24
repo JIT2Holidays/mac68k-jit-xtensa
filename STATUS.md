@@ -395,6 +395,51 @@ Suggested next steps if pursuing this further:
   same-position clicks — the OS may need CrsrNew to be raised
   even on no-position-change for double-click registration.
 
+**M6.65 — `--diff-jit` finds a real pre-existing JIT divergence
+(not introduced by recent commits; ctest misses it).**
+
+Per user direction "always compare JIT result to interp result and
+mini vMac result to find divergences", running `--diff-jit` on the
+existing `speedo-bench.snap` immediately reveals:
+
+```
+./build/mac68k_host --diff-jit-trace --no-irq \
+    --load-snapshot roms/disks/speedo-bench.snap --max-cycles 2000
+
+[trace] DIVERGENCE at step 36, block PC=0x41E184, cycles 1630..1666
+  SR interp=2700 jit=2704        # JIT sets Z=1, interp Z=0
+  pre-block:  D3=0x00000000
+  block:
+    PC=41E184  op=99CC  ; SUBA.L A4,A4   (bridged to m68k_step)
+    PC=41E186  op=5443  ; ADDQ.W #2,D3   (inlined)
+    PC=41E188  op=4E75  ; RTS            (block terminator)
+```
+
+After the block: D3 = 2 (both engines agree); flags should be CCR=0
+(Z=0 since result≠0). Interp gets this right; JIT sets Z=1.
+
+The bug exists at M6.61 too — it pre-dates M6.62 (cross-block reg
+caching) and M6.63 (eviction policies). `ctest` doesn't catch it —
+`test_jit.c` runs a small curated snippet set, not this block.
+
+Walked through `emit_addq_w_dn` + `emit_addsub_flags_long_masked`
+emission by hand:
+* `xt_bnez(r, 6)` at result ≠ 0 correctly skips the Z-setting
+  `xt_or` (xt_or is 3 bytes; branch target PC+6 lands past it).
+* The mask `xt_movi(12, -32); xt_and R_SR,R_SR,12` should clear
+  CCR bits 0-4, then `xt_or R_SR,R_SR,a8` ORs in the new bits.
+
+Plausible causes (not investigated to root):
+* SUBA.L bridge's `emit_sr_reload` reading a `cpu->sr` modified
+  unexpectedly during m68k_step (interrupt poll? supervisor flag?).
+* `flags_dead[]` liveness analysis marking ADDQ.W's flags dead
+  for this block (it shouldn't — RTS is classified CONS, meaning
+  it reads CCR, so ADDQ's flag write isn't dead).
+
+**Workflow change per user direction:** `--diff-jit` is SOP after
+any JIT-affecting commit. ctest passing isn't enough. Memory at
+`memory/triple-differential.md`.
+
 Alternative real-software pair if synthetic benchmarks aren't the
 goal: **Dark Castle** (VIA-timer-driven sound + raster bit-banging
 — tests M3's "good enough to pace 60 Hz VBL, not instruction-cycle-
