@@ -9,6 +9,27 @@
 | **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.665** | **1.666** | **3.88 ×** |
 | **Boot** (Mac Plus ROM, 5 M cycles, PC=`0x40032C` deterministic)    | **2.196** | **2.196** | **2.94 ×** |
 
+## M6.140 — cross-block lazy-CC for JMP/BRA.W static targets
+
+Extended the cross-block lazy-CC analyzer (the pre-pass that walks
+forward from a block's static-target successor to decide whether the
+block's last setter's flags are dead) to handle four more terminator
+patterns: BRA.W, Bcc.W, JMP (xxx).L, JMP (d16,PC).
+
+Also fixes a latent .W/.L mis-handling: the pre-existing BRA.S / Bcc.S
+arms used `(i8)(last_op & 0xFF)` for the displacement, which for the
+.W and .L forms (low byte 0x00 or 0xFF) gave disp=0 and pointed at the
+disp16/disp32 ext-word bytes mid-instruction. PC_OVERWRITES_CCR's
+decode at that garbage PC sometimes returned a phantom setter,
+incorrectly marking the prior setter dead.
+
+Compile-time instrumentation shows the extension catches **9 blocks
+in bench 100 M** (all 9 hit — JMP (xxx).L target is a SETTER) and
+**0 in boot 100 M**. The metric impact at 3-decimal `lx7/cyc`
+precision is invisible (9 × per-block-runs × per-dead-flag savings
+falls below the rounding boundary), but the latent .W/.L bug fix is
+a correctness win.
+
 ## M6.138 + M6.139 — small inline wins on Dn-form ops 🎯
 
 Two small Dn-form arms after M6.137 closed out the bench-hot F-line zone:
