@@ -5,6 +5,60 @@
 > across the 68000 ISA, plus the trajectory-safety-aware shopping list
 > for further inline arms.
 
+## M6.158 — per-helper SR mask (structural item 2) 🎯
+
+First concrete delivery on the high-gain backlog's **Item 2** (lazy-CC
+classifier). Adds `g_helper_sr_mask` alongside the existing
+`g_helper_touched_mask`: per-helper flags for whether the helper reads
+or writes `cpu->sr`. Seven verified-clean helpers now skip both
+`emit_sr_flush` before the call and `emit_sr_reload` after — saving
+3–6 LX7 per slow-path execution.
+
+| Helper | Reads SR | Writes SR | Mask |
+|--------|:--------:|:---------:|:----:|
+| `m68k_jit_rts_mmio` | no | no | **0u** |
+| `m68k_jit_bsr_s_mmio` | no | no | **0u** |
+| `m68k_jit_bsr_w_mmio` | no | no | **0u** |
+| `m68k_jit_movem_l_postinc_to_regs` | no | no | **0u** |
+| `m68k_jit_movem_l_predec_from_regs` | no | no | **0u** |
+| `m68k_jit_movem_w_to_mem` | no | no | **0u** |
+| `m68k_jit_movem_l_to_mem` | no | no | **0u** |
+
+| Workload | Pre | Post | Δ |
+|----------|----:|-----:|--:|
+| Bench 100M `lx7/cyc` | 1.183 | **1.182** | -0.001 |
+| Bench 100M `xt` | 118 149 367 | **118 032 204** | **-117 K LX7** |
+| **Boot 100M `lx7/cyc`** | 1.663 | **1.658** | **-0.30 %** 🎯 |
+| **Boot 100M `xt`** | 154 942 292 | **154 417 039** | **-525 K LX7** |
+
+Process documented in `memory/per-helper-sr-mask.md`. The MOVE-family
+helpers still need full mask=3u (they call `m68k_set_ccr` which is
+read-modify-write on cpu->sr); fine-grained CCR bit masks (X/N/Z/V/C
+separately) would be a follow-up if Item 2 is pushed further.
+
+## M6.154-M6.157 — pure register-op sweep (closes the easy shopping list)
+
+Four pure-register-op inline arms in one loop iteration, draining the
+INSTRUCTIONS.md remaining-opportunities list of the "easy" category:
+
+| Milestone | Pattern | Δ |
+|-----------|---------|---|
+| **M6.154** | BTST/BCHG/BCLR/BSET #imm,Dn (0x08C0 family) | boot 100M helpers **-434** |
+| **M6.155** | ASL.L #imm,Dn (0xE181) — sibling of M6.151 | boot 100M helpers -124 |
+| **M6.156** | NOT.B/W/L Dn (0x4641) — sibling of M6.139 | bench helpers -66 |
+| **M6.157** | SUBA.L Dn/Am,An — sibling of M6.152 | bench -11, boot -6 |
+
+Combined Δ since M6.153:
+
+| Workload | M6.153 | M6.158 | Δ |
+|----------|------:|------:|--:|
+| Bench 20M lx7/cyc | 1.163 | **1.162** | -0.001 |
+| Bench 20M helpers | 2 504 | **2 274** | **-230 (-9 %)** |
+| Bench 100M lx7/cyc | 1.183 | **1.182** | -0.001 |
+| Boot 100M lx7/cyc | 1.664 | **1.658** | **-0.006 (-0.36 %)** |
+| Boot 100M helpers | 178 459 | **177 861** | -598 |
+| Boot 100M jit_cost | 166 511 K | **165 800 K** | **-711 K LX7** |
+
 ## M6.153 — extra-bench snapshots wired into ctest 🎯
 
 Two new boot-phase snapshots stand in for the long-blocked MacBench 4.0
@@ -50,13 +104,13 @@ hot-code regions (0x40032C ROM init, 0x401F6E post-System-load, and
 0x41E0E6 Speedometer ALU) so a JIT regression in any of them surfaces
 on `ctest` instead of slipping through to a boot/bench run.
 
-## Where things stand right now (post-M6.153)
+## Where things stand right now (post-M6.158)
 
 | Engine | lx7 / cyc | real_lx7 / cyc | × interp baseline (host) |
 |--------|----------:|---------------:|-------------------------:|
-| **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.163** | **1.164** | **5.56 ×** ✅ |
-| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.183** | **1.183** | **5.46 ×** ✅ |
-| **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.664** | **1.664** | **3.88 ×** |
+| **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.162** | **1.163** | **5.56 ×** ✅ |
+| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.182** | **1.182** | **5.47 ×** ✅ |
+| **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.658** | **1.658** | **3.89 ×** |
 | **Boot** (Mac Plus ROM, 5 M cycles, PC=`0x40032C` deterministic)    | **2.196** | **2.196** | **2.94 ×** |
 
 ## M6.149-M6.152 — pure register-op inline series 🎯
