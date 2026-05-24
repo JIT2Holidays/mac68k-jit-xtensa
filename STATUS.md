@@ -1,5 +1,52 @@
 # Status
 
+## Where things stand right now (post-M6.118)
+
+| Engine | lx7 / cyc | × interp baseline |
+|--------|----------:|------------------:|
+| **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.173** | **5.51 ×** ✅ |
+| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.210** | **5.34 ×** ✅ |
+| **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.715** | **3.45 ×** |
+| **Boot** (Mac Plus ROM, 5 M cycles, PC=`0x40032C` deterministic)    | **2.223** | **2.66 ×** |
+| **Boot** (Mac Plus ROM, 300 K cycles, PC=`0x40032C` deterministic)  | **1.975** | **2.99 ×** |
+
+## M6.118 — MOVE.W Dn,(d16,An) — bench 20 M crosses 5.51 × interp 🎯
+
+The next un-inlined opcode after M6.117 cleared the 21K-hit list:
+bench's 0x3B40 (MOVE.W D0,(d16,A5)) at 4 995 helpers / 100 M cyc and
+1 594 / 20 M cyc.
+
+Length 4 (op + d16); cycles 8 (m68k_step base 4 + MOVE handler 4).
+EA = An + sext16(d16); bounds-check the EA; fast path writes 2 BE
+bytes, MOVE-family flags.
+
+**Triple-diff workflow:**
+
+* ctest: 7/7
+* `--diff-jit-trace`: clean through 11 038 cycles
+* Boot 5 M det / 100 M: byte-identical
+* Bench (20 M): 6 567 → 4 973 helpers (**−1 594** = the 0x3B40 count)
+* Bench (100 M): 53 362 → 48 244 helpers (**−5 118**)
+
+**Perf:**
+
+| Workload | M6.117 | **M6.118** | Δ |
+|----------|------:|----------:|--:|
+| **Bench (20 M)**    | 1.176 | **1.173** | **−0.25 %** |
+| **Bench (100 M)**   | 1.212 | **1.210** | **−0.16 %** |
+| Boot 5 M det        | 2.223 | **2.223** | unchanged |
+| Boot 100 M          | 1.715 | **1.715** | unchanged |
+
+🎯 **Bench 20 M crosses 5.51 × interp** (= 6.462 / 1.173).
+🎯 **Bench 100 M crosses 5.34 × interp** (= 6.462 / 1.210).
+
+Cumulative M6.84 → M6.118:
+* Bench (20 M): 1.257 → **1.173** (−6.7 %)
+* Bench (100 M): 1.396 → **1.210** (**−13.3 %**)
+* Boot 300 K det: 2.170 → **1.975** (−9.0 %)
+* Boot 5 M det:   2.471 → **2.223** (−10.0 %)
+* Boot 100 M:     1.734 → **1.715** (−1.1 %)
+
 ## M6.117 — MOVE #imm16,SR — bench 100 M crosses 5.33 × interp 🎯
 
 Privileged op that bench's hot loop hits 21 598 times / 100 M cyc (the
