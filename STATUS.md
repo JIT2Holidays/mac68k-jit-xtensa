@@ -55,6 +55,37 @@ ROX). Bit 8 = 0 = RIGHT direction. The LEFT-direction ROXL.B fires in
 boot 100M (0xE3xx at 1 688 hits) and was NOT inlined — preserving the
 trajectory.
 
+### Post-M6.144 saturation analysis
+
+Bench 100M's helper-histo top entries post-M6.144 are now all NEW
+patterns without an existing inline arm — meaning they need brand-new
+arms, which the M6.145 OR.W revert and the
+[[bridge-only-arms-trajectory-shift]] memory establish as risky:
+
+| Bench helper | Hits | Pattern | Status |
+|--------------|-----:|---------|--------|
+| eaa8 LSL.L D5,D0 reg-form  | 190 | top=E,bit5=1,bit8=1,szf=2,bits 4-3=01 | Boot has 254 (efef in bogus zone) — trajectory risk |
+| 8155 OR.W D0,(A5) MMIO     | 156 | top=8,bit8=1,szf=1,mode=2 | Reverted M6.145; bridge-only triggers shift |
+| 4a11/4a10 TST.B (An)       | 126 combined | top=4,bits 11-8=A,szf=0,mode=2 | Boot has 4 hits — trajectory risk |
+| d1c1 ADDA.L D1,A0          | 59 | top=D,bit8=1,szf=3,mode=0 | Boot has 653 (M6.142 attempt regressed) |
+| 4a2e TST.B (d16,A6)        | 58 | top=4,bits 11-8=A,szf=0,mode=5 | Similar to 4a11/10 |
+| c4c0 MULU.W D0,D2          | 54 | top=C,bit8=0,szf=3,mode=0 | Boot has 1 hit |
+| 3630 MOVE.W (d8,An,Xn),D3  | 52 | top=3,bits 8-6=0,mode=6 | Mode-6 complex |
+| 486e PEA (d16,A6)          | 47 | top=4,(op&0xFFC0)==0x4840 | Boot has 3 hits |
+
+The slow-path conversion lever (M6.144 pattern) is exhausted for
+bench — JSR variants' slow paths (would-be next conversion candidates)
+fire 0-3 times. **The trajectory-safe inline series M6.141-144 is
+near saturation on the host metric**; remaining wins are either
+small (sub-200-hit ops × ~30 LX7 savings = ≤ 0.006%) or trajectory-
+risky.
+
+Future levers per the high-gain backlog above:
+* Asm-trampoline preserves a4-a7 across fast helpers — ESP32-only,
+  unmeasurable on host.
+* Native chain epilogue on ESP32 — unmeasurable on host.
+* M6.66 structural fix — biggest potential but complex.
+
 ### Implementation gotchas caught by ctest
 
 * **`emit_addsub_flags_long_masked` clobbers a11 internally.** The
