@@ -719,6 +719,40 @@ void m68k_jit_bsr_w_mmio(m68k_cpu *cpu) {
     cpu->pc = cpu->jit_arg1;
 }
 
+void m68k_jit_move_b_dn_to_addr_mmio(m68k_cpu *cpu) {
+    /* MOVE.B Dn,addr — caller pre-computes dst addr in jit_arg1;
+     * jit_arg2 holds the source Dn (0..7).
+     *
+     * Used by MOVE.B Dn,(An) and MOVE.B Dn,(d16,An) inline arms. */
+    int dn = (int)(cpu->jit_arg2 & 7);
+    u32 addr = cpu->jit_arg1;
+    u8 v = (u8)(cpu->d[dn] & 0xFF);
+    mac_write8(cpu->mem, addr, v);
+    u8 ccr = m68k_get_ccr(cpu) & CCR_X;
+    if (v == 0)        ccr |= CCR_Z;
+    if (v & 0x80)      ccr |= CCR_N;
+    m68k_set_ccr(cpu, ccr);
+}
+
+void m68k_jit_move_l_dn_to_anpi_mmio(m68k_cpu *cpu) {
+    /* MOVE.L Dn|Am,(An)+ — bench/boot-hot 0x24C3 (MOVE.L D3,(A2)+) at
+     * 5472 hits / 100 M cyc when An→MMIO.
+     *
+     * jit_arg2 packed: bits 0-2 = src_reg, bits 4-6 = dst_an,
+     *                  bit 8 = src_is_an. jit_arg1 unused. */
+    int src = (int)(cpu->jit_arg2 & 7);
+    int an  = (int)((cpu->jit_arg2 >> 4) & 7);
+    bool src_is_an = (cpu->jit_arg2 >> 8) & 1;
+    u32 v = src_is_an ? cpu->a[src] : cpu->d[src];
+    u32 addr = cpu->a[an];
+    mac_write32(cpu->mem, addr, v);
+    cpu->a[an] = addr + 4;
+    u8 ccr = m68k_get_ccr(cpu) & CCR_X;
+    if (v == 0)             ccr |= CCR_Z;
+    if (v & 0x80000000u)    ccr |= CCR_N;
+    m68k_set_ccr(cpu, ccr);
+}
+
 void m68k_jit_move_b_addr_to_dn_mmio(m68k_cpu *cpu) {
     /* Generic MOVE.B src→Dn fast helper. Caller pre-computes the source
      * address in jit_arg1; jit_arg2 holds the destination Dn (0..7).

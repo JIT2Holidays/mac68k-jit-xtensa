@@ -93,6 +93,8 @@ static u32 helper_addr(literal_id id, void *user) {
         case HELPER_JIT_BSR_W_MMIO:      return (u32)(uintptr_t)&m68k_jit_bsr_w_mmio;
         case HELPER_JIT_MOVE_L_POSTINC_TO_DN_MMIO: return (u32)(uintptr_t)&m68k_jit_move_l_postinc_to_dn_mmio;
         case HELPER_JIT_MOVE_B_ADDR_TO_DN_MMIO: return (u32)(uintptr_t)&m68k_jit_move_b_addr_to_dn_mmio;
+        case HELPER_JIT_MOVE_B_DN_TO_ADDR_MMIO: return (u32)(uintptr_t)&m68k_jit_move_b_dn_to_addr_mmio;
+        case HELPER_JIT_MOVE_L_DN_TO_ANPI_MMIO: return (u32)(uintptr_t)&m68k_jit_move_l_dn_to_anpi_mmio;
         case LITERAL_ROM_BOUNDS:return rom_bounds_mask(cpu);
         case LITERAL_ROM_BASE:  return (cpu && cpu->mem && cpu->mem->rom) ? MAC_ROM_BASE : 0xFFFFFFFFu;
         /* host_ptr - guest_base, so `host_ptr + guest_addr` lands at
@@ -124,6 +126,8 @@ static u32 helper_addr(literal_id id, void *user) {
         case HELPER_JIT_BSR_W_MMIO:      return (u32)HELPER_JIT_BSR_W_MMIO;
         case HELPER_JIT_MOVE_L_POSTINC_TO_DN_MMIO: return (u32)HELPER_JIT_MOVE_L_POSTINC_TO_DN_MMIO;
         case HELPER_JIT_MOVE_B_ADDR_TO_DN_MMIO: return (u32)HELPER_JIT_MOVE_B_ADDR_TO_DN_MMIO;
+        case HELPER_JIT_MOVE_B_DN_TO_ADDR_MMIO: return (u32)HELPER_JIT_MOVE_B_DN_TO_ADDR_MMIO;
+        case HELPER_JIT_MOVE_L_DN_TO_ANPI_MMIO: return (u32)HELPER_JIT_MOVE_L_DN_TO_ANPI_MMIO;
         case LITERAL_ROM_BOUNDS:return rom_bounds_mask(cpu);
         case LITERAL_ROM_BASE:  return (cpu && cpu->mem && cpu->mem->rom) ? MAC_ROM_BASE : 0xFFFFFFFFu;
         /* The host sim's translate maps HOST_RAM_BASE + (0x400000..rom_top)
@@ -469,6 +473,8 @@ static void sim_call(xt_sim *s, u32 fn_token) {
         case HELPER_JIT_BSR_W_MMIO:      m68k_jit_bsr_w_mmio(c->cpu); break;
         case HELPER_JIT_MOVE_L_POSTINC_TO_DN_MMIO: m68k_jit_move_l_postinc_to_dn_mmio(c->cpu); break;
         case HELPER_JIT_MOVE_B_ADDR_TO_DN_MMIO: m68k_jit_move_b_addr_to_dn_mmio(c->cpu); break;
+        case HELPER_JIT_MOVE_B_DN_TO_ADDR_MMIO: m68k_jit_move_b_dn_to_addr_mmio(c->cpu); break;
+        case HELPER_JIT_MOVE_L_DN_TO_ANPI_MMIO: m68k_jit_move_l_dn_to_anpi_mmio(c->cpu); break;
         default: break;
     }
 }

@@ -3158,13 +3158,18 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             xt_and  (&e, 10, 8, 9);
             emit_cache_flush(&e, &rc);
             i32 op_pc_lp = 2, op_cyc_lp = 8;
-            /* M6.123 — MOVE.L Dn|Am,(An)+ modifies only An (post-incr).
-             * The src reg is READ, not written; m68k_step doesn't touch it. */
+            /* M6.133 — fast helper. jit_arg2 packed: src_reg (bits 0-2),
+             * dst_an (bits 4-6), src_is_an (bit 8). Helper reads src reg,
+             * writes 4 BE bytes at cpu->a[an], post-increments An by 4. */
             g_helper_touched_mask = (u16)(1u << G_A(an));
-            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_lp, op_cyc_lp)));
-            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
-                                              entry_off, &rc, op_pc_lp, op_cyc_lp);
+            u32 lp_bridge_size = emit_jit_fast_helper_size(&rc);
+            xt_beqz (&e, 10, (i32)(6u + lp_bridge_size));
+            i32 packed_arg2 = dm | (an << 4) | ((mode == 1) ? (1 << 8) : 0);
+            emit_jit_fast_helper(&e, 8, packed_arg2,
+                                 lit_off[HELPER_JIT_MOVE_L_DN_TO_ANPI_MMIO],
+                                 entry_off, &rc);
             g_helper_touched_mask = 0xFFFFu;
+            (void)op_pc_lp; (void)op_cyc_lp; (void)g_src;
             u32 jlp_pos = e.len;
             xt_j    (&e, 4);
             /* Fast path: load src reg, write 4 BE bytes, post-incr An. */
@@ -3860,14 +3865,16 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             xt_and  (&e, 10, an_reg, 9);
             emit_cache_flush(&e, &rc);
             i32 op_pc_b2 = 2, op_cyc_b2 = 8;
-            /* M6.125 — MOVE.B Dn,(An) modifies no D/A reg. The helper
-             * reads Dn and An, writes mem[An], updates CCR. Cache slots
-             * for D/A are unchanged — skip all reload. */
+            /* M6.133 — fast helper: helper reads byte from Dn, writes
+             * to addr (in an_reg), sets CCR. touched_mask = 0. */
             g_helper_touched_mask = 0u;
-            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_b2, op_cyc_b2)));
-            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
-                                              entry_off, &rc, op_pc_b2, op_cyc_b2);
+            u32 b2_bridge_size = emit_jit_fast_helper_size(&rc);
+            xt_beqz (&e, 10, (i32)(6u + b2_bridge_size));
+            emit_jit_fast_helper(&e, an_reg, dn,
+                                 lit_off[HELPER_JIT_MOVE_B_DN_TO_ADDR_MMIO],
+                                 entry_off, &rc);
             g_helper_touched_mask = 0xFFFFu;
+            (void)op_pc_b2; (void)op_cyc_b2;
             u32 jb2_pos = e.len;
             xt_j    (&e, 4);
 
