@@ -300,6 +300,15 @@ static u32 helper_step_after_flush_base_size(const regcache *rc) {
 static void emit_helper_step_after_flush_undo(xt_emit *e, u32 helper_lit_off,
                                               u32 entry_off, regcache *rc,
                                               i32 pc_undo, i32 cyc_undo) {
+    /* M6.68 — the emit_sr_flush we're about to emit is in the SLOW-path
+     * branch (caller put a beqz over us). At runtime it only runs if
+     * the slow path is taken; the fast path skips it entirely. But the
+     * compile-time side effect clears g_sr_dirty, which leaks into
+     * subsequent code in this block. If R_SR was dirty on entry, we
+     * must remember that so the *epilogue* knows to flush R_SR back to
+     * cpu->sr (covering the fast-path case where the slow-path s16i
+     * never ran). */
+    bool was_sr_dirty = g_sr_dirty;
     emit_sr_flush(e);
     xt_mov(e, R_ARG, R_CPU);
     emit_l32r_at(e, R_HELP, helper_lit_off, entry_off + e->len);
@@ -317,6 +326,14 @@ static void emit_helper_step_after_flush_undo(xt_emit *e, u32 helper_lit_off,
     emit_sr_reload(e);
     emit_cache_reload(e, rc);
     sext_memo_invalidate();   /* helper branch sets a13 = HELPER literal */
+    /* M6.68 — restore the on-entry dirty state. The emit_sr_flush above
+     * is conditional at runtime (slow path only), so its compile-time
+     * effect of clearing g_sr_dirty would otherwise hide the fact that
+     * the fast path may still have unflushed R_SR modifications.
+     * Diagnosed via --diff-jit on speedo-bench.snap: SUBA.L bridge +
+     * ADDQ.W + RTS, where RTS's fast-path inline (SP in RAM) doesn't
+     * run the slow-path s16i. */
+    if (was_sr_dirty) g_sr_dirty = true;
 }
 static u32 helper_step_after_flush_undo_size(const regcache *rc,
                                              i32 pc_undo, i32 cyc_undo) {
