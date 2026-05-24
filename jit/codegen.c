@@ -7526,6 +7526,85 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             }
             emit_advance(&e, 2, 10 + 2 * imm);
             inline_ops++; done = true;
+        } else if (top == 0xE && ((w >> 8) & 1)
+                   && ((w >> 6) & 3) == 2
+                   && !((w >> 5) & 1)
+                   && (((w >> 3) & 3) == 0)) {
+            /* M6.155 — ASL.L #imm,Dn (LEFT direction, AS type, .L size).
+             * Sibling of M6.151 ASL.B/W and M6.146 LSL.L. Boot 100M's
+             * 0xE181 (ASL.L #8,D1) at 120 hits / pc=0x400572 is the
+             * largest un-inlined shift family op per INSTRUCTIONS.md.
+             *
+             * Differs from M6.151 .B/.W in two ways:
+             *   - Operates on the full 32-bit Dn in-place; no merge
+             *     step needed (the result IS the whole register).
+             *   - last_out and V-flag top-bits extract read directly
+             *     from src_reg (no a9 size-masking stage). xt_extui
+             *     max width is 16 bits, which fits up to (imm+1) = 9.
+             *
+             * V flag: top (imm+1) bits of original src. If all 0 or
+             * all 1, V=0 (no sign change). Else V=1. Implemented via
+             * XOR-self-test, with V indicator in a13 (R_HELP) so it
+             * survives the CCR-merge step that clobbers a11/a12.
+             * a14 = R_SR is off-limits — same gotcha as M6.151.
+             *
+             * Cycles: 10 + 2*imm (m68k_step base 4 + handler 6 + 2*cnt).
+             * Length 2. */
+            int imm = (w >> 9) & 7; if (imm == 0) imm = 8;
+            int dn = w & 7;
+            int top_bits_count = imm + 1;   /* max 9; within xt_extui 16-bit limit */
+
+            int dn_xt = cache_lookup(&rc, G_D(dn));
+            u8 src_reg = (dn_xt >= 0) ? (u8)dn_xt : 8;
+            if (dn_xt < 0) emit_read_g(&e, &rc, G_D(dn), 8);
+
+            /* a10 = last_out = bit (32-imm) of src (last bit shifted off
+             * top in the FINAL iter). MUST be captured before in-place
+             * shift writes dst_reg (=src_reg when cached). */
+            xt_extui(&e, 10, src_reg, (u8)(32 - imm), 0);
+
+            /* V flag scratch: top (imm+1) bits of src in a11; XOR-self-
+             * test result in a13 (!=0 iff any sign change). */
+            int top_shift = 32 - top_bits_count;
+            xt_extui(&e, 11, src_reg, (u8)top_shift, (u8)(top_bits_count - 1));
+            xt_movi (&e, 12, (1 << top_bits_count) - 1);
+            xt_xor  (&e, 12, 11, 12);
+            xt_and  (&e, 13, 11, 12);
+
+            /* result = src << imm — full 32-bit in-place. */
+            u8 dst_reg = (dn_xt >= 0) ? (u8)dn_xt : 8;
+            xt_slli(&e, dst_reg, src_reg, (u8)imm);
+
+            if (dn_xt >= 0) {
+                for (int s = 0; s < rc.active; s++)
+                    if (rc.guest[s] == (u8)G_D(dn)) { rc.dirty |= (u16)(1u << s); break; }
+            } else {
+                emit_write_g(&e, &rc, G_D(dn), 8);
+            }
+
+            if (!flags_dead[i]) {
+                /* CCR: clear N/Z/V/C/X (bits 0..4) — ASL writes X = C. */
+                xt_movi (&e, 12, -32);
+                xt_and  (&e, R_SR, R_SR, 12);
+                xt_or   (&e, R_SR, R_SR, 10);             /* C = last_out */
+                xt_slli (&e, 12, 10, 4);
+                xt_or   (&e, R_SR, R_SR, 12);             /* X = C */
+                xt_extui(&e, 12, dst_reg, 31, 0);
+                xt_slli (&e, 12, 12, 3);
+                xt_or   (&e, R_SR, R_SR, 12);             /* N = bit 31 */
+                /* V: set if a13 != 0 (top bits not all same). */
+                xt_movi (&e, 12, 0x02);
+                xt_beqz (&e, 13, 6);                       /* skip if V=0 */
+                xt_or   (&e, R_SR, R_SR, 12);             /* V = 1 */
+                /* Z: set if dst_reg == 0. */
+                xt_movi (&e, 12, 0x04);
+                xt_bnez (&e, dst_reg, 6);
+                xt_or   (&e, R_SR, R_SR, 12);             /* Z */
+                g_sr_dirty = true;
+                sext_memo_invalidate();
+            }
+            emit_advance(&e, 2, 10 + 2 * imm);
+            inline_ops++; done = true;
         } else if (top == 0xE
                    && !((w >> 5) & 1)
                    && (((w >> 3) & 3) == 3)) {
