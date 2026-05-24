@@ -6977,6 +6977,118 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             }
             emit_advance(&e, 2, 10 + 2 * imm);
             inline_ops++; done = true;
+        } else if (top == 0xE && ((w >> 8) & 1)
+                   && (((w >> 6) & 3) == 0 || ((w >> 6) & 3) == 1)
+                   && !((w >> 5) & 1)
+                   && (((w >> 3) & 3) == 1)) {
+            /* M6.146 — LSL.B/W #imm,Dn (LEFT direction, LS type). Sibling
+             * of M6.97/98's LSR/ASR.B/W #imm: same size_bits/cnt structure,
+             * just shifting left. ASL (bits 4-3 = 00) NOT included here
+             * because ASL needs V-flag computation (sign-change detection)
+             * while LSL has V=0 always.
+             *
+             * Bench has 87 hits (e548 47 + e54a 40 = LSL.W #2,D0/D2);
+             * boot 100M has 12 hits (e548 1 + e54a 11). Boot fires are
+             * in real Mac code (pc=4005ea / 401f92), not divergence
+             * zone. Modest trajectory risk; mitigated by sibling
+             * symmetry with the existing M6.97/98 right-shift arm.
+             *
+             * Semantics:
+             *   src = Dn.size, result = (src << imm) & size_mask
+             *   C = X = bit (size_bits - imm) of src (last bit shifted out)
+             *   N = bit (size_bits - 1) of result;  Z = (result == 0); V = 0
+             *
+             * Cycles: m68k_step base 4 + handler 6 + 2*cnt = 10 + 2*imm. */
+            int imm = (w >> 9) & 7; if (imm == 0) imm = 8;
+            int dn = w & 7;
+            int szf_local = (w >> 6) & 3;
+            int size_bits = szf_local == 0 ? 8 : 16;
+
+            int dn_xt = cache_lookup(&rc, G_D(dn));
+            u8 src_reg = (dn_xt >= 0) ? (u8)dn_xt : 8;
+            if (dn_xt < 0) emit_read_g(&e, &rc, G_D(dn), 8);
+
+            /* a9 = src.size, a10 = last_out bit. */
+            xt_extui(&e, 9, src_reg, 0, size_bits - 1);
+            xt_extui(&e, 10, 9, size_bits - imm, 0);
+            /* a9 = (src.size << imm) & size_mask. */
+            xt_slli (&e, 9, 9, imm);
+            xt_extui(&e, 9, 9, 0, size_bits - 1);
+            /* Merge: clear low size_bits of src_reg, OR in result. */
+            xt_srli (&e, 11, src_reg, size_bits);
+            xt_slli (&e, 11, 11, size_bits);
+            u8 dst_reg = (dn_xt >= 0) ? (u8)dn_xt : 8;
+            xt_or   (&e, dst_reg, 11, 9);
+
+            if (dn_xt >= 0) {
+                for (int s = 0; s < rc.active; s++)
+                    if (rc.guest[s] == (u8)G_D(dn)) { rc.dirty |= (u16)(1u << s); break; }
+            } else {
+                emit_write_g(&e, &rc, G_D(dn), 8);
+            }
+
+            if (!flags_dead[i]) {
+                /* CCR: clear NZVCX (bits 0..4) then set N/Z/C/X. V stays 0. */
+                xt_movi (&e, 12, -32);
+                xt_and  (&e, R_SR, R_SR, 12);
+                xt_or   (&e, R_SR, R_SR, 10);     /* C = last_out */
+                xt_slli (&e, 12, 10, 4);
+                xt_or   (&e, R_SR, R_SR, 12);     /* X = last_out (LSL copies C→X) */
+                xt_extui(&e, 12, 9, size_bits - 1, 0);
+                xt_slli (&e, 12, 12, 3);
+                xt_or   (&e, R_SR, R_SR, 12);     /* N */
+                xt_movi (&e, 12, 0x04);
+                xt_bnez (&e, 9, 6);
+                xt_or   (&e, R_SR, R_SR, 12);     /* Z */
+                g_sr_dirty = true;
+                sext_memo_invalidate();
+            }
+            emit_advance(&e, 2, 10 + 2 * imm);
+            inline_ops++; done = true;
+        } else if (top == 0xE && ((w >> 8) & 1)
+                   && ((w >> 6) & 3) == 2
+                   && !((w >> 5) & 1)
+                   && (((w >> 3) & 3) == 1)) {
+            /* M6.146 — LSL.L #imm,Dn. Sibling of M6.99 LSR/ASR.L for the
+             * left direction. .L operates on full 32 bits in place. */
+            int imm = (w >> 9) & 7; if (imm == 0) imm = 8;
+            int dn = w & 7;
+
+            int dn_xt = cache_lookup(&rc, G_D(dn));
+            u8 src_reg = (dn_xt >= 0) ? (u8)dn_xt : 8;
+            if (dn_xt < 0) emit_read_g(&e, &rc, G_D(dn), 8);
+
+            /* last_out = bit (32 - imm) of src. Must be extracted BEFORE
+             * the in-place shift clobbers src_reg. */
+            xt_extui(&e, 10, src_reg, 32 - imm, 0);
+
+            u8 dst_reg = (dn_xt >= 0) ? (u8)dn_xt : 8;
+            xt_slli (&e, dst_reg, src_reg, imm);
+
+            if (dn_xt >= 0) {
+                for (int s = 0; s < rc.active; s++)
+                    if (rc.guest[s] == (u8)G_D(dn)) { rc.dirty |= (u16)(1u << s); break; }
+            } else {
+                emit_write_g(&e, &rc, G_D(dn), 8);
+            }
+
+            if (!flags_dead[i]) {
+                xt_movi (&e, 12, -32);
+                xt_and  (&e, R_SR, R_SR, 12);
+                xt_or   (&e, R_SR, R_SR, 10);     /* C */
+                xt_slli (&e, 12, 10, 4);
+                xt_or   (&e, R_SR, R_SR, 12);     /* X = C */
+                xt_extui(&e, 12, dst_reg, 31, 0);
+                xt_slli (&e, 12, 12, 3);
+                xt_or   (&e, R_SR, R_SR, 12);     /* N */
+                xt_movi (&e, 12, 0x04);
+                xt_bnez (&e, dst_reg, 6);
+                xt_or   (&e, R_SR, R_SR, 12);     /* Z */
+                g_sr_dirty = true;
+                sext_memo_invalidate();
+            }
+            emit_advance(&e, 2, 10 + 2 * imm);
+            inline_ops++; done = true;
         } else if (top == 0xE && !((w >> 8) & 1)
                    && !((w >> 5) & 1)
                    && (((w >> 3) & 3) == 2)) {
