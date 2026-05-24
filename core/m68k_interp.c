@@ -1539,7 +1539,33 @@ m68k_decoded m68k_decode_at(m68k_cpu *cpu, u32 pc) {
         }
         case 0x7: break;                    /* MOVEQ */
         case 0x8: case 0x9: case 0xB: case 0xC: case 0xD: {
-            d.length += ea_ext_bytes(cpu, pc, mode, reg, (szf==3)?2:sz);
+            /* M6.124 — szf=3 disambiguates by top:
+             *   top=0x8/0xC : DIVU/DIVS/MULU/MULS — always .W operand (sz=2)
+             *   top=0x9/0xB/0xD : ADDA/SUBA/CMPA — sz depends on bit 8
+             *     bit 8 = 0 → .W (sz=2); bit 8 = 1 → .L (sz=4)
+             *
+             * Without the bit-8 distinction for top=9/B/D, ADDA.L/SUBA.L/
+             * CMPA.L with #imm32 source would have decoder return length 4
+             * (op + 2 byte imm) instead of 6 (op + 4 byte imm). The JIT
+             * block compiler would walk past only the first 2 bytes of
+             * the imm32 and decode the next 2 bytes as a phantom opcode —
+             * the same trap class as M6.122 (MOVE-to-SR length bug).
+             *
+             * The phantom emission is accidentally correct for most paths
+             * because default-helper bridges' m68k_step decodes from
+             * runtime cpu->pc (advanced by the actual op length via the
+             * step's internal fetch), not from the wrong compile-time
+             * op_pc. But any new inline arm for the phantom's opcode
+             * would corrupt execution. */
+            int adj_sz;
+            if (szf == 3) {
+                bool a_long = (top == 0x9 || top == 0xB || top == 0xD)
+                              && (op & 0x0100);
+                adj_sz = a_long ? 4 : 2;
+            } else {
+                adj_sz = sz;
+            }
+            d.length += ea_ext_bytes(cpu, pc, mode, reg, adj_sz);
             break;
         }
         case 0xE: {

@@ -1,14 +1,60 @@
 # Status
 
-## Where things stand right now (post-M6.123)
+## Where things stand right now (post-M6.124)
 
 | Engine | lx7 / cyc | × interp baseline |
 |--------|----------:|------------------:|
 | **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.172** | **5.51 ×** ✅ |
 | **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.197** | **5.40 ×** ✅ |
 | **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.700** | **3.80 ×** |
-| **Boot** (Mac Plus ROM, 5 M cycles, PC=`0x40032C` deterministic)    | **2.223** | **2.66 ×** |
+| **Boot** (Mac Plus ROM, 5 M cycles, PC=`0x40032C` deterministic)    | **2.218** | **2.66 ×** |
 | **Boot** (Mac Plus ROM, 300 K cycles, PC=`0x40032C` deterministic)  | **1.975** | **2.99 ×** |
+
+## M6.124 — m68k_decode_at length fix for ADDA.L/SUBA.L/CMPA.L #imm32 — boot 5 M det 2.223 → 2.218 lx7/cyc (−0.22 %)
+
+Sibling bug to M6.122's MOVE-to-SR length fix. For top=0x9 (SUB),
+top=0xB (CMP), top=0xD (ADD) family with szf=3:
+
+* szf=3 disambiguates by `top`:
+  - top=0x8/0xC : DIVU/DIVS/MULU/MULS — always .W operand
+  - top=0x9/0xB/0xD : ADDA/SUBA/CMPA — sz depends on bit 8
+    - bit 8 = 0 → .W (sz=2)
+    - bit 8 = 1 → .L (sz=4)
+
+Pre-M6.124, the decoder used `(szf==3)?2:sz` — forcing sz=2 for ALL
+szf=3 ops including ADDA.L/SUBA.L/CMPA.L. For these with `#imm`
+source (mode=7/reg=4), `ea_ext_bytes` returned 2 bytes (.W imm) when
+the actual encoding has a 4-byte imm32.
+
+Same trap class as M6.122 — the JIT block compiler walks past only
+the first 2 bytes of the imm32, decoding the next 2 bytes as a
+phantom opcode. The phantom op's default-helper bridge accidentally
+chains to correct execution via m68k_step's internal pc-advance from
+the runtime cpu->pc (set by the previous arm's emit_advance to the
+REAL next instruction). But any new inline arm for the phantom's
+opcode would corrupt execution.
+
+**Triple-diff:** ctest 7/7, `--diff-jit-trace` clean through 11 038 cyc.
+
+**Perf:**
+
+| Workload | M6.123 | **M6.124** | Δ |
+|----------|------:|----------:|--:|
+| Bench (20 M)        | 1.172 | **1.172** | unchanged (no ADDA.L #imm) |
+| Bench (100 M)       | 1.197 | **1.197** | unchanged |
+| **Boot 5 M det**    | 2.223 | **2.218** | **−0.22 %** ✅ (real workload) |
+| Boot 100 M          | 1.700 | **1.700** | unchanged |
+
+Boot 5M det xt drops 24 693 LX7 — the deterministic real-boot path
+uses `ADDA.L #imm32,An` (typical for stack/buffer address adjustments)
+and now compiles correctly without phantom-op fallthrough.
+
+Cumulative M6.84 → M6.124:
+* Bench (20 M): 1.257 → **1.172** (−6.8 %)
+* Bench (100 M): 1.396 → **1.197** (−14.3 %) 🎯
+* Boot 300 K det: 2.170 → **1.975** (−9.0 %)
+* Boot 5 M det:   2.471 → **2.218** (**−10.2 %**) 🎯
+* Boot 100 M:     1.734 → **1.700** (−2.0 %)
 
 ## M6.123 — selective cache_reload via touched_mask for SP/An-only helper bridges
 
