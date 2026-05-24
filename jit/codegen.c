@@ -5189,21 +5189,30 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
 
             sext_memo_invalidate();
             inline_ops++; done = true;
-        } else if ((top == 0xD || top == 0x9) && szf == 1
+        } else if ((top == 0xD || top == 0x9) && (szf == 0 || szf == 1)
                    && !((w >> 8) & 1) && mode == 0) {
-            /* ADD.W / SUB.W Dm,Dn — boot-warm 0xD441 (~9 K). */
+            /* ADD.B/W / SUB.B/W Dm,Dn — boot-warm 0xD441 (~9 K) for .W;
+             * M6.112 extends to .B (bench-hot 0xD603 = ADD.B D3,D3 at
+             * 21 K helpers / 100 M cyc on the post-cycle-11898 path).
+             *
+             * size_bits = 8 for .B, 16 for .W. The "shift to high"
+             * trick puts the size's sign bit at register bit 31 so
+             * emit_addsub_flags_long reads it directly. Shift amount
+             * is (32 - size_bits) = 24 for .B, 16 for .W. */
             bool is_sub = (top == 0x9);
             int dn = (w >> 9) & 7;
             int dm = w & 7;
+            int size_bits = (szf == 0) ? 8 : 16;
+            int up = 32 - size_bits;
             emit_read_g(&e, &rc, G_D(dm), 8);
             emit_read_g(&e, &rc, G_D(dn), 11);
-            xt_slli(&e, 8, 8, 16);
-            xt_slli(&e, 9, 11, 16);
+            xt_slli(&e, 8, 8, up);
+            xt_slli(&e, 9, 11, up);
             if (is_sub) xt_sub(&e, 10, 9, 8);
             else        xt_add(&e, 10, 9, 8);
-            xt_srli(&e, 11, 11, 16);
-            xt_slli(&e, 11, 11, 16);
-            xt_extui(&e, 12, 10, 16, 15);
+            xt_srli(&e, 11, 11, size_bits);
+            xt_slli(&e, 11, 11, size_bits);
+            xt_extui(&e, 12, 10, up, size_bits - 1);
             xt_or  (&e, 11, 11, 12);
             emit_write_g(&e, &rc, G_D(dn), 11);
             if (!flags_dead[i]) {
