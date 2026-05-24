@@ -5,6 +5,35 @@
 > across the 68000 ISA, plus the trajectory-safety-aware shopping list
 > for further inline arms.
 
+## MacBench 4.0 — infeasible on Mac Plus 🚫
+
+The "make MacBench 4.0 work end-to-end" directive runs into a hard
+compatibility wall. From the InfiniteHD6 disk's own About-MacBench text:
+
+> MacBench 4.0's minimum hardware and software requirements include:
+>   - A 68030 processor or better.
+>   - System 7.5 or better.
+>   - 12 MB or more of physical RAM.
+
+We emulate a **Mac Plus** (68000, System 6.0.8, max 4 MB RAM). MacBench
+will refuse to start regardless of how it's launched. The InfiniteHD6
+also doesn't include older MacBench versions (3.0 / 2.0 / etc.) that
+would be compatible.
+
+**THINK C** says "Sorry, THINK C requires System version 4.2 or newer."
+— System 6 is past that, so THINK C *is* potentially feasible to
+launch. M6.67's app-launch wall still applies (folder-open works,
+app-launch on Mac-Plus Finder needs specific Finder-state setup).
+
+**Infrastructure built during this directive attempt (kept):**
+* `scripts/framediff.sh` — byte-level BMP diff for click-effect detection
+* `scripts/bmp2png_grid.py` — pure-stdlib BMP→PNG with red 50-px coord grid
+* `MAC68K_TRACE_FROM/_TO` env vars in `port/host/main.c` — log Toolbox
+  traps in a cycle window (caught the "no `_Launch` fires" pattern that
+  confirmed Cmd-O on empty-space is a no-op)
+
+These tools are reusable for any future Mac-Plus interactive scripting.
+
 ## M6.158 — per-helper SR mask (structural item 2) 🎯
 
 First concrete delivery on the high-gain backlog's **Item 2** (lazy-CC
