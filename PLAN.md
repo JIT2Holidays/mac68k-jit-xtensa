@@ -62,19 +62,25 @@ cpu_state base — it survives helper calls** (the trampoline preserves
 the windowed-callee-safe `a0..a7` range), `a8..a15` inline scratch.
 
 ### 4.4 Inline vs fallback
-The JIT emits native Xtensa for ~30 hot opcodes / patterns — every
-MOVE / MOVEQ / MOVEA variant, the immediate and register ADD / ADDQ /
-ADDA / SUB / SUBQ / SUBA / CMP / CMPI / CMPM forms, NEG / TST / CLR,
-ADDX / SUBX / NEGX, the bit ops, JSR / JMP / RTS (with in-RAM fast
-paths that read 4 BE bytes inline instead of bridging), Bcc.S / DBcc,
-fused-CMP+Bcc terminators, MOVE.L push / pop patterns, MOVEM predec /
-postinc inlined under a size threshold, and BTST / ORI MMIO fast
-helpers — including full X N Z V C computation derived from the
-standard carry / overflow bit identities. Lazy-CC liveness avoids
-materialising flags that no downstream op reads. Every other
-instruction becomes a `CALLX0` into the reference interpreter's
-`m68k_step` (or, for hot patterns where m68k_step's decode dominates,
-a custom fast-helper that takes the operands via `cpu->jit_arg1/2`).
+The JIT emits native Xtensa for ~120 opcode classes — every MOVE /
+MOVEQ / MOVEA / MOVEM variant the boot + bench hit, the full immediate /
+register / `(d16,An)` / `(d8,An,Xn)` / `(xxx).W` ADD / ADDQ / ADDA /
+SUB / SUBQ / SUBA / CMP / CMPI / CMPM / CMPA forms, NEG / TST / CLR,
+ADDX / SUBX / NEGX / NOT (Dn forms; .L done), EXT, BCD, the static-imm
+bit ops to Dn / `(xxx).W` / MMIO, every `#imm,Dn` ASR / ASL / LSR / LSL /
+ROR / ROL / ROXR / ROXL across .B / .W / .L sizes, Scc, JSR / JMP / RTS
+(with in-RAM fast paths that read 4 BE bytes inline instead of bridging),
+Bcc.S / Bcc.W / DBcc, fused-TST+Bcc / MOVE+Bcc / CMP+Bcc terminators,
+MOVE.L push / pop patterns, MOVEM predec / postinc inlined under a size
+threshold, plus 18 custom `m68k_jit_*` fast helpers for the MMIO and
+exception slow paths (RTS / BSR / MOVE.L (An)+,Dn / MOVE.B address forms /
+ORI.B / BTST / MOVEM / line-F trap). Full X / N / Z / V / C computation
+derived from the standard carry / overflow bit identities; lazy-CC
+liveness skips materialising flags that no downstream op reads. Every
+other instruction becomes a `CALLX0` into the reference interpreter's
+`m68k_step`.
+
+See [`INSTRUCTIONS.md`](INSTRUCTIONS.md) for the per-instruction map.
 
 ### 4.5 Dispatch & chaining
 The dispatcher hashes blocks by start PC and keeps a per-block
@@ -191,10 +197,39 @@ A 512×342 1bpp framebuffer is carved from the top of RAM.
      even though their `emit_sr_flush` was inside a runtime
      slow-path branch. Fix: snapshot + restore. New ctest
      (`diff_jit_bench_lockstep`) locks the fix in.
+   - **M6.71–M6.85** — chain prefetch (static + chain modes), CMP /
+     CMPA inline expansion, fusion classes (MOVEA+ADDA absorption,
+     LEA(d8,An,Xn)+ADDA, MOVE.L Dm,Dn+Bcc), unified RAM-or-ROM byte
+     bounds for MOVE.B inlines.
+   - **M6.91–M6.144** — the MMIO fast-helper round: 18 custom
+     `m68k_jit_*` helpers replace `m68k_step` for the bench's 21K-hit
+     RTS / BSR / MOVE.L (An)+,Dn / MOVE.B-address / MOVE.W (An)+,Dn
+     MMIO patterns. Bench 100M real_lx7 dropped 1.253 → 1.197 (-4.5 %).
+     `g_helper_touched_mask` narrowed per-helper to skip irrelevant
+     cache reloads.
+   - **M6.136–M6.152** — bridge-trajectory-safety rule established:
+     M6.66's post-divergence chaotic region means a brand-new
+     inline arm with bridge structure can swing boot 100M ±3 % even
+     if its op pattern is rare or absent in boot's helper histo
+     (M6.145 OR.W +2.2 %, M6.148 TST.B +32 %, both reverted). Safe
+     categories — pure-register-op arms, slow-path-conversion of
+     existing arms, compile-time-only fusion — landed cleanly
+     (M6.141 Scc, M6.142 ADDX, M6.143 ROXR, M6.144 MOVE.L bridge swap,
+     M6.146 LSL, M6.149 ROXL, M6.150 ROR/ROL, M6.151 ASL, M6.152
+     ADDA.L).
+   - **M6.153** — extra-bench snapshots `boot-rom-init.snap` (cycle
+     4 M, PC=0x40032C) and `boot-system-load.snap` (cycle 60 M,
+     PC=0x401F6E) added to ctest. 9 tests total. The originally-
+     planned MacBench 4.0 / THINK C targets remain blocked on the
+     M6.67 Finder app-launch wall; the boot-phase snapshots cover the
+     same broadened-differential value (distinct opcode mix from the
+     Speedometer ALU loop) without that wall.
 
-   Triple-differential (JIT vs interp vs mini vMac) is now SOP after
-   any JIT-affecting change. See `STATUS.md` for the full progression
-   and `memory/triple-differential.md` for the workflow rationale.
+   Current state: **bench 100 M `lx7/cyc` = 1.183, boot 100 M = 1.664**.
+   See `STATUS.md` for the full progression and `INSTRUCTIONS.md` for
+   the per-instruction map. Triple-differential (JIT vs interp vs mini
+   vMac) is SOP after any JIT-affecting change — see
+   `memory/triple-differential.md`.
 
 ## 7. What's left
 
@@ -205,14 +240,44 @@ because the in-tree Xtensa simulator can't follow a JX out of the
 current block's code memory. Measuring on real ESP32-S3 hardware is
 the next concrete step.
 
-Smaller plate items, in rough decreasing order of impact:
+The three structural items remaining (see the "High-gain backlog"
+section of STATUS.md for the full discussion):
+
+1. **Per-helper CCR-read/write masks** — the most tractable next item.
+   Today every helper bridge forces an `emit_sr_flush` before and an
+   `emit_sr_reload` after; many helpers don't touch CCR at all
+   (RTS / BSR / MOVEA / JMP / fast-helper SP pushes / pops). A table
+   keyed by helper id, with read-mask and write-mask CCR bits, would
+   let the JIT skip the flush before CCR-read=0 helpers and skip the
+   reload after CCR-write=0 helpers. Estimated 2–5 LX7 saved per
+   affected helper bridge.
+
+2. **Trampoline-preserves-a4..a7** — a hand-written asm trampoline
+   around the existing fast helpers, spilling and restoring the
+   cache slots `a4..a7` so the JIT can skip cache flush/reload of
+   slots a helper doesn't touch. Combined with the existing
+   `g_helper_touched_mask` infrastructure, this saves
+   `2 × |unaffected dirty/cached slots|` `l32i`/`s32i` per bridge.
+
+3. **Native chain on ESP32** — infrastructure already in place
+   (`predicted_next_entry`, `chain_entry_addr`, `cache_sig`); the
+   measurement gap is real-hardware-only. Estimated ~5-15 LX7 saved
+   per chained block on hardware.
+
+Smaller plate items:
 - Trace-based / superblock JIT (combine multiple blocks).
-- More inlined hot opcodes (incremental, ~0.1-0.5 % per add).
+- More inlined hot opcodes — see `INSTRUCTIONS.md`'s "Remaining
+  opportunities" list. Trajectory-safety rules from
+  `memory/bridge-only-arms-trajectory-shift.md` apply: pure-register-
+  op extensions and slow-path bridge conversions land cleanly; new
+  arms with bounds-check + bridge structure are risky.
 - Inline simple helper bodies (avoid CALLX0 overhead).
 - Address-error trap on odd PC (could short-circuit a ~6 % boot
   excursion through unmapped memory, with behavioural risk).
 - Per-instruction `mac_mem_tick` in JIT to align VIA timing with
   the interpreter (would extend `--diff-jit` reach past ~12 K
-  cycles but at significant perf cost).
-- MacBench / THINK C bench snapshots for broader differential
-  coverage.
+  cycles but at significant perf cost). The M6.66 chaotic-trajectory
+  problem reduces to "fix this".
+- MacBench / THINK C bench snapshots: the Finder app-launch wall
+  (M6.67 §2809) still stands; the M6.153 boot-phase snapshots cover
+  the equivalent broadened-coverage goal.

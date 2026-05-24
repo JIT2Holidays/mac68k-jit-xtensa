@@ -12,13 +12,22 @@ simulator.
 
 ## Headline numbers (host, JIT vs interp)
 
+State at **M6.153**.
+
 | Workload | interp lx7/cyc | JIT lx7/cyc | speedup |
 |---|---:|---:|---:|
-| Speedometer (frozen snapshot) | 6.462 | **1.279** | **5.05 ×** |
-| Mac Plus ROM boot (100 M cyc) | 5.895 | **1.735** | 3.40 × |
+| Speedometer 20 M cycles (frozen snapshot) | 6.462 | **1.163** | **5.56 ×** |
+| Speedometer 100 M cycles | 6.462 | **1.183** | 5.46 × |
+| Mac Plus ROM boot (100 M cyc) | 5.895 | **1.664** | 3.88 × |
+| Mac Plus ROM boot (5 M cyc, det) | 5.895 | **2.196** | 2.94 × |
 
-The bench exceeds the original "5 × interp" goal (M6.31, M6.51). The
-boot number is path-dependent on VIA-tick timing — see `STATUS.md`.
+The bench exceeds the original "5 × interp" goal (M6.31, M6.51) and has
+since moved another ~9 % faster across the M6.91–M6.152 inline rounds.
+The boot number is path-dependent on VIA-tick timing — see `STATUS.md`
+and `memory/m6.66-trajectory-traps.md`.
+
+For a per-instruction view of what's inline vs what still falls to
+`m68k_step`, see [`INSTRUCTIONS.md`](INSTRUCTIONS.md).
 
 On real ESP32-S3 hardware the additional native-chaining (M6.54) and
 cross-block register-caching (M6.62) optimisations add an estimated
@@ -31,7 +40,7 @@ The `scripts/` helpers wrap the most common entry points:
 
 ```sh
 ./scripts/build.sh                  # cmake + build, host Release
-./scripts/test.sh                   # ctest — 4/4 incl. diff-jit lockstep
+./scripts/test.sh                   # ctest — 9/9 incl. diff-jit lockstep
 ./scripts/gui.sh                    # SDL GUI: Mac Plus ROM + System 6 floppy
 ./scripts/boot.sh jit               # headless boot, 100 M cycles, prints perf
 ./scripts/bench.sh jit              # Speedometer snapshot — JIT cost metric
@@ -75,13 +84,21 @@ JIT-tuning flags:
   EXT / SWAP / LINK / UNLK, NEG / NEGX / NOT / CLR / TST / TAS, TRAP,
   exceptions, autovector interrupts. It is the correctness oracle.
 - **Inline-heavy JIT** (`jit/codegen.c`, `jit/dispatcher.c`) — discovers
-  basic blocks, emits native Xtensa for ~30 hot opcodes / patterns
-  including MOVE, MOVEQ, MOVEA, ADD / ADDA / ADDQ, SUB / SUBA / SUBQ,
-  CMP / CMPI / CMPM, JSR / JMP / RTS (with in-RAM fast paths),
-  Bcc.S / DBcc, fused-CMP+Bcc, MOVE.L push / pop patterns, MOVEM
-  predec / postinc, BTST / ORI MMIO fast helpers. Everything else
-  falls back to a `CALLX0` into `m68k_step`. Full X N Z V C
-  computation with lazy CC liveness.
+  basic blocks and emits native Xtensa for **~120 opcode classes** across
+  the MOVE / MOVEA / MOVEM / MOVEQ / LEA, ADD / ADDA / ADDI / ADDQ / ADDX,
+  SUB / SUBA / SUBI / SUBQ / SUBX, MUL, NEG / NEGX, EXT, CMP / CMPI / CMPM,
+  AND / OR / EOR / NOT / CLR / TST, BTST and (#imm to abs.W) bit family,
+  ASR / ASL / LSR / LSL / ROR / ROL / ROXR / ROXL #imm shift family,
+  ABCD / SBCD / NBCD BCD chain, Bcc / BRA / BSR / JMP / JSR / RTS / DBcc /
+  Scc control family, and the line-F + MOVE-to-SR system family. Eighteen
+  bench / boot patterns (RTS-to-MMIO, BSR-to-MMIO, MOVE.L (An)+,Dn-to-MMIO,
+  MOVE.B address forms, ORI.B / BTST MMIO, MOVEM predec / postinc / mem,
+  MOVE.W (An)+,Dn MMIO, MOVE.L (An),Dn MMIO, line-F trap …) take a custom `m68k_jit_*` fast helper instead of
+  `m68k_step`. Everything still uncovered (PEA, LINK, UNLK, DIV, EXG,
+  full Bxxx-Dn, full shift-by-Dm, line-A traps, MMIO mem-EA bit ops, …)
+  falls back to a `CALLX0` into `m68k_step`. Full X / N / Z / V / C
+  computation with lazy-CC liveness. See [`INSTRUCTIONS.md`](INSTRUCTIONS.md)
+  for the per-instruction map.
 - **Within-block + cross-block register caching** — hot D / A regs
   are cached in `a4..a7` for the lifetime of a block (M6.10), and
   the ESP32 chain epilogue can skip the next block's prologue
@@ -146,7 +163,9 @@ port/host/      host CLI driver — mac68k_host
 port/esp32s3/   ESP-IDF v6 project (component + app + trampolines)
 gui/            SDL2 GUI front-end (mac_gui) — talks to host over a pipe
 tests/          ctest cases (interp / encoder / jit_differential /
-                diff_jit_bench_lockstep)
+                prefetch / diff_jit lockstep — 3 snapshots × {plain,
+                prefetch static, prefetch chain} for the bench, +1 each
+                for the two boot-phase snapshots)
 scripts/        build / test / gui / boot / bench / diff helpers plus
                 QEMU runner and IDF environment helper
 third_party/    minivmac submodule (source of the .Sony driver patch)
@@ -156,17 +175,26 @@ third_party/    minivmac submodule (source of the .Sony driver patch)
 
 ```
 $ ctest --test-dir build
-    interp                            — interpreter runs a hand-built snippet + the demo
-    encoder                           — Xtensa encoder output round-trips through the sim
-    jit_differential                  — JIT register/flag/cycle state matches the interp
-    prefetch                          — m68k_block_static_successors unit tests (M6.71)
-    diff_jit_bench_lockstep           — JIT/interp lockstep on speedo-bench.snap to
-                                        cycle 11000 (M6.68/M6.69 SR-flush regression
-                                        guard). Conditional on the snapshot's presence.
-    diff_jit_bench_lockstep_prefetch  — same lockstep with --prefetch static (M6.71)
-    diff_jit_bench_lockstep_prefetch_chain
-                                      — same lockstep with --prefetch chain (M6.72)
+    interp                                  — interpreter runs a hand-built snippet + the demo
+    encoder                                 — Xtensa encoder output round-trips through the sim
+    jit_differential                        — JIT register/flag/cycle state matches the interp
+    prefetch                                — m68k_block_static_successors unit tests (M6.71)
+    diff_jit_bench_lockstep                 — JIT/interp lockstep on speedo-bench.snap to
+                                              cycle 11000 (M6.68/M6.69 SR-flush regression
+                                              guard). Conditional on the snapshot's presence.
+    diff_jit_bench_lockstep_prefetch        — same lockstep with --prefetch static (M6.71)
+    diff_jit_bench_lockstep_prefetch_chain  — same lockstep with --prefetch chain (M6.72)
+    diff_jit_boot_rom_init_lockstep         — lockstep on boot-rom-init.snap (BTST-heavy ROM
+                                              memory-test loop, M6.153)
+    diff_jit_boot_system_load_lockstep      — lockstep on boot-system-load.snap (MOVE.L stack
+                                              args in ROM trap handlers, M6.153)
 ```
+
+The three `*.snap` lockstep tests are conditional on the snapshot files
+existing in `roms/disks/`. The snapshots are gitignored (copyrighted
+ROM bytes); regenerate them with `scripts/snap-extra-bench.sh` (for the
+two boot-phase snaps) — the Speedometer snap is captured manually under
+the GUI via `MAC68K_SNAP`.
 
 ## Workflow notes
 

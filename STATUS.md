@@ -1,5 +1,10 @@
 # Status
 
+> **Per-instruction status:** see [`INSTRUCTIONS.md`](INSTRUCTIONS.md)
+> for the JIT's full coverage map (inline / fast-helper / m68k_step)
+> across the 68000 ISA, plus the trajectory-safety-aware shopping list
+> for further inline arms.
+
 ## M6.153 — extra-bench snapshots wired into ctest 🎯
 
 Two new boot-phase snapshots stand in for the long-blocked MacBench 4.0
