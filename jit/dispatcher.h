@@ -40,6 +40,8 @@ typedef struct m68k_dispatcher {
     u64 chain_hits;
     u64 chain_misses;
     u64 chain_cache_matches;  /* of chain_hits, how many had prev->cache_sig == next->cache_sig */
+    u64 prefetch_compiles;    /* M6.71 — blocks compiled via the static-successor prefetch path */
+    u64 prefetch_hits;        /* of chain_misses, how many resolved to a block prefetch had already compiled */
     u64 interp_fallbacks;   /* ops run via m68k_step when compile failed */
     u64 arena_resets;
     u64 smc_invalidations;
@@ -54,6 +56,10 @@ typedef struct m68k_dispatcher {
     u64 helper_calls;
 
     bool no_cache;          /* bench toggle: recompile every dispatch */
+    bool prefetch_static;   /* M6.71 — after each compile, also compile
+                             * the block's statically-known successor PCs
+                             * (BRA, Bcc, JMP .L, BSR, DBcc, fall-through).
+                             * Capped at 1 level deep to keep cost bounded. */
 
     /* Self-modifying-code tracking. The guest OS loads code segments into
      * RAM and reuses that RAM, so a cached block can outlive the code it
@@ -73,6 +79,9 @@ bool m68k_dispatcher_init(m68k_dispatcher *d, m68k_cpu *cpu);
    M68K_JIT_ARENA_KB and CC_MODE_BUMP. */
 bool m68k_dispatcher_init_ex(m68k_dispatcher *d, m68k_cpu *cpu,
                              u32 arena_kb, u8 evict_mode);
+/* Enable / disable static-successor prefetch. Off by default. Cheap
+ * to flip at runtime — only affects what get_block does post-compile. */
+void m68k_dispatcher_set_prefetch(m68k_dispatcher *d, bool on);
 void m68k_dispatcher_shutdown(m68k_dispatcher *d);
 
 /* Run compiled blocks until cpu->cycles >= until or the CPU halts. */

@@ -548,6 +548,7 @@ int main(int argc, char **argv) {
        M68K_JIT_ARENA_KB (1024 KB) bump-allocator behaviour. */
     u32 arena_kb = 1024;
     u8  evict_mode = CC_MODE_BUMP;
+    bool prefetch_static = false;   /* M6.71 — static-successor prefetch */
 
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "--interp")) use_jit = false;
@@ -578,6 +579,12 @@ int main(int argc, char **argv) {
             else if (!strcmp(e, "lru"))                         evict_mode = CC_MODE_LRU;
             else if (!strcmp(e, "fifo"))                        evict_mode = CC_MODE_FIFO;
             else { fprintf(stderr, "--evict: expect none|lru|fifo\n"); return 1; }
+        }
+        else if (!strcmp(argv[i], "--prefetch") && i + 1 < argc) {
+            const char *p = argv[++i];
+            if      (!strcmp(p, "none"))   prefetch_static = false;
+            else if (!strcmp(p, "static")) prefetch_static = true;
+            else { fprintf(stderr, "--prefetch: expect none|static\n"); return 1; }
         }
         else if (argv[i][0] == '-') { usage(argv[0]); return 1; }
         else rom_path = argv[i];
@@ -707,6 +714,7 @@ int main(int argc, char **argv) {
         if (!m68k_dispatcher_init(&dd, &cj)) {
             fprintf(stderr, "trace: jit init failed\n"); return 4;
         }
+        m68k_dispatcher_set_prefetch(&dd, prefetch_static);
         u64 step = 0;
         m68k_cpu pre_cj;
         while (cj.cycles < max_cycles && !cj.halted) {
@@ -824,6 +832,7 @@ int main(int argc, char **argv) {
         if (!m68k_dispatcher_init(&dd, &cj)) {
             fprintf(stderr, "diff-jit: jit init failed\n"); return 4;
         }
+        m68k_dispatcher_set_prefetch(&dd, prefetch_static);
         m68k_dispatcher_run_until(&dd, max_cycles);  /* JIT  */
         m68k_run_until(&cpu, cj.cycles);             /* interp to same cyc */
         int bad = 0;
@@ -863,10 +872,12 @@ int main(int argc, char **argv) {
         return 4;
     }
     if (use_jit) {
+        m68k_dispatcher_set_prefetch(&disp, prefetch_static);
         const char *en = evict_mode == CC_MODE_LRU  ? "lru"
                        : evict_mode == CC_MODE_FIFO ? "fifo"
                                                     : "none";
-        fprintf(stderr, "[host] JIT arena=%uKB evict=%s\n", arena_kb, en);
+        fprintf(stderr, "[host] JIT arena=%uKB evict=%s prefetch=%s\n",
+                arena_kb, en, prefetch_static ? "static" : "none");
     }
     /* Run in chunks so the drive-2 disk can be inserted after boot. */
     while (cpu.cycles < max_cycles && !cpu.halted) {
@@ -898,10 +909,14 @@ int main(int argc, char **argv) {
             (unsigned long long)disp.chain_misses,
             (unsigned long long)disp.arena_resets,
             (unsigned long long)disp.smc_invalidations);
-        fprintf(stderr, "[host] interp_fallbacks=%llu  chain_cache_matches=%llu/%llu\n",
+        fprintf(stderr, "[host] interp_fallbacks=%llu  chain_cache_matches=%llu/%llu  "
+            "prefetch_compiles=%llu/%llu  prefetch_hits=%llu\n",
             (unsigned long long)disp.interp_fallbacks,
             (unsigned long long)disp.chain_cache_matches,
-            (unsigned long long)disp.chain_hits);
+            (unsigned long long)disp.chain_hits,
+            (unsigned long long)disp.prefetch_compiles,
+            (unsigned long long)disp.blocks_compiled,
+            (unsigned long long)disp.prefetch_hits);
         /* JIT-cost benchmark metric: estimated LX7 instructions to run the
          * workload, per emulated 68000 cycle. Lower is a faster JIT. */
         u64 cost = disp.xt_instrs

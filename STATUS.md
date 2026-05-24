@@ -636,6 +636,65 @@ bug present at least since M6.61 (and probably earlier) that ctest
 missed. `--diff-jit` on the real benchmark snapshot caught it
 immediately. Workflow memory at `memory/triple-differential.md`.
 
+**M6.71 — block prefetch (static-successor speculative compile).**
+
+Adds `--prefetch none|static` (default `none`). When `static`, after
+the dispatcher compiles a block on demand, it also speculatively
+compiles each statically-known successor of that block (BRA / Bcc /
+JMP (xxx).L / JMP (d16,PC) / JSR variants / BSR / DBcc / plain
+non-control-flow fall-through). Capped at 1 level deep to keep the
+upfront cost bounded; skips arena-resets on the prefetch path so a
+speculative compile never evicts the just-compiled real block.
+
+New `m68k_block_static_successors(b, mem, out[2]) → int`
+extracts up to 2 successor PCs from a block's last_op. Returns 0 for
+dynamic terminators (RTS / RTE / RTR / TRAP / STOP / JMP (An) /
+JSR (An) / line-A / line-F).
+
+Two new stats: `prefetch_compiles` (blocks compiled speculatively)
+and `prefetch_hits` (chain misses where prefetch had already
+compiled the target). Printed in the `[host]` line.
+
+Tests added:
+* `test_prefetch` — unit tests for `m68k_block_static_successors`,
+  hand-crafts blocks for every terminator shape (BRA.S / BRA.W /
+  BRA.L=dynamic, Bcc.S / Bcc.W, BSR.S, DBNE.W, JMP/JSR .L / .W /
+  (d16,PC), RTS / RTE / TRAP / JMP (An) / line-A / STOP all return
+  0, fall-through cap returns pc_end).
+* `diff_jit_bench_lockstep_prefetch` — re-runs the M6.68 SR-flush
+  lockstep regression guard but with `--prefetch static`. Confirms
+  prefetch doesn't perturb the JIT/interp invariants.
+
+Measurements (host, lx7_per_cyc unchanged across all scenarios —
+prefetch trades compile latency for execution-cost-neutral
+speculation):
+
+| Workload                    | prefetch=none | prefetch=static | wall-clock |
+|-----------------------------|--------------:|----------------:|-----------:|
+| Bench 60 M cyc              | 1.279         | 1.279           | identical  |
+| Boot 100 M cyc, 1 MB arena  | 1.735         | 1.735           | +2.6 % wc  |
+| Boot 100 M cyc, 64 KB FIFO  | 1.734         | 1.734           | identical  |
+| Boot 10 M cyc (cold start)  | 1.7x          | 1.7x            | **−5.0 % wc** |
+| Bench 300 M cyc (long run)  | 1.279         | 1.279           | +3.2 % wc  |
+
+Bench: 522 prefetched compiles (of 1010 total), 100 prefetch hits
+(chain misses prefetch had beaten to compilation). Boot: 1425 / 102 208,
+352 hits.
+
+The lx7_per_cyc metric is correctness-neutral because prefetch only
+changes *when* a block compiles, not *what* runs. Wall-clock shows
+the canonical prefetch tradeoff: wins on cold / short runs (5 % on
+the 10 M-cycle boot), small loss on long steady-state runs (3 % on
+300 M-cycle bench — the extra speculative blocks compete with the
+working set without paying back). On the typical 100 M-cycle boot
+the tradeoff is roughly neutral.
+
+**Recommended default: off** for the standard host bench / boot,
+where wall-clock matters and steady-state dominates. **On for
+embedded ESP32-S3 deployment** where the working set is much smaller
+relative to the JIT arena and one-shot boot latency matters more.
+Code path is conditional and zero-overhead when off.
+
 Alternative real-software pair if synthetic benchmarks aren't the
 goal: **Dark Castle** (VIA-timer-driven sound + raster bit-banging
 — tests M3's "good enough to pace 60 Hz VBL, not instruction-cycle-

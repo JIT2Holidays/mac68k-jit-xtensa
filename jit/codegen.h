@@ -104,6 +104,13 @@ typedef struct m68k_block {
      * don't read this field. */
     u64                last_used_cycle;
 
+    /* M6.71 prefetch — terminator opcode + the guest PC it's at. Lets
+     * the dispatcher's prefetch policy analyse the block's static
+     * successors (BRA / Bcc / JMP .L / DBcc / BSR / plain fall-through)
+     * without re-walking the body. */
+    u16                last_op;
+    u32                last_op_pc;
+
     struct m68k_block *hash_next;   /* bucket chain */
 } m68k_block;
 
@@ -111,6 +118,16 @@ typedef struct m68k_block {
  * dispatcher then interp-falls-back for that PC). */
 m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                                jit_helper_addr_fn helper_addr, void *user);
+
+/* M6.71 — fills `out[]` with the statically-known successor PCs of
+ * block `b` and returns the count (0..2). Returns 0 for blocks ending
+ * with a dynamic-target terminator (RTS / JMP (An) / JSR (An) / TRAP /
+ * RTE / STOP / line-A / line-F) and 1-2 for static-target ones (BRA,
+ * Bcc, JMP (xxx).L, BSR, DBcc, plain block-size-cap fall-through).
+ * `mem` is needed to read multi-word displacements. */
+struct mac_mem;
+int m68k_block_static_successors(const m68k_block *b, struct mac_mem *mem,
+                                 u32 out[2]);
 
 void m68k_block_free(m68k_block *b);
 

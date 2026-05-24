@@ -3136,8 +3136,88 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
         b->cache_sig = sig;
     }
     b->last_used_cycle = cpu->cycles;
+    b->last_op = op_word[n_ops - 1];
+    b->last_op_pc = op_pc[n_ops - 1];
     b->hash_next = NULL;
     return b;
+}
+
+/* M6.71 — static successor analysis. See codegen.h for the contract. */
+int m68k_block_static_successors(const m68k_block *b, struct mac_mem *mem,
+                                 u32 out[2]) {
+    u16 op     = b->last_op;
+    u32 op_pc  = b->last_op_pc;
+    int top    = (op >> 12) & 0xF;
+
+    /* BRA / Bcc / BSR (top nibble 6).  Encoding: 0110 cccc dddddddd.
+     * disp byte 0 → .W form (disp16 in next word); 0xFF → .L (68020,
+     * not produced by 68000 Mac code — treated as dynamic to be safe). */
+    if (top == 0x6) {
+        int cc = (op >> 8) & 0xF;
+        i32 disp8 = (i8)(op & 0xFF);
+        u32 taken, ft;
+        if (disp8 == 0) {
+            taken = op_pc + 2 + (u32)(i32)(i16)mac_read16(mem, op_pc + 2);
+            ft    = op_pc + 4;
+        } else if (disp8 == -1) {
+            return 0;
+        } else {
+            taken = op_pc + 2 + (u32)disp8;
+            ft    = op_pc + 2;
+        }
+        if (cc == 0 || cc == 1) {            /* BRA / BSR — one successor. */
+            out[0] = taken;
+            return 1;
+        }
+        /* Bcc — two successors (taken + fall-through). */
+        out[0] = taken;
+        out[1] = ft;
+        return 2;
+    }
+
+    /* DBcc Dn, disp16  —  encoding 0101 cccc 11 001 ddd. disp16 follows. */
+    if (top == 0x5 && ((op >> 6) & 3) == 3 && ((op >> 3) & 7) == 1) {
+        out[0] = op_pc + 4;                  /* fall-through */
+        out[1] = op_pc + 2 + (u32)(i32)(i16)mac_read16(mem, op_pc + 2);
+        return 2;
+    }
+
+    /* JMP / JSR with statically-known effective address. */
+    switch (op) {
+        case 0x4EF9:                         /* JMP (xxx).L */
+        case 0x4EB9:                         /* JSR (xxx).L */
+            out[0] = mac_read32(mem, op_pc + 2);
+            return 1;
+        case 0x4EF8:                         /* JMP (xxx).W */
+        case 0x4EB8:                         /* JSR (xxx).W */
+            out[0] = (u32)(i32)(i16)mac_read16(mem, op_pc + 2);
+            return 1;
+        case 0x4EFA:                         /* JMP (d16,PC) */
+        case 0x4EBA:                         /* JSR (d16,PC) */
+            out[0] = op_pc + 2 + (u32)(i32)(i16)mac_read16(mem, op_pc + 2);
+            return 1;
+        default: break;
+    }
+
+    /* Plain block-size-cap fall-through: the JIT block walker stopped
+     * at M68K_MAX_OPS_PER_BLOCK without hitting a terminator. The
+     * successor PC is just pc_end. Detect by: not a known dynamic
+     * terminator. Dynamic = top-4 RTS/RTE/RTR/STOP/TRAP/JMP/JSR via An
+     * or PC-relative-indexed, plus line-A/line-F traps. */
+    if (top == 0xA || top == 0xF) return 0;
+    if (top == 0x4) {
+        if (op == 0x4E75 || op == 0x4E73 || op == 0x4E77 || op == 0x4E72)
+            return 0;                        /* RTS / RTE / RTR / STOP */
+        if ((op & 0xFFF0) == 0x4E40) return 0;       /* TRAP #n */
+        if ((op & 0xFFC0) == 0x4EC0 || (op & 0xFFC0) == 0x4E80) {
+            /* JMP / JSR <ea>. Only the (xxx).W/.L/(d16,PC) variants are
+             * caught above; the rest (An, (An,Xn), (d8,PC,Xn)) are
+             * dynamic. */
+            return 0;
+        }
+    }
+    out[0] = b->pc_end;
+    return 1;
 }
 
 void m68k_block_free(m68k_block *b) {

@@ -47,12 +47,21 @@ Each script `--help`-style block sits in its first comment. Direct
 ./build/mac68k_host --jit rom.bin   # arbitrary raw 68k image at 0x0
 
 # Boot a real Macintosh Plus ROM, an 800K floppy, a 1 GB Infinite HD as
-# drive 2 (auto-inserted post-boot), with a tuned JIT arena + LRU evict:
+# drive 2 (auto-inserted post-boot), with a tuned JIT arena + LRU evict
+# and static-successor prefetch on:
 ./build/mac68k_host --jit --rom roms/MacPlus.ROM \
     --disk roms/disks/System6.dsk \
     --evict lru --arena-kb 256 \
+    --prefetch static \
     --max-cycles 100000000
 ```
+
+JIT-tuning flags:
+* `--arena-kb N`            — JIT codecache arena size (default 1024).
+* `--evict none|lru|fifo`   — eviction policy on arena fill (M6.63).
+* `--prefetch none|static`  — speculative compile of statically-known
+  block successors (M6.71). `static` helps cold-start latency; mild
+  steady-state overhead. Off by default.
 
 ## What works
 
@@ -143,12 +152,14 @@ third_party/    minivmac submodule (source of the .Sony driver patch)
 
 ```
 $ ctest --test-dir build
-    interp                    — interpreter runs a hand-built snippet + the demo
-    encoder                   — Xtensa encoder output round-trips through the sim
-    jit_differential          — JIT register/flag/cycle state matches the interp
-    diff_jit_bench_lockstep   — JIT/interp lockstep on speedo-bench.snap to
-                                cycle 11000 (M6.68/M6.69 SR-flush regression
-                                guard). Conditional on the snapshot's presence.
+    interp                            — interpreter runs a hand-built snippet + the demo
+    encoder                           — Xtensa encoder output round-trips through the sim
+    jit_differential                  — JIT register/flag/cycle state matches the interp
+    prefetch                          — m68k_block_static_successors unit tests (M6.71)
+    diff_jit_bench_lockstep           — JIT/interp lockstep on speedo-bench.snap to
+                                        cycle 11000 (M6.68/M6.69 SR-flush regression
+                                        guard). Conditional on the snapshot's presence.
+    diff_jit_bench_lockstep_prefetch  — same lockstep with --prefetch static (M6.71)
 ```
 
 ## Workflow notes
