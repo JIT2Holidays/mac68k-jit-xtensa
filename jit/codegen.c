@@ -7225,6 +7225,93 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             }
             emit_advance(&e, 2, 10 + 2 * imm);
             inline_ops++; done = true;
+        } else if (top == 0xE && ((w >> 8) & 1)
+                   && !((w >> 5) & 1)
+                   && (((w >> 3) & 3) == 2)) {
+            /* M6.149 — ROXL.B/W/L #imm,Dn (LEFT direction). Pure-register
+             * sibling of M6.143 ROXR (RIGHT). Boot 100M has 1 688 hits at
+             * 0xE311/E312/E313 (ROXL.B #3,D1/D2/D3 at pc=0x40025x — real
+             * Mac code, not the divergence bogus zone).
+             *
+             * Bit-field decode (mirror of M6.143 ROXR):
+             *   bits 11-9 = count (1..7, 0 means 8)
+             *   bit 8     = 1 (LEFT direction)
+             *   bits 7-6  = size (00 .B, 01 .W, 10 .L)
+             *   bit 5     = 0 (immediate count)
+             *   bits 4-3  = 10 = ROX
+             *   bits 2-0  = Dn
+             *
+             * Semantics for ROXL.size #cnt,Dn (per m68k_interp do_shift
+             * case 6):
+             *   Per iter: inb = current_X (saved from bit 4 of SR);
+             *             new_X = bit (size-1) of val;
+             *             val = ((val << 1) & size_mask) | inb;
+             *             X = last_out = new_X
+             *   After cnt iters: C = X = final last_out;
+             *                    N = bit (size-1) of val;
+             *                    Z = (val == 0);  V = 0
+             *
+             * Cycles: 10 + 2*cnt (m68k_step base 4 + handler 6 + 2*cnt).
+             *
+             * Trajectory risk: ROXL has 1 688 boot 100M fires (much more
+             * than the 12 LSL fires that M6.146 cleared safely). Tested
+             * empirically via ctest + diff + boot 100M comparison. If
+             * trajectory shifts adversely, revert. */
+            int imm = (w >> 9) & 7; if (imm == 0) imm = 8;
+            int dn = w & 7;
+            int szf_local = (w >> 6) & 3;
+            int size_bits = szf_local == 0 ? 8 : szf_local == 1 ? 16 : 32;
+
+            int dn_xt = cache_lookup(&rc, G_D(dn));
+            u8 src_reg = (dn_xt >= 0) ? (u8)dn_xt : 8;
+            if (dn_xt < 0) emit_read_g(&e, &rc, G_D(dn), 8);
+
+            /* a9 = src.size (low size_bits zero-extended). */
+            xt_extui(&e, 9, src_reg, 0, size_bits - 1);
+            /* a10 = current X bit (will be updated per iteration). */
+            xt_extui(&e, 10, R_SR, 4, 0);
+
+            /* Iterate `imm` times — unrolled at compile time. */
+            for (int k = 0; k < imm; k++) {
+                xt_extui(&e, 11, 9, size_bits - 1, 0);   /* a11 = bit (size-1) of val = new_X */
+                xt_slli (&e, 9, 9, 1);                    /* val <<= 1 */
+                xt_extui(&e, 9, 9, 0, size_bits - 1);     /* mask to size_bits */
+                xt_or   (&e, 9, 9, 10);                   /* val |= inb (old X) */
+                xt_mov  (&e, 10, 11);                     /* X = new_X = last_out */
+            }
+
+            /* Merge: clear low size_bits of src_reg, OR in result.size. */
+            xt_srli (&e, 12, src_reg, size_bits);
+            xt_slli (&e, 12, 12, size_bits);
+            u8 dst_reg = (dn_xt >= 0) ? (u8)dn_xt : 8;
+            xt_or   (&e, dst_reg, 12, 9);
+
+            if (dn_xt >= 0) {
+                for (int s = 0; s < rc.active; s++)
+                    if (rc.guest[s] == (u8)G_D(dn)) { rc.dirty |= (u16)(1u << s); break; }
+            } else {
+                emit_write_g(&e, &rc, G_D(dn), 8);
+            }
+
+            if (!flags_dead[i]) {
+                /* CCR: clear NZVCX (bits 0..4), set N from bit (size-1),
+                 * Z from a9==0, C=X=a10 (last_out). */
+                xt_movi (&e, 12, -32);
+                xt_and  (&e, R_SR, R_SR, 12);
+                xt_or   (&e, R_SR, R_SR, 10);             /* C */
+                xt_slli (&e, 12, 10, 4);
+                xt_or   (&e, R_SR, R_SR, 12);             /* X */
+                xt_extui(&e, 12, 9, size_bits - 1, 0);
+                xt_slli (&e, 12, 12, 3);
+                xt_or   (&e, R_SR, R_SR, 12);             /* N */
+                xt_movi (&e, 12, 0x04);
+                xt_bnez (&e, 9, 6);
+                xt_or   (&e, R_SR, R_SR, 12);             /* Z */
+                g_sr_dirty = true;
+                sext_memo_invalidate();
+            }
+            emit_advance(&e, 2, 10 + 2 * imm);
+            inline_ops++; done = true;
         } else if (w == 0x46FC) {
             /* M6.117 — MOVE #imm16,SR. Privileged op. Bench-hot 21 598 hits
              * / 100 M cyc — the last remaining 21K-hit un-inlined opcode
