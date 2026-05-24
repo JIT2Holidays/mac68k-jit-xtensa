@@ -1,13 +1,74 @@
 # Status
 
-## Where things stand right now (post-M6.139)
+## Where things stand right now (post-M6.143)
 
 | Engine | lx7 / cyc | real_lx7 / cyc | × interp baseline (host) |
 |--------|----------:|---------------:|-------------------------:|
-| **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.168** | **1.169** | **5.53 ×** ✅ |
-| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.184** | **1.184** | **5.46 ×** ✅ |
+| **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.164** | **1.165** | **5.55 ×** ✅ |
+| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.183** | **1.184** | **5.46 ×** ✅ |
 | **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.665** | **1.666** | **3.88 ×** |
 | **Boot** (Mac Plus ROM, 5 M cycles, PC=`0x40032C` deterministic)    | **2.196** | **2.196** | **2.94 ×** |
+
+## Trajectory-safe inline series — M6.141, M6.142, M6.143
+
+A reproducible methodology for finding inline arms that can never
+trajectory-shift boot 100M's M6.66 post-VIA-tick chaotic region. The
+key insight: an arm matching opcode pattern P is trajectory-safe iff
+P is STRICTLY ABSENT from boot 100M's full helper histogram — not just
+top-20, since sub-300-hit ops still shift the chaos materially (M6.142
+ADDQ.B Dn revert: 56 boot fires hidden below top-20 caused +2.2 %
+regression).
+
+### Methodology
+
+`jit/dispatcher.c` has a `MAC68K_HISTO_FULL=1` env-gated full-histo
+dump (temporarily restorable in 4 lines). Build with
+`-DJIT_HELPER_HISTO=1`, capture all-non-zero opcodes for both
+workloads, then per-arm pattern-match in shell:
+
+```sh
+for op in $(awk '/^  [0-9a-f]{4}/ {print $1}' /tmp/boot_all.txt); do
+    val=$((16#$op))
+    top=$(( (val >> 12) & 0xF ))
+    # ... matching predicate for the arm's bit pattern ...
+done
+```
+
+If the predicate matches ZERO entries from the boot dump, the arm is
+trajectory-safe. Verified by post-commit boot 100M `lx7/cyc` being
+exactly unchanged (helpers unchanged at 182 033 across all 3 commits).
+
+### Series wins (bench-snapshot ops absent from boot 100M)
+
+| Milestone | Op pattern | Bench hits | bench 20M `lx7/cyc` | Helpers |
+|-----------|-----------|-----------:|--------------------:|--------:|
+| Pre-M6.141 | (baseline) | — | 1.168 | 4 105 |
+| **M6.141** | Scc Dn (Set on Condition → Dn) | 182 | 1.167 | 3 683 |
+| **M6.142** | ADDX.L / SUBX.L Dm,Dn | 476 | 1.166 | 3 207 |
+| **M6.143** | ROXR.B/W/L #imm,Dn (right only — ROXL fires in boot) | 421 | **1.164** | **2 786** |
+
+Net: bench 20M -0.004 lx7/cyc (-0.34 %); helpers -32 %.
+
+The "ROXL is in boot" detail is crucial: bits 4-3 = 10 = ROX (not RO,
+which is bits 4-3 = 11 — m68k_interp's `which == 2` corresponds to
+ROX). Bit 8 = 0 = RIGHT direction. The LEFT-direction ROXL.B fires in
+boot 100M (0xE3xx at 1 688 hits) and was NOT inlined — preserving the
+trajectory.
+
+### Implementation gotchas caught by ctest
+
+* **`emit_addsub_flags_long_masked` clobbers a11 internally.** The
+  C-bit formula computes `xt_and(11, s, d)` BEFORE `xt_xor(13, r, …)`
+  reads `r` — if `r = 11`, the result register is corrupted. Pass
+  `r = 10` (the convention used by CMP.W Dm,Dn).
+* **ADDX/SUBX has STICKY Z.** `Z_new = Z_prev AND (result == 0)`.
+  Implementation: cc_mask omits Z (leaves the existing Z bit alone
+  via the helper's narrow mask), then conditionally clear: `xt_movi
+  12, -5; xt_beqz r, 6; xt_and R_SR, R_SR, 12`.
+* **bits 4-3 = 10 is ROX, not RO** (per m68k_interp's `(op >> 3) & 3`
+  decode: 0=AS, 1=LS, 2=ROX, 3=RO). M6.139 ROL/ROR attempt earlier
+  used the wrong mask and inlined ROX with plain-rotate semantics —
+  caught by ctest correctness check after the trajectory regression.
 
 ## M6.140 — cross-block lazy-CC for JMP/BRA.W static targets
 
