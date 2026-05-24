@@ -88,6 +88,34 @@ Combined Δ since M6.153:
 | Boot 100M helpers | 178 459 | **177 861** | -598 |
 | Boot 100M jit_cost | 166 511 K | **165 800 K** | **-711 K LX7** |
 
+## M6.168 — THINK C bench-only snapshot 🎯
+
+A fourth snapshot, this one a Finder steady-state with 3 overlapping
+windows open at THINK C 8. Unlike the other three, **it is not
+JIT-deterministic** (M6.66 trajectory has already drifted by cycle
+1.9B) — so it is BENCH-only, not for `--diff-jit-trace`. The
+distinct opcode mix is exactly why it's useful: it stresses the
+helper-bridge fast paths far more heavily than any of the existing
+snapshots (~2.1 M helpers per 100 M cycles vs <3K for speedo).
+
+Generation script: `scripts/snap-thinkc8.sh`. The Finder navigation
+to reach this state was OCR-driven: tesseract over the framebuffer
+identified the Infinite HD icon, the Developer folder, and finally
+THINK C 8 (after a thumb-drag scroll past M-R items). All click
+coords are documented in the `finder-navigation-cookbook` memory note.
+
+| Snapshot | PC | Cycle | JIT `lx7/cyc` (100 M) | Helpers (100 M) | Notes |
+|----------|----|-------|----------------------:|----------------:|-------|
+| `speedo-bench.snap` | `0x41E0E6` | 21 M | **1.179** | 2.4 K | tight ALU loop |
+| `boot-rom-init.snap` | `0x40032C` | 4 M | **1.662** | 233 K | RAM init loop |
+| `boot-system-load.snap` | `0x401F6E` | 60 M | **2.518** | 1.6 M | System file post-load |
+| `thinkc8-folder-open.snap` | `0x3E97C0` | 1.9 B | **2.414** | 2.1 M | Finder steady-state — bench-only |
+
+The thinkc8 snapshot took ~3 seconds wall-clock to generate (the
+host runs to 1.9 B Mac cycles at >700 MHz throughput), so future
+re-generation is cheap. Bench numbers above are mid-2026 measurements
+on Darwin host.
+
 ## M6.153 — extra-bench snapshots wired into ctest 🎯
 
 Two new boot-phase snapshots stand in for the long-blocked MacBench 4.0
