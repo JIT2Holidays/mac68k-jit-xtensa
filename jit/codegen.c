@@ -3111,6 +3111,7 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
         }
         b->cache_sig = sig;
     }
+    b->last_used_cycle = cpu->cycles;
     b->hash_next = NULL;
     return b;
 }

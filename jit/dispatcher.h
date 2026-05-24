@@ -68,6 +68,11 @@ typedef struct m68k_dispatcher {
 } m68k_dispatcher;
 
 bool m68k_dispatcher_init(m68k_dispatcher *d, m68k_cpu *cpu);
+/* Extended init: pick an arena size (KB) and an eviction policy
+   (CC_MODE_BUMP / CC_MODE_LRU / CC_MODE_FIFO). The plain init uses
+   M68K_JIT_ARENA_KB and CC_MODE_BUMP. */
+bool m68k_dispatcher_init_ex(m68k_dispatcher *d, m68k_cpu *cpu,
+                             u32 arena_kb, u8 evict_mode);
 void m68k_dispatcher_shutdown(m68k_dispatcher *d);
 
 /* Run compiled blocks until cpu->cycles >= until or the CPU halts. */

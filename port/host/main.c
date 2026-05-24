@@ -526,6 +526,10 @@ int main(int argc, char **argv) {
     bool diff_jit_trace = false;
     bool no_irq = false;
     bool server = false;
+    /* M6.63 — JIT-arena tuning. Defaults match the existing
+       M68K_JIT_ARENA_KB (1024 KB) bump-allocator behaviour. */
+    u32 arena_kb = 1024;
+    u8  evict_mode = CC_MODE_BUMP;
 
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "--interp")) use_jit = false;
@@ -548,6 +552,15 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--diff-jit")) diff_jit = true;
         else if (!strcmp(argv[i], "--diff-jit-trace")) diff_jit_trace = true;
         else if (!strcmp(argv[i], "--no-irq")) no_irq = true;
+        else if (!strcmp(argv[i], "--arena-kb") && i + 1 < argc)
+            arena_kb = (u32)strtoul(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--evict") && i + 1 < argc) {
+            const char *e = argv[++i];
+            if      (!strcmp(e, "none") || !strcmp(e, "bump")) evict_mode = CC_MODE_BUMP;
+            else if (!strcmp(e, "lru"))                         evict_mode = CC_MODE_LRU;
+            else if (!strcmp(e, "fifo"))                        evict_mode = CC_MODE_FIFO;
+            else { fprintf(stderr, "--evict: expect none|lru|fifo\n"); return 1; }
+        }
         else if (argv[i][0] == '-') { usage(argv[0]); return 1; }
         else rom_path = argv[i];
     }
@@ -826,9 +839,16 @@ int main(int argc, char **argv) {
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
     m68k_dispatcher disp;
-    if (use_jit && !m68k_dispatcher_init(&disp, &cpu)) {
-        fprintf(stderr, "JIT init failed\n");
+    if (use_jit && !m68k_dispatcher_init_ex(&disp, &cpu, arena_kb, evict_mode)) {
+        fprintf(stderr, "JIT init failed (arena=%uKB evict=%u)\n",
+                arena_kb, evict_mode);
         return 4;
+    }
+    if (use_jit) {
+        const char *en = evict_mode == CC_MODE_LRU  ? "lru"
+                       : evict_mode == CC_MODE_FIFO ? "fifo"
+                                                    : "none";
+        fprintf(stderr, "[host] JIT arena=%uKB evict=%s\n", arena_kb, en);
     }
     /* Run in chunks so the drive-2 disk can be inserted after boot. */
     while (cpu.cycles < max_cycles && !cpu.halted) {

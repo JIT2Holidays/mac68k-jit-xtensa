@@ -98,6 +98,12 @@ typedef struct m68k_block {
      * are still in a4..a7 from prev's execution). 0xFFFF marks "no sig". */
     u32                cache_sig;
 
+    /* M6.63 LRU-eviction tag: cpu->cycles when this block was last
+     * dispatched. The LRU evict callback walks every cached block to
+     * find the smallest tag and evicts that block. Bump and FIFO modes
+     * don't read this field. */
+    u64                last_used_cycle;
+
     struct m68k_block *hash_next;   /* bucket chain */
 } m68k_block;
 

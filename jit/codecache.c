@@ -6,33 +6,31 @@
 
 static inline u32 cc_align(u32 v) { return (v + (CC_ALIGN - 1u)) & ~(CC_ALIGN - 1u); }
 
-#if GBJIT_JIT_EVICT == 1
-/* Intrusive free-span header, stored at the start of every free span. */
+/* Intrusive free-span header used by CC_MODE_LRU, stored at the start of
+   every free span. */
 typedef struct { u32 size; u32 next; } cc_free_hdr;
-#endif
 
-void codecache_init(codecache *cc, u8 *base, u32 cap) {
+void codecache_init(codecache *cc, u8 *base, u32 cap, u8 mode) {
     cc->base = base;
     cc->used = 0;
     cc->cap  = cap & ~(CC_ALIGN - 1u);
+    cc->mode = mode;
     cc->free_head = CC_NIL;
     cc->evict = 0;
     cc->evict_range = 0;
     cc->evict_ctx = 0;
-#if GBJIT_JIT_EVICT == 1
-    /* Coldness mode: whole arena starts as one free span. */
-    if (cc->cap >= sizeof(cc_free_hdr)) {
+    if (mode == CC_MODE_LRU && cc->cap >= sizeof(cc_free_hdr)) {
+        /* Whole arena starts as one free span. */
         cc_free_hdr *h = (cc_free_hdr *)cc->base;
         h->size = cc->cap;
         h->next = CC_NIL;
         cc->free_head = 0;
     }
-#endif
 }
 
-#if GBJIT_JIT_EVICT == 1   /* ---- coldness: free-list allocator ---- */
+/* ---- CC_MODE_LRU helpers (free-list allocator) ---------------------- */
 
-u8 *codecache_alloc(codecache *cc, u32 size) {
+static u8 *lru_alloc(codecache *cc, u32 size) {
     size = cc_align(size);
     if (size < sizeof(cc_free_hdr)) size = sizeof(cc_free_hdr);
     if (size > cc->cap) return NULL;
@@ -67,7 +65,7 @@ u8 *codecache_alloc(codecache *cc, u32 size) {
     }
 }
 
-void codecache_free(codecache *cc, u32 offset, u32 size) {
+static void lru_free(codecache *cc, u32 offset, u32 size) {
     size = cc_align(size);
     if (size < sizeof(cc_free_hdr)) size = sizeof(cc_free_hdr);
 
@@ -98,28 +96,9 @@ void codecache_free(codecache *cc, u32 offset, u32 size) {
     }
 }
 
-void codecache_reset(codecache *cc) {
-    cc->used = 0;
-    cc->free_head = CC_NIL;
-    if (cc->cap >= sizeof(cc_free_hdr)) {
-        cc_free_hdr *h = (cc_free_hdr *)cc->base;
-        h->size = cc->cap;
-        h->next = CC_NIL;
-        cc->free_head = 0;
-    }
-}
+/* ---- CC_MODE_FIFO helpers (circular ring) --------------------------- */
 
-void codecache_trim(codecache *cc, u8 *block, u32 actual, u32 reserved) {
-    actual = cc_align(actual);
-    reserved = cc_align(reserved);
-    /* Return the unused tail of this allocation to the free list. */
-    if (reserved > actual)
-        codecache_free(cc, (u32)(block - cc->base) + actual, reserved - actual);
-}
-
-#elif GBJIT_JIT_EVICT == 2   /* ---- circular ring: FIFO eviction ---- */
-
-u8 *codecache_alloc(codecache *cc, u32 size) {
+static u8 *fifo_alloc(codecache *cc, u32 size) {
     size = cc_align(size);
     if (size > cc->cap) return NULL;
     /* `used` is the ring write cursor. Wrap rather than split a block
@@ -134,23 +113,9 @@ u8 *codecache_alloc(codecache *cc, u32 size) {
     return cc->base + start;
 }
 
-void codecache_free(codecache *cc, u32 offset, u32 size) {
-    (void)cc; (void)offset; (void)size;     /* ring reclaims by overwrite */
-}
+/* ---- CC_MODE_BUMP helper (plain bump allocator) --------------------- */
 
-void codecache_reset(codecache *cc) {
-    cc->used = 0;
-}
-
-void codecache_trim(codecache *cc, u8 *block, u32 actual, u32 reserved) {
-    (void)reserved;
-    /* Pull the ring cursor back to the block's real end. */
-    cc->used = (u32)(block - cc->base) + cc_align(actual);
-}
-
-#else  /* GBJIT_JIT_EVICT == 0 — plain bump allocator */
-
-u8 *codecache_alloc(codecache *cc, u32 size) {
+static u8 *bump_alloc(codecache *cc, u32 size) {
     cc->used = cc_align(cc->used);
     if (cc->used + size > cc->cap) return NULL;
     u8 *p = cc->base + cc->used;
@@ -158,24 +123,49 @@ u8 *codecache_alloc(codecache *cc, u32 size) {
     return p;
 }
 
+/* ---- runtime-dispatched public API ---------------------------------- */
+
+u8 *codecache_alloc(codecache *cc, u32 size) {
+    switch (cc->mode) {
+        case CC_MODE_LRU:  return lru_alloc(cc, size);
+        case CC_MODE_FIFO: return fifo_alloc(cc, size);
+        default:           return bump_alloc(cc, size);
+    }
+}
+
 void codecache_free(codecache *cc, u32 offset, u32 size) {
-    (void)cc; (void)offset; (void)size;     /* bump allocator can't reclaim */
+    if (cc->mode == CC_MODE_LRU) {
+        lru_free(cc, offset, size);
+    }
+    /* bump and FIFO can't or don't need to reclaim. */
+    (void)offset; (void)size;
 }
 
 void codecache_reset(codecache *cc) {
     cc->used = 0;
+    cc->free_head = CC_NIL;
+    if (cc->mode == CC_MODE_LRU && cc->cap >= sizeof(cc_free_hdr)) {
+        cc_free_hdr *h = (cc_free_hdr *)cc->base;
+        h->size = cc->cap;
+        h->next = CC_NIL;
+        cc->free_head = 0;
+    }
 }
 
 void codecache_trim(codecache *cc, u8 *block, u32 actual, u32 reserved) {
+    actual = cc_align(actual);
+    if (cc->mode == CC_MODE_LRU) {
+        reserved = cc_align(reserved);
+        /* Return the unused tail of this allocation to the free list. */
+        if (reserved > actual)
+            lru_free(cc, (u32)(block - cc->base) + actual, reserved - actual);
+        return;
+    }
+    /* Bump and FIFO both pull the cursor back to the block's real end
+     * — the most-recent allocation is exactly at the cursor. */
     (void)reserved;
-    /* The block is the most recent allocation, so the bump cursor sits
-     * right past it — pull it back to the block's real end and the next
-     * compile packs in immediately after. This is the whole density
-     * win: blocks reserve a worst-case size but emit ~half of it. */
-    cc->used = (u32)(block - cc->base) + cc_align(actual);
+    cc->used = (u32)(block - cc->base) + actual;
 }
-
-#endif
 
 #if defined(ESP_PLATFORM)
 /* ESP32-S3 IRAM is internal SRAM that is NOT routed through the L1 cache

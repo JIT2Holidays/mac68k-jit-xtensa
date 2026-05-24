@@ -194,10 +194,93 @@ static bool smc_flush(m68k_dispatcher *d) {
 
 /* --- init / shutdown -------------------------------------------------- */
 
-bool m68k_dispatcher_init(m68k_dispatcher *d, m68k_cpu *cpu) {
+/* LRU-mode eviction: walk all cached blocks, pick the one with the
+ * lowest last_used_cycle, drop it from the hash + free its codecache
+ * span. Returns the bytes returned to the free list, or 0 if nothing
+ * could be evicted (empty cache).
+ *
+ * Cost: O(N_blocks). On boot's ~100 K blocks this is ~100 K iterations
+ * per eviction — significant; mitigated by the fact that evictions
+ * only happen when the arena fills, and only one per failed alloc. */
+static u32 lru_evict_cb(void *ctx) {
+    m68k_dispatcher *d = (m68k_dispatcher *)ctx;
+    m68k_block *coldest = NULL;
+    m68k_block **coldest_pp = NULL;
+    u64 coldest_tag = (u64)-1;
+    for (u32 i = 0; i < M68K_JIT_BLOCK_BUCKETS; i++) {
+        m68k_block **pp = &d->buckets[i];
+        while (*pp) {
+            m68k_block *b = *pp;
+            if (b->last_used_cycle < coldest_tag) {
+                coldest_tag = b->last_used_cycle;
+                coldest = b;
+                coldest_pp = pp;
+            }
+            pp = &b->hash_next;
+        }
+    }
+    if (!coldest) return 0;
+    /* Unlink from the hash bucket. */
+    *coldest_pp = coldest->hash_next;
+    /* Other blocks may still point to it via predicted_next — invalidate
+     * the whole predictor since we don't track reverse-edges. Cheaper
+     * to clear all than to find which point at the victim. */
+    for (u32 i = 0; i < M68K_JIT_BLOCK_BUCKETS; i++)
+        for (m68k_block *b = d->buckets[i]; b; b = b->hash_next) {
+            if (b->predicted_next == coldest) {
+                b->predicted_next = NULL;
+                b->predicted_next_pc = 0xFFFFFFFFu;
+                b->predicted_next_entry = NULL;
+            }
+        }
+    u32 offset = (u32)((u8 *)coldest->code - d->cc.base);
+    u32 size = coldest->code_size;
+    d->smc_invalidations++;
+    m68k_block_free(coldest);
+    /* Return the span to the codecache free list — but codecache_free
+     * is a no-op in LRU mode for everyone except this caller path, so
+     * we inline its effect by calling it directly. */
+    codecache_free(&d->cc, offset, size);
+    return size;
+}
+
+/* FIFO-mode eviction: every byte range that the ring is about to
+ * overwrite must be evacuated. Drop every cached block whose codecache
+ * span [code-base, code-base+code_size) overlaps [start, end). */
+static void fifo_evict_range_cb(void *ctx, u32 start, u32 end) {
+    m68k_dispatcher *d = (m68k_dispatcher *)ctx;
+    int dropped_any = 0;
+    for (u32 i = 0; i < M68K_JIT_BLOCK_BUCKETS; i++) {
+        m68k_block **pp = &d->buckets[i];
+        while (*pp) {
+            m68k_block *b = *pp;
+            u32 boff = (u32)((u8 *)b->code - d->cc.base);
+            if (boff < end && boff + b->code_size > start) {
+                *pp = b->hash_next;
+                d->smc_invalidations++;
+                m68k_block_free(b);
+                dropped_any = 1;
+            } else {
+                pp = &b->hash_next;
+            }
+        }
+    }
+    if (dropped_any) {
+        /* predicted_next links may now dangle; clear them all. */
+        for (u32 i = 0; i < M68K_JIT_BLOCK_BUCKETS; i++)
+            for (m68k_block *b = d->buckets[i]; b; b = b->hash_next) {
+                b->predicted_next = NULL;
+                b->predicted_next_pc = 0xFFFFFFFFu;
+                b->predicted_next_entry = NULL;
+            }
+    }
+}
+
+bool m68k_dispatcher_init_ex(m68k_dispatcher *d, m68k_cpu *cpu,
+                             u32 arena_kb, u8 evict_mode) {
     memset(d, 0, sizeof(*d));
     d->cpu = cpu;
-    d->arena_cap = M68K_JIT_ARENA_KB * 1024u;
+    d->arena_cap = arena_kb * 1024u;
     mac_write_watch = smc_watch;
     mac_write_watch_ctx = d;
 #if defined(ESP_PLATFORM)
@@ -207,8 +290,19 @@ bool m68k_dispatcher_init(m68k_dispatcher *d, m68k_cpu *cpu) {
     d->arena = malloc(d->arena_cap);
 #endif
     if (!d->arena) return false;
-    codecache_init(&d->cc, (u8 *)d->arena, d->arena_cap);
+    codecache_init(&d->cc, (u8 *)d->arena, d->arena_cap, evict_mode);
+    if (evict_mode == CC_MODE_LRU) {
+        d->cc.evict = lru_evict_cb;
+        d->cc.evict_ctx = d;
+    } else if (evict_mode == CC_MODE_FIFO) {
+        d->cc.evict_range = fifo_evict_range_cb;
+        d->cc.evict_ctx = d;
+    }
     return true;
+}
+
+bool m68k_dispatcher_init(m68k_dispatcher *d, m68k_cpu *cpu) {
+    return m68k_dispatcher_init_ex(d, cpu, M68K_JIT_ARENA_KB, CC_MODE_BUMP);
 }
 
 void m68k_dispatcher_shutdown(m68k_dispatcher *d) {
@@ -399,12 +493,16 @@ void m68k_dispatcher_run_until(m68k_dispatcher *d, u64 until) {
             if (prev->cache_sig == b->cache_sig) d->chain_cache_matches++;
         } else {
             /* get_block may trigger an arena reset (free_all_blocks)
-             * which leaves `prev` dangling. Snapshot the reset counter
-             * and null `prev` if it changed before we touch it. */
+             * which leaves `prev` dangling. M6.63: LRU/FIFO eviction
+             * during the compile inside get_block can also drop the
+             * block `prev` points at — both bump smc_invalidations, so
+             * snapshot both counters and null `prev` if either moved. */
             u64 resets_before = d->arena_resets;
+            u64 inv_before    = d->smc_invalidations;
             b = get_block(d, pc);
             d->chain_misses++;
-            if (d->arena_resets != resets_before) prev = NULL;
+            if (d->arena_resets != resets_before ||
+                d->smc_invalidations != inv_before) prev = NULL;
             if (prev && !d->no_cache) {
                 prev->predicted_next = b;
                 prev->predicted_next_pc = pc;
@@ -429,6 +527,15 @@ void m68k_dispatcher_run_until(m68k_dispatcher *d, u64 until) {
             prev = NULL;
             continue;
         }
+
+        /* M6.63 LRU tag — update on every dispatch, *not* on chain hits
+         * inside the block (those don't pass through here). Means the
+         * LRU eviction sees recent dispatcher entries; chained blocks
+         * keep whatever tag they had when last dispatched. This is the
+         * right approximation: a chained block that's never dispatcher-
+         * entered must be on a chain rooted at a hot dispatcher entry,
+         * which keeps the root hot — eviction follows the root. */
+        b->last_used_cycle = cpu->cycles;
 
         enter_block(d, b);
         d->blocks_executed++;

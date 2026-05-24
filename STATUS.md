@@ -542,6 +542,71 @@ saved). Negligible on bench (1.4 % chain-match rate).
 * #2 comprehensive lazy CCs: M6.16–M6.30 ✅
 * #3 native block chaining on ESP32: M6.54 + audit M6.55–M6.58 ✅
 
+**M6.63 — runtime-selectable JIT-arena eviction policies + sweep.**
+The user asked for LRU and FIFO eviction policies and a comparative
+arena-size sweep against the existing bump allocator. Previously
+`GBJIT_JIT_EVICT` was a compile-time macro with three modes but
+*no actual evict callbacks wired*, so all three behaved as bump.
+
+Refactored:
+* `codecache.h/.c` — dropped `#if GBJIT_JIT_EVICT` gating, runtime
+  dispatch on `cc->mode` field. `codecache_init` now takes a mode
+  parameter (`CC_MODE_BUMP` / `CC_MODE_LRU` / `CC_MODE_FIFO`).
+* `dispatcher.c` — implemented `lru_evict_cb` (O(N) scan for the
+  block with the smallest `last_used_cycle`, free its codecache
+  span, drop from hash, invalidate any predicted_next links pointing
+  at it) and `fifo_evict_range_cb` (drop every block whose
+  codecache span overlaps the ring's about-to-overwrite range).
+* `m68k_block` — added `u64 last_used_cycle`, stamped on every
+  dispatcher entry (not on chain hits — see M6.62).
+* `dispatcher` — `m68k_dispatcher_init_ex(d, cpu, arena_kb,
+  evict_mode)`; legacy `m68k_dispatcher_init` calls it with
+  defaults. Existing `prev`-invalidation cascade extended to react
+  to `smc_invalidations` (LRU/FIFO drops fire that counter) in
+  addition to `arena_resets`.
+* `port/host/main.c` — `--arena-kb N`, `--evict none|lru|fifo` CLI
+  flags.
+
+**Sweep results** (`scripts/evict_sweep.csv`,
+`scripts/evict_sweep.png`):
+
+Bench (Speedometer snapshot): all three policies identical at 1.279
+lx7/cyc across the full 16 KB → 4 MB sweep — the working set is
+small enough to fit in 16 KB so no eviction ever fires. Interp
+baseline 6.462 lx7/cyc.
+
+Boot (Mac Plus ROM, 100 M cycles): pure-bump suffers a sharp cliff
+below 512 KB (1.735 → 2.337 lx7/cyc, +35 %) because the arena
+thrashes — 98 K resets at 16 KB, 1085 even at 256 KB. LRU and FIFO
+both **hold the JIT speed flat (1.734) across the entire range
+with zero arena resets** — the eviction callback fires per
+allocation, dropping the coldest (LRU) or oldest (FIFO) block, no
+massive recompile storm. Interp baseline 5.895 lx7/cyc.
+
+| Arena | bump (lx7/cyc, resets) | LRU | FIFO |
+|-------|-----------------------:|----:|-----:|
+| 16 KB | 2.336 (98 022)         | **1.734** | **1.734** |
+| 256 KB | 2.337 (1 085)         | **1.734** | **1.734** |
+| 1 MB | 1.735 (303)             | **1.734** | **1.734** |
+| 4 MB | 1.734 (75)              | **1.734** | **1.734** |
+
+LRU and FIFO match each other to 3 decimal places at every arena
+size — for this workload's spatial-locality / chain-induced
+working-set shape, the policies are interchangeable. The big win
+is over bump's hard-cliff behaviour at small arenas, which is the
+exact regime ESP32 IRAM lives in (typical JIT-arena allocations
+on -S3 are 256–512 KB).
+
+**Practical implication for ESP32-S3:** turn on either policy
+(LRU is closer to "right" theoretically; FIFO is cheaper at
+allocation time — no O(N) victim scan). Either lets us shrink the
+ESP32 JIT-arena allocation from 1 MB-worth-of-IRAM down to 256 KB
+or even less, freeing IRAM for other purposes, without any
+boot-perf regression.
+
+Reproduce: `scripts/evict_sweep.sh > scripts/evict_sweep.csv` then
+`python3 scripts/evict_sweep_plot.py`.
+
 **Cross-block register caching.** The other unimplemented item.
 M6.10's regcache caches D/A regs *within* a block (loaded at
 prologue, flushed at epilogue). Extending across blocks would
