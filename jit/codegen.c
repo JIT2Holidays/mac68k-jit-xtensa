@@ -2099,22 +2099,52 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             emit_addq_w_dn(&e, w & 7, data, (w >> 8) & 1, flags_dead[i], &rc);
             inline_ops++; done = true;
         } else if (top == 0x3 && ((w >> 6) & 7) == 0 && mode == 0) {
-            /* MOVE.W Dm,Dn — aggressive (held back under --diff-jit). */
+            /* MOVE.W Dm,Dn — aggressive (held back under --diff-jit).
+             *
+             * M6.88 — when flags are dead (lazy-CC marked the next op as a
+             * setter that overwrites all CCR), use a lean 4-op cached
+             * path that combines source low 16 with destination high 16
+             * directly into the dst slot. Bench's 0x03DF58 has
+             * `MOVE.W D5,D4` followed by `MOVE.W (A2),(A3)` (setter) →
+             * flags dead → ~212 K hits / 20 M cyc × 3 LX7 saved ≈ 3 %
+             * bench. */
             int dn = (w >> 9) & 7;
             int dm = w & 7;
-            emit_read_g(&e, &rc, G_D(dm), 9);
-            emit_read_g(&e, &rc, G_D(dn), 11);
-            xt_srli (&e, 11, 11, 16);
-            xt_slli (&e, 11, 11, 16);
-            xt_extui(&e, 12, 9, 0, 15);
-            xt_or   (&e, 11, 11, 12);
-            emit_write_g(&e, &rc, G_D(dn), 11);
-            if (!flags_dead[i]) {
+            if (flags_dead[i]) {
+                u8 src_reg = emit_read_g_in(&e, &rc, G_D(dm), 9);
+                int xt_dst = cache_lookup(&rc, G_D(dn));
+                if (xt_dst >= 0) {
+                    u8 d = (u8)xt_dst;
+                    xt_extui(&e, 12, src_reg, 0, 15);   /* a12 = dm.low_16 */
+                    xt_extui(&e, 11, d, 16, 15);         /* a11 = dn.high_16 */
+                    xt_slli (&e, 11, 11, 16);            /* a11 = high << 16 */
+                    xt_or   (&e, d, 11, 12);              /* dn = combined */
+                    for (int j = 0; j < rc.active; j++)
+                        if (rc.guest[j] == (u8)G_D(dn)) { rc.dirty |= (u16)(1u << j); break; }
+                } else {
+                    /* Uncached dst: load + merge + store. */
+                    xt_l32i(&e, 11, R_CPU, OFF_D(dn));
+                    xt_extui(&e, 12, src_reg, 0, 15);
+                    xt_extui(&e, 11, 11, 16, 15);
+                    xt_slli (&e, 11, 11, 16);
+                    xt_or   (&e, 11, 11, 12);
+                    xt_s32i (&e, 11, R_CPU, OFF_D(dn));
+                }
+                emit_advance(&e, 2, 8);
+                inline_ops++; done = true;
+            } else {
+                emit_read_g(&e, &rc, G_D(dm), 9);
+                emit_read_g(&e, &rc, G_D(dn), 11);
+                xt_srli (&e, 11, 11, 16);
+                xt_slli (&e, 11, 11, 16);
+                xt_extui(&e, 12, 9, 0, 15);
+                xt_or   (&e, 11, 11, 12);
+                emit_write_g(&e, &rc, G_D(dn), 11);
                 xt_slli (&e, 8, 9, 16);
                 emit_logic_flags(&e, 8);
+                emit_advance(&e, 2, 8);
+                inline_ops++; done = true;
             }
-            emit_advance(&e, 2, 8);
-            inline_ops++; done = true;
         } else if (top == 0x3 && ((w >> 6) & 7) == 0 && mode == 7 && (w & 7) == 4) {
             /* MOVE.W #imm16,Dn — bench-warm 0x303C+reg<<9 at ~1000 helpers
              * in 20M cyc (M6.73). Replace low 16 of Dn with imm16, full

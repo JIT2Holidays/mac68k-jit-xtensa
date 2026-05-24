@@ -1,5 +1,62 @@
 # Status
 
+## M6.88 — MOVE.W Dm,Dn skip-flags lean path (delivered)
+
+Same class as M6.87 but for `MOVE.W Dm,Dn`. When the lazy-CC pass
+sets `flags_dead = true` (bench's `MOVE.W D5,D4 ; MOVE.W (A2),(A3)` —
+the second op is a MOVE.W setter that overwrites all CCR), the inline
+emit doesn't need the shifted-to-high-16 source needed by
+`emit_logic_flags`.
+
+Lean cached path (4 LX7) vs original (7 LX7):
+
+```
+                       original (7 cached ops)    M6.88 lean (4 cached ops)
+read Dm                xt_mov 9, slot(dm)         -- (emit_read_g_in)
+read Dn                xt_mov 11, slot(dn)        -- (slot used directly)
+high-clear dn          xt_srli 11, 11, 16
+                       xt_slli 11, 11, 16         xt_extui 11, slot(dn), 16, 15
+                                                  xt_slli 11, 11, 16
+get low_16 of dm       xt_extui 12, 9, 0, 15      xt_extui 12, slot(dm), 0, 15
+combine                xt_or  11, 11, 12          xt_or  slot(dn), 11, 12
+write Dn               xt_mov slot(dn), 11        -- (direct write)
+```
+
+Saves 3 LX7 per call when both Dm and Dn are cached.
+
+**Triple-diff workflow:**
+
+* ctest: 7/7
+* `--diff-jit-trace`: clean through 11 038 cycles
+* Boot 300 K / 5 M det: same final PC; tiny −3 LX7 (one rare skip_flags
+  site in the deterministic boot path)
+
+**Perf:**
+
+| Workload | M6.87 | **M6.88** | Δ |
+|----------|------:|----------:|--:|
+| Bench @ 5 M cyc   | 1.359 lx7/cyc | **1.350 lx7/cyc** | **−0.7 %** lx7 |
+| Bench @ 20 M cyc  | 1.198 lx7/cyc | **1.191 lx7/cyc** | **−0.6 %** lx7 |
+| Bench @ 100 M cyc | 1.340 lx7/cyc | **1.334 lx7/cyc** | **−0.5 %** lx7 |
+| Boot @ 300 K det  | 2.158 | 2.158 | within noise |
+| Boot @ 5 M det    | 12 341 858 lx7 | 12 341 855 lx7 | −3 LX7 |
+| Boot @ 100 M cyc  | 1.734 | 1.734 | unchanged |
+
+**Cumulative M6.84 → M6.88:**
+
+| Workload | M6.84 | M6.88 | Δ |
+|----------|------:|------:|--:|
+| Bench @ 20 M cyc  | 1.257 | **1.191** | **−5.3 %** lx7 |
+| Bench @ 100 M cyc | 1.396 | **1.334** | **−4.4 %** lx7 |
+
+**Bench is now 1.191 lx7/cyc @ 20 M cyc = 5.42 × interp baseline.**
+
+The "skip the .W shift gymnastics when flags are dead" class now covers
+ADDQ.W (M6.87) and MOVE.W Dm,Dn (M6.88). The same pattern generalises
+to ADD.W / SUB.W / AND.W / OR.W / EOR.W Dm,Dn (top=0x8/0x9/0xB/0xC/0xD
+with szf=1) — those are boot-warm rather than bench-hot, so the per-
+workload win would be small but real. Saved as a future-loop candidate.
+
 ## M6.87 — ADDQ.W skip-flags lean path (delivered)
 
 The `emit_addq_w_dn` emitter uses a shifted-to-high-16 form for its
@@ -222,12 +279,12 @@ them each iteration.
    intermediate register writeback. See M6.85 below for the first
    fusion lever in this class.
 
-## Where things stand right now (post-M6.87)
+## Where things stand right now (post-M6.88)
 
 | Engine | lx7 / cyc | × interp baseline |
 |--------|----------:|------------------:|
-| **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.198** | **5.39 ×** ✅ |
-| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.340** | **4.82 ×** |
+| **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.191** | **5.42 ×** ✅ |
+| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.334** | **4.84 ×** |
 | **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.734** | **3.40 ×** |
 | **Boot** (Mac Plus ROM, 5 M cycles, PC=`0x40032C` deterministic)    | **2.468** | **2.39 ×** |
 | **Boot** (Mac Plus ROM, 300 K cycles, PC=`0x40032C` deterministic)  | **2.158** | **2.73 ×** |
