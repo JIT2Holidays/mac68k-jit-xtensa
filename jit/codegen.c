@@ -5940,6 +5940,53 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             }
             emit_advance(&e, 2, 4);
             inline_ops++; done = true;
+        } else if (top == 0x5 && szf == 3 && mode == 0) {
+            /* M6.141 — Scc Dn. Bench 5M's 0x55C1 (SCS D1) at 159 hits.
+             * Writes 0xFF or 0x00 to Dn[7:0] based on condition; does NOT
+             * touch CCR or the upper 24 bits of Dn. Length 2, cycles 8
+             * (m68k_step base 4 + handler 4 — m68k_interp uses a flat
+             * 4 for all Scc forms regardless of cc result).
+             *
+             * Trajectory-safe: 0x55Cx pattern fires in bench's real
+             * code (snapshot pre-divergence area) and does NOT appear
+             * in boot 100M's top-20 helpers, so per
+             * memory/m6.66-trajectory-traps.md this won't shift the
+             * boot 100M chaotic trajectory. */
+            int reg = w & 7;
+            int cc = (w >> 8) & 0xF;
+            /* Compute byte (0xFF or 0x00) into a8. */
+            if (cc == 0) {
+                xt_movi(&e, 8, 0xFF);            /* ST — always true */
+            } else if (cc == 1) {
+                xt_movi(&e, 8, 0);               /* SF — always false */
+            } else {
+                emit_cond(&e, cc);               /* a8 = 0 or 1 */
+                xt_movi(&e, 9, 0);
+                xt_sub  (&e, 8, 9, 8);           /* a8 = -cond (0 or -1) */
+                xt_extui(&e, 8, 8, 0, 7);        /* a8 = byte (0 or 0xFF) */
+            }
+            /* Read Dn (after emit_cond's scratch clobbering a9..a13). */
+            int dn_xt = cache_lookup(&rc, G_D(reg));
+            u8 src_reg;
+            if (dn_xt >= 0) {
+                src_reg = (u8)dn_xt;
+            } else {
+                emit_read_g(&e, &rc, G_D(reg), 9);
+                src_reg = 9;
+            }
+            /* Merge: (D[reg] & ~0xFF) | byte. */
+            xt_srli (&e, 10, src_reg, 8);
+            xt_slli (&e, 10, 10, 8);
+            u8 dst_reg = (dn_xt >= 0) ? (u8)dn_xt : 8;
+            xt_or   (&e, dst_reg, 10, 8);
+            if (dn_xt >= 0) {
+                for (int s = 0; s < rc.active; s++)
+                    if (rc.guest[s] == (u8)G_D(reg)) { rc.dirty |= (u16)(1u << s); break; }
+            } else {
+                emit_write_g(&e, &rc, G_D(reg), 8);
+            }
+            emit_advance(&e, 2, 8);
+            inline_ops++; done = true;
         } else if (top == 0x4 && ((w >> 8) & 0xF) == 0xA && szf == 2 && mode == 0) {
             /* TST.L Dn — bench-warm 0x4A80/0x4A81 (~4 K). N/Z from Dn,
              * V=C=0, X preserved.
