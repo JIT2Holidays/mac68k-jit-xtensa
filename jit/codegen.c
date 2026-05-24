@@ -185,6 +185,29 @@ static u8 g_helper_sr_mask = 3u;
  * arg setup for subsequent helpers that DO read those args. */
 static u8 g_helper_arg_mask = 3u;
 
+/* M6.167 — sibling of M6.166's is_last_op for emit_jit_fast_helper. Set
+ * true when the calling arm is a BLOCK TERMINATOR WITH NO FAST PATH
+ * (the fline trap is the only one of those today). When set:
+ *   - emit_sr_reload is SKIPPED — R_SR going stale at block exit is
+ *     fine, the epilogue's emit_sr_flush is no-op (g_sr_dirty=false
+ *     after the pre-bridge flush).
+ *   - emit_cache_reload is SKIPPED — rc->dirty was cleared by the
+ *     pre-bridge emit_cache_flush, so the epilogue's emit_cache_flush
+ *     has nothing to flush.
+ *   - was_sr_dirty restore is SKIPPED — the only purpose of that
+ *     restore is to make a downstream fast-path's epilogue flush
+ *     R_SR; with no fast path there's no downstream that needs the
+ *     restore. Letting g_sr_dirty stay false prevents the epilogue
+ *     from flushing stale R_SR over the helper's writes.
+ *
+ * Safety: ONLY safe for arms that have NO fast path after the bridge.
+ * The fline arm is the only such arm today. M6.121 documented the
+ * regression that occurs when this is applied to bridges that DO have
+ * fast paths (fast path's emit_write_g sets rc->dirty; if cache_reload
+ * is skipped, the epilogue's cache_flush writes stale cached values
+ * back, corrupting cpu state). */
+static bool g_helper_terminal_no_fastpath = false;
+
 /* Reload every cached slot from cpu state. Called after a helper.
  * Selective per g_helper_touched_mask — slots whose guest reg the
  * helper didn't touch are skipped (cpu state already matches the
@@ -473,12 +496,19 @@ static void emit_jit_fast_helper(xt_emit *e, u8 a8_arg1_reg, i32 imm2,
     xt_mov (e, R_ARG, R_CPU);
     emit_l32r_at(e, R_HELP, helper_lit_off, entry_off + e->len);
     xt_callx0(e, R_HELP);
-    if (g_helper_sr_mask & 2) emit_sr_reload(e);
-    emit_cache_reload(e, rc);
-    /* Only restore was_sr_dirty if the flush or reload cleared the
-     * compile-time flag. With mask=0u both branches skipped — g_sr_dirty
-     * is untouched and no restore is needed. */
-    if ((g_helper_sr_mask & 3u) && was_sr_dirty) g_sr_dirty = true;
+    /* M6.167 — terminal-no-fastpath arms (fline trap) skip both reloads. */
+    if (!g_helper_terminal_no_fastpath) {
+        if (g_helper_sr_mask & 2) emit_sr_reload(e);
+        emit_cache_reload(e, rc);
+        /* Only restore was_sr_dirty if the flush or reload cleared the
+         * compile-time flag. With mask=0u both branches skipped —
+         * g_sr_dirty is untouched and no restore is needed. */
+        if ((g_helper_sr_mask & 3u) && was_sr_dirty) g_sr_dirty = true;
+    }
+    /* For terminal_no_fastpath, leave g_sr_dirty = false (set by the
+     * pre-bridge emit_sr_flush). Epilogue's emit_sr_flush will be a
+     * no-op; cpu->sr retains the helper's writes. R_SR going stale at
+     * block exit is fine. */
 }
 
 /* Size of an emit_load_imm(list) + emit_jit_fast_helper sequence —
@@ -495,11 +525,14 @@ static u32 emit_jit_fast_helper_size(const regcache *rc) {
     if (g_helper_arg_mask & 1) sz += 3u;            /* s32i arg1 */
     if (g_helper_arg_mask & 2) sz += 3u + 3u;       /* movi + s32i arg2 */
     if ((g_helper_sr_mask & 1) && g_sr_dirty) sz += 3u;  /* emit_sr_flush */
-    if (g_helper_sr_mask & 2)                 sz += 3u;  /* emit_sr_reload */
-    if (rc) {
-        for (int i = 0; i < rc->active; i++) {
-            int gi = rc->guest[i];
-            if (g_helper_touched_mask & (1u << gi)) sz += 3u;
+    /* M6.167: terminal_no_fastpath skips both reload paths. */
+    if (!g_helper_terminal_no_fastpath) {
+        if (g_helper_sr_mask & 2) sz += 3u;             /* emit_sr_reload */
+        if (rc) {
+            for (int i = 0; i < rc->active; i++) {
+                int gi = rc->guest[i];
+                if (g_helper_touched_mask & (1u << gi)) sz += 3u;
+            }
         }
     }
     return sz;
@@ -2158,11 +2191,19 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
              * jit_arg1 / jit_arg2 setup. Saves 9 LX7 per fire. Bench's
              * 0xFFFF fires 21 808 times / 100M cyc — ~196 K LX7 saved. */
             g_helper_arg_mask = 0u;
+            /* M6.167 — fline trap is a block terminator with NO fast path.
+             * Skip emit_sr_reload + emit_cache_reload (the block exits;
+             * R_SR/cache going stale is fine, the epilogue's flushes are
+             * compile-time no-ops because g_sr_dirty=false and
+             * rc->dirty=0 after the pre-bridge flushes). +3 LX7 saved
+             * per fire. */
+            g_helper_terminal_no_fastpath = true;
             emit_jit_fast_helper(&e, 8, 0,
                                  lit_off[HELPER_JIT_FLINE_TRAP],
                                  entry_off, &rc);
             g_helper_touched_mask = 0xFFFFu;
             g_helper_arg_mask = 3u;
+            g_helper_terminal_no_fastpath = false;
             /* pc_delta = 0: helper sets cpu->pc to vector 11 directly.
              * cyc_delta = 4: m68k_step base 4; m68k_exception adds 34. */
             emit_advance(&e, 0, 4);
