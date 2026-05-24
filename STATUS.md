@@ -384,13 +384,22 @@ divergence chaotic region (see `memory/m6.66-trajectory-traps.md`), so
 new inline arms shift the trajectory more than they shave LX7. The path
 forward is structural, not piecemeal. Three items, biggest-win-first:
 
-**Progress summary (post-M6.162):**
+**Progress summary (post-M6.164):**
 
 | Item | State | Notes |
 |------|-------|-------|
-| 1. Full register caching | mostly done | Cache miss rate already < 1 %. Widening is low-ceiling. The "trampoline-preserves-a4..a7" sub-item remains as a possible follow-up. |
-| 2. Lazy-CC classifier | partial (M6.158 + M6.162) | Per-helper SR + arg masks delivered. MOVE-family X-bit refactor remains. |
+| 1. Full register caching | mostly done | Cache miss rate already < 1 %. Widening is low-ceiling. The "trampoline-preserves-a4..a7" sub-item remains as a possible follow-up (asm-required on ESP32, untestable on host). |
+| 2. Lazy-CC classifier | partial (M6.158 + M6.162-164) | Per-helper SR + arg masks delivered across 7 non-SR helpers + 3 MOVE-family unused-arg1 helpers + F-line trap. MOVE-family X-bit refactor remains (marginal). Saturated on host. |
 | 3. Native ESP32 chaining | infrastructure ready | Host-unmeasurable. Awaiting on-device benchmark. |
+
+**Host-perf saturation (memory/host-perf-saturation.md):** post-M6.164
+the host-measurable optimization frontier is saturated. Cataloged
+failed attempts (M6.136/M6.142-first/M6.145/M6.148/M6.162-first/
+M6.163-first/M6.165) establish the empirical boundaries. Further
+gains require deeper structural moves: trampoline preserves a4-a7
+(Item 1 sub), native ESP32 chain on hardware (Item 3), M6.66
+root-cause fix, or dynamic-Dm-count shift inline with runtime
+cycle accounting.
 
 ### 1. Full register caching of hot D/A regs across a block
 
@@ -446,8 +455,8 @@ at block-compile time. Hits eliminate `l32i`/`s32i`; misses fall back to
 
 ### 2. Comprehensive lazy CCs with a classifier modelling helper CCR usage
 
-**Partial delivery: M6.158 + M6.162** — see the per-helper masks at
-the top of `jit/codegen.c`:
+**Partial delivery: M6.158 + M6.162 + M6.163 + M6.164** — see the
+per-helper masks at the top of `jit/codegen.c`:
 
 * `g_helper_sr_mask` (M6.158): clear bits to skip
   `emit_sr_flush` / `emit_sr_reload` around helpers that don't read /
@@ -457,6 +466,15 @@ the top of `jit/codegen.c`:
   `s32i jit_arg1` / `movi+s32i jit_arg2` setup when the helper ignores
   those args. RTS uses mask=0u, BSR mask=1u, CLR.W (An)+ mask=2u.
   Win: bench 100M `lx7/cyc` 1.182 → 1.180 (-0.17 %, -153K LX7).
+* `g_helper_arg_mask = 0u` extended to F-line trap (M6.163): saves
+  9 LX7/fire on bench's 21K-fire chaos region. Win: bench 100M xt
+  -65K LX7.
+* `g_helper_arg_mask = 2u` extended to MOVE-family helpers (M6.164):
+  3 MOVE helpers verified to ignore jit_arg1
+  (`move_w_postinc_to_dn`, `move_l_postinc_to_dn_mmio`,
+  `move_l_dn_to_anpi_mmio`). Win: bench 100M 1.180 → 1.179, boot 100M
+  1.658 → 1.657, boot 5M det 2.196 → 2.195 — three workloads moved
+  at 3-decimal precision.
 * Memory note `memory/per-helper-sr-mask.md` records the verified-clean
   helper list and the rule for extending it.
 
