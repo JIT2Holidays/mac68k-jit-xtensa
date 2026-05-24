@@ -7241,6 +7241,76 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             emit_immarith_bw_dn(&e, w & 7, imm, size, (w >> 9) & 7, &rc);
             inline_ops++; done = true;
         } else if (top == 0x0 && !((w >> 8) & 1) && ((w >> 9) & 7) == 6
+                   && szf == 1 && mode == 2) {
+            /* M6.172 — CMPI.W #imm,(An). thinkc8-folder-open bench's
+             * 0x0C50 at PC=0x3E5814 — Finder linked-list walk's inner
+             * compare against a tagged record byte. ~50K hits / 100 M.
+             * Absent from boot 100 M and speedo. Trajectory-safe per
+             * the M6.142 predicate.
+             *
+             * Sibling of M6.80 CMPI.W (d16,An) at line below: same
+             * compare + flag-set + MMIO bridge structure; just no d16
+             * (EA = An). Length 4 (op + imm16), cycles 8. */
+            int src_an = w & 7;
+            u16 imm = mac_read16(cpu->mem, op_pc[i] + 2);
+            i32 imm32 = (i32)(i16)imm;
+
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(src_an), 8);     /* a8 = An (EA) */
+            /* Unified RAM-or-ROM bounds (source might be ROM-resident
+             * Toolbox data). Mirrors M6.80 CMPI.W (d16,An). */
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_l32r_at(&e, 9, lit_off[LITERAL_ROM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 11, 8, 9);
+            emit_l32r_at(&e, 9, lit_off[LITERAL_ROM_BASE],
+                         entry_off + e.len);
+            xt_xor  (&e, 11, 11, 9);
+            xt_and  (&e, 12, 10, 11);              /* a12==0 iff RAM or ROM */
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_ci2 = 4, op_cyc_ci2 = 8;
+            g_helper_touched_mask = 0u;            /* CMP flag-only */
+            xt_beqz (&e, 12, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_ci2, op_cyc_ci2)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_ci2, op_cyc_ci2);
+            g_helper_touched_mask = 0xFFFFu;
+            u32 jci2_pos = e.len;
+            xt_j    (&e, 4);
+            /* Fast path: pick base via a10 (RAM_BASE when a10==0). */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_beqz (&e, 10, 6);
+            emit_l32r_at(&e, 9, lit_off[ADDR_ROM_HOST_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);
+            /* Read .W (2 BE bytes) → a11. */
+            xt_l8ui (&e, 11, 9, 0);
+            xt_l8ui (&e, 12, 9, 1);
+            xt_slli (&e, 11, 11, 8);
+            xt_or   (&e, 11, 11, 12);
+            /* Shift mem.W to high 16 → a9 (= d for SUB). */
+            xt_slli (&e, 9, 11, 16);
+            /* imm.W shifted to high 16 → a8 (= s for SUB). */
+            emit_load_imm(&e, 8, 11, (u32)imm32);
+            xt_slli (&e, 8, 8, 16);
+            /* r = d - s → a10. */
+            xt_sub  (&e, 10, 9, 8);
+            if (!flags_dead[i]) {
+                emit_addsub_flags_long_masked(&e, true, true, 8, 9, 10, flags_needed[i]);
+            }
+            emit_advance(&e, op_pc_ci2, op_cyc_ci2);
+
+            u32 here_ci2 = e.len;
+            i32 jo_ci2 = (i32)(here_ci2 - jci2_pos) - 4;
+            u32 jw_ci2 = ((u32)((u32)jo_ci2 & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jci2_pos    ] = (u8)jw_ci2;
+            base[entry_off + jci2_pos + 1] = (u8)(jw_ci2 >> 8);
+            base[entry_off + jci2_pos + 2] = (u8)(jw_ci2 >> 16);
+
+            inline_ops++; done = true;
+        } else if (top == 0x0 && !((w >> 8) & 1) && ((w >> 9) & 7) == 6
                    && szf == 1 && mode == 5) {
             /* CMPI.W #imm16, (d16,An) — bench-warm 0x0C6D (CMPI.W #imm,
              * (d16,A5)) at 515 hits/20 M cyc (M6.80).
