@@ -6703,6 +6703,83 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                  * falling through. M6.131 reset at iter start cleans up. */
                 g_helper_touched_mask = 0u;
             }
+        } else if (top == 0x4 && ((w >> 8) & 0xF) == 0xA && szf == 0
+                   && mode == 5) {
+            /* M6.169 — TST.B (d16,An). thinkc8-folder-open bench's
+             * 638 K helpers/100 M cyc on the Finder linked-list walk
+             * at PC=0x3E580E. Trajectory-safe (4A28 absent from speedo,
+             * fires 6 times in boot 100 M). Length 4 (opcode + d16
+             * ext), cycles 4 (interp returns early before the +4 in
+             * the NEGX/CLR/NEG/NOT/TST/TAS group).
+             *
+             * Sibling of M6.144 BTST.B (d16,An) — same EA pattern,
+             * same RAM-bounds-check + custom-MMIO-helper structure.
+             * The custom helper (m68k_jit_tst_b_mmio) takes EA in
+             * jit_arg1 and sets only N/Z (V/C cleared, X kept).
+             *
+             * Fast path: l8ui byte, shift to bit 31 so emit_logic_flags
+             * sees N=bit 7 and Z=(byte==0) at the same position it would
+             * for a .L value. */
+            int an = w & 7;
+            i16 d16 = (i16)mac_read16(cpu->mem, op_pc[i] + 2);
+
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(an), 8);
+            if (d16 >= -128 && d16 <= 127) {
+                xt_addi(&e, 8, 8, d16);
+            } else {
+                emit_load_imm32(&e, 11, 12, (u32)(i32)d16);
+                xt_add(&e, 8, 8, 11);
+            }
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and(&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_tb = 4, op_cyc_tb = 4;
+
+            /* Bridge size for the MMIO arm (must match what we emit).
+             * 3 setup ops: s32i arg1, mov R_ARG, l32r helper, callx0.
+             * Plus 3 each for sr_flush (if g_sr_dirty) and sr_reload.
+             * No emit_cache_reload — tst_b_mmio doesn't touch D/A regs. */
+            u32 tst_bridge_size = 4u * 3u;  /* s32i, mov, l32r, callx0 */
+            if (g_sr_dirty) tst_bridge_size += 3u;
+            tst_bridge_size += 3u;          /* emit_sr_reload */
+            xt_beqz(&e, 10, (i32)(6u + tst_bridge_size));
+            /* --- Custom MMIO TST helper bridge. --- */
+            sext_memo_invalidate();
+            emit_sr_flush(&e);
+            xt_s32i(&e, 8, R_CPU, OFF_JIT_ARG1);   /* arg1 = addr */
+            xt_mov (&e, R_ARG, R_CPU);
+            emit_l32r_at(&e, R_HELP, lit_off[HELPER_JIT_TST_B_MMIO],
+                         entry_off + e.len);
+            xt_callx0(&e, R_HELP);
+            g_block_emitted_callx0 = true;
+            emit_sr_reload(&e);
+            /* Note: NO emit_cache_reload — tst_b_mmio preserves D/A. */
+            /* --- end custom bridge --- */
+            u32 jtb_pos = e.len;
+            xt_j(&e, 4);
+            /* Fast path: read byte from RAM, set N/Z via logic flags. */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add(&e, 9, 9, 8);
+            xt_l8ui(&e, 10, 9, 0);                  /* a10 = byte */
+            if (!flags_dead[i]) {
+                /* Shift byte to bit 31 so emit_logic_flags reads N=bit 7
+                 * and Z=(byte==0) at the .L convention. */
+                xt_slli(&e, 10, 10, 24);
+                emit_logic_flags(&e, 10);
+            }
+            sext_memo_invalidate();
+            emit_advance(&e, op_pc_tb, op_cyc_tb);
+            u32 here_tb = e.len;
+            i32 jo_tb = (i32)(here_tb - jtb_pos) - 4;
+            u32 jw_tb = ((u32)((u32)jo_tb & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jtb_pos    ] = (u8)jw_tb;
+            base[entry_off + jtb_pos + 1] = (u8)(jw_tb >> 8);
+            base[entry_off + jtb_pos + 2] = (u8)(jw_tb >> 16);
+
+            inline_ops++; done = true;
         } else if (top == 0x4 && ((w >> 8) & 0xF) == 0x4 && szf == 2 && mode == 0) {
             /* NEG.L Dn — bench-warm 0x4480-0x4487 at ~1500 helpers in 20M cyc
              * (M6.73). r = 0 - Dn; full CCR via the existing SUB-style flag

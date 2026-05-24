@@ -735,6 +735,21 @@ void m68k_jit_clr_w_anpi_mmio(m68k_cpu *cpu) {
     m68k_set_ccr(cpu, ccr);
 }
 
+/* M6.169 — TST.B (d16,An) MMIO fast helper. thinkc8-folder-open bench's
+ * 638 K hits / 100 M cyc on the Finder linked-list walk at PC=0x3E580E.
+ * The JIT arm pre-computes EA = An + (s16)d16 and passes it via
+ * jit_arg1; this helper just reads the byte (mac_read8 dispatches to
+ * RAM, ROM, or MMIO transparently) and sets N/Z. V/C cleared, X kept.
+ * No D/A reg writes — JIT can skip emit_cache_reload after the bridge. */
+void m68k_jit_tst_b_mmio(m68k_cpu *cpu) {
+    u32 addr = cpu->jit_arg1;
+    u8 d = mac_read8(cpu->mem, addr);
+    u8 ccr = m68k_get_ccr(cpu) & CCR_X;
+    if (d == 0)   ccr |= CCR_Z;
+    if (d & 0x80) ccr |= CCR_N;
+    m68k_set_ccr(cpu, ccr);
+}
+
 /* M6.137 — F-line trap fast helper. Bench-hot 0xFFFF at 21 808 hits /
  * 100 M cyc (the bench's M6.66-equivalent divergence zone fetches
  * 0xFFFF from unmapped memory, which top-nibble F decodes to line-F).
