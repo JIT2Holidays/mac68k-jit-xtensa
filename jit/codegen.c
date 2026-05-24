@@ -6760,6 +6760,98 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             }
             emit_advance(&e, 2, 4);
             inline_ops++; done = true;
+        } else if ((w & 0xFFF8) == 0x4E50) {
+            /* M6.174 — LINK An,#d16. Subroutine entry: stack-frame
+             * setup. Pairs with M6.173 UNLK An. Fires ~50K/100M on
+             * thinkc8 at PC=0x3EA882 (LINK A6 — canonical frame setup).
+             * Absent from boot 100M; 40 hits in speedo.
+             *
+             * Semantics (per m68k_interp.c:1038):
+             *     cpu->a[7]  -= 4;
+             *     mac_write32(cpu->mem, cpu->a[7], cpu->a[an]);
+             *     cpu->a[an] = cpu->a[7];
+             *     cpu->a[7] += (u32)(i32)d16;     (d16 typically negative
+             *                                      to allocate locals)
+             *
+             * For An==7 (rare/degenerate) the writes overlap; the spec
+             * says cpu->a[7]'s value pushed to (SP-4) is the value AFTER
+             * the SP -= 4 (which then is overwritten by a[an] = a[7]). We
+             * follow interp order exactly.
+             *
+             * MMIO falls through to default m68k_step helper. Length 4,
+             * cycles 16 (interp base 4 + handler 12). */
+            int an = w & 7;
+            i16 d16 = (i16)mac_read16(cpu->mem, op_pc[i] + 2);
+
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(7), 8);              /* a8 = current SP */
+            xt_addi (&e, 8, 8, -4);                        /* a8 = SP - 4 = new SP */
+
+            /* Bounds check on the new SP (write target). */
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_link = 4, op_cyc_link = 16;
+            g_helper_touched_mask = (u16)((1u << G_A(an)) | (1u << G_A(7)));
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_link, op_cyc_link)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_link, op_cyc_link);
+            g_helper_touched_mask = 0xFFFFu;
+            u32 jlink_pos = e.len;
+            xt_j    (&e, 4);
+
+            /* Fast path:
+             *   a[7] = a8         (= SP - 4)
+             *   mac_write32(a8, a[an])
+             *   a[an] = a8        (= new SP, before final adjust)
+             *   a[7] = a8 + d16   (allocate stack locals) */
+            emit_write_g(&e, &rc, G_A(7), 8);              /* SP = SP-4 */
+
+            /* Read a[an] (the value to push). Note: for an==7 we must
+             * read the value that's currently in a[7], which we just
+             * wrote = (SP-4). That's correct: LINK A7 pushes the
+             * post-decrement SP value. */
+            emit_read_g(&e, &rc, G_A(an), 11);             /* a11 = a[an] */
+
+            /* Write 4 BE bytes of a11 to RAM at a8. */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);                          /* a9 = ram + a8 */
+            xt_extui(&e, 12, 11, 24, 7);
+            xt_s8i  (&e, 12, 9, 0);
+            xt_extui(&e, 12, 11, 16, 7);
+            xt_s8i  (&e, 12, 9, 1);
+            xt_extui(&e, 12, 11,  8, 7);
+            xt_s8i  (&e, 12, 9, 2);
+            xt_extui(&e, 12, 11,  0, 7);
+            xt_s8i  (&e, 12, 9, 3);
+
+            /* a[an] = a8 (= new SP). For an==7 this overwrites the prior
+             * SP = SP-4 with the same value (a8 = SP-4), so it's a no-op
+             * — matches interp's net effect. */
+            emit_write_g(&e, &rc, G_A(an), 8);
+
+            /* a[7] += d16. Read back a[7] in case an==7 overlaid it. */
+            emit_read_g(&e, &rc, G_A(7), 11);
+            if (d16 >= -128 && d16 <= 127) {
+                xt_addi(&e, 11, 11, d16);
+            } else {
+                emit_load_imm(&e, 12, 10, (u32)(i32)d16);
+                xt_add (&e, 11, 11, 12);
+            }
+            emit_write_g(&e, &rc, G_A(7), 11);
+
+            emit_advance(&e, op_pc_link, op_cyc_link);
+
+            u32 here_link = e.len;
+            i32 jo_link = (i32)(here_link - jlink_pos) - 4;
+            u32 jw_link = ((u32)((u32)jo_link & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jlink_pos    ] = (u8)jw_link;
+            base[entry_off + jlink_pos + 1] = (u8)(jw_link >> 8);
+            base[entry_off + jlink_pos + 2] = (u8)(jw_link >> 16);
+
+            inline_ops++; done = true;
         } else if ((w & 0xFFF8) == 0x4E58) {
             /* M6.173 — UNLK An. thinkc8-folder-open bench's 0x4E5E
              * (UNLK A6) at PC=0x3E9800 — subroutine epilogue stack-frame
