@@ -44,6 +44,18 @@ static u32 ram_bounds_mask(m68k_cpu *cpu) {
     return (~(sz - 1u)) | 1u;
 }
 
+/* M6.76 — parallel ROM bounds mask. Failing the AND fast-path test means
+ * "addr is NOT a power-of-two-aligned even ROM address in the canonical
+ * [MAC_ROM_BASE, MAC_ROM_BASE + rom_size) range." During overlay the whole
+ * map shifts, so we disable the ROM fast path like ram_bounds_mask does. */
+static u32 rom_bounds_mask(m68k_cpu *cpu) {
+    if (!cpu || !cpu->mem) return 0xFFFFFFFFu;
+    if (cpu->mem->overlay) return 0xFFFFFFFFu;
+    u32 sz = cpu->mem->rom_size;
+    if (sz == 0 || (sz & (sz - 1))) return 0xFFFFFFFFu;  /* non-pow2 → off */
+    return (~(sz - 1u)) | 1u;
+}
+
 static u32 helper_addr(literal_id id, void *user) {
     m68k_cpu *cpu = (m68k_cpu *)user;
 #if defined(ESP_PLATFORM)
@@ -59,6 +71,14 @@ static u32 helper_addr(literal_id id, void *user) {
         case HELPER_JIT_MOVEM_W_TO_MEM:  return (u32)(uintptr_t)&m68k_jit_movem_w_to_mem;
         case HELPER_JIT_MOVEM_L_TO_MEM:  return (u32)(uintptr_t)&m68k_jit_movem_l_to_mem;
         case HELPER_JIT_MOVE_W_POSTINC_TO_DN: return (u32)(uintptr_t)&m68k_jit_move_w_postinc_to_dn;
+        case LITERAL_ROM_BOUNDS:return rom_bounds_mask(cpu);
+        case LITERAL_ROM_BASE:  return (cpu && cpu->mem && cpu->mem->rom) ? MAC_ROM_BASE : 0xFFFFFFFFu;
+        /* host_ptr - guest_base, so `host_ptr + guest_addr` lands at
+         * the host's rom[] entry for the matching guest ROM address. */
+        case ADDR_ROM_HOST_BASE:
+            return (cpu && cpu->mem && cpu->mem->rom)
+                ? ((u32)(uintptr_t)cpu->mem->rom - MAC_ROM_BASE)
+                : 0u;
         default:                return 0;
     }
 #else
@@ -75,6 +95,13 @@ static u32 helper_addr(literal_id id, void *user) {
         case HELPER_JIT_MOVEM_W_TO_MEM:  return (u32)HELPER_JIT_MOVEM_W_TO_MEM;
         case HELPER_JIT_MOVEM_L_TO_MEM:  return (u32)HELPER_JIT_MOVEM_L_TO_MEM;
         case HELPER_JIT_MOVE_W_POSTINC_TO_DN: return (u32)HELPER_JIT_MOVE_W_POSTINC_TO_DN;
+        case LITERAL_ROM_BOUNDS:return rom_bounds_mask(cpu);
+        case LITERAL_ROM_BASE:  return (cpu && cpu->mem && cpu->mem->rom) ? MAC_ROM_BASE : 0xFFFFFFFFu;
+        /* The host sim's translate maps HOST_RAM_BASE + (0x400000..rom_top)
+         * to mem->rom for the matching guest range, so we can re-use the
+         * same sentinel base on host — the sim's auto-route handles ROM. */
+        case ADDR_ROM_HOST_BASE:
+            return (cpu && cpu->mem && cpu->mem->rom) ? HOST_RAM_BASE : 0u;
         default:                return 0;
     }
 #endif

@@ -2054,6 +2054,120 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + jlp_pos + 2] = (u8)(jww >> 16);
 
             inline_ops++; done = true;
+        } else if (top == 0x2 && ((w >> 6) & 7) == 3 && mode == 3) {
+            /* MOVE.L (An)+,(Am)+ — mem-to-mem long copy. Bench-hot
+             * 0x28D8 (MOVE.L (A0)+,(A4)+) at ~71 K helpers in 20 M cyc;
+             * 0x22D8 (MOVE.L (A0)+,(A1)+) at ~13 K (M6.76).
+             *
+             * Bit-field decode (per memory/triple-differential.md
+             * post-M6.75 lesson):
+             *   0x28D8 = 0010_1000_1101_1000
+             *            top=2  reg=4 m=3   m=3 reg=0
+             *                        dst   src
+             *   → top=0x2 (.L MOVE), dst_mode=3 ((An)+), dst_reg=A4,
+             *     src_mode=3 ((An)+), src_reg=A0.
+             *
+             * Source admits RAM OR ROM (Speedometer reads pointer
+             * tables in ROM at PC ≈ 0x408???). Destination admits RAM
+             * only. Bounds-check both upfront; both-OK → inline copy.
+             *
+             * Same-An edge case (e.g. MOVE.L (A0)+,(A0)+): src ea_decode
+             * captures orig and increments An; dst ea_decode captures
+             * the now-incremented An and increments again. So the write
+             * happens at orig+4 and An ends at orig+8. We mirror this
+             * by resynching the dst-An register (a15) to the post-incr
+             * src An (a8) when src_an == dst_am. */
+            int dst_am = (w >> 9) & 7;
+            int src_an = w & 7;
+
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(src_an), 8);    /* a8  = src An */
+            emit_read_g(&e, &rc, G_A(dst_am), 15);   /* a15 = dst An (pre-incr) */
+
+            /* Source bounds: a12 == 0 iff src in RAM OR ROM. */
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);                   /* a10 = src & RAM_MASK */
+            emit_l32r_at(&e, 9, lit_off[LITERAL_ROM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 11, 8, 9);
+            emit_l32r_at(&e, 9, lit_off[LITERAL_ROM_BASE],
+                         entry_off + e.len);
+            xt_xor  (&e, 11, 11, 9);                  /* a11 = (src & ROM_M) ^ ROM_BASE */
+            xt_and  (&e, 12, 10, 11);                 /* a12 = 0 iff src RAM-or-ROM */
+
+            /* Dest bounds (RAM only) folded into a12. */
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 9, 15, 9);                   /* a9 = dst & RAM_MASK */
+            xt_or   (&e, 12, 12, 9);                  /* a12 == 0 iff both pass */
+
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_mm = 2, op_cyc_mm = 8;
+            xt_beqz (&e, 12, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_mm, op_cyc_mm)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_mm, op_cyc_mm);
+            u32 jmm_pos = e.len;
+            xt_j    (&e, 4);
+
+            /* === Fast path === */
+            /* Pick src host base: RAM_BASE if a10==0 (in RAM), else ROM. */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_beqz (&e, 10, 6);                     /* rel=6 skips one l32r */
+            emit_l32r_at(&e, 9, lit_off[ADDR_ROM_HOST_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);                   /* a9 = src host ptr */
+
+            /* Read 4 BE bytes from a9 → a10 (.L value). */
+            xt_l8ui (&e, 11, 9, 0);
+            xt_l8ui (&e, 12, 9, 1);
+            xt_slli (&e, 10, 11, 24);
+            xt_slli (&e, 12, 12, 16);
+            xt_or   (&e, 10, 10, 12);
+            xt_l8ui (&e, 11, 9, 2);
+            xt_l8ui (&e, 12, 9, 3);
+            xt_slli (&e, 11, 11, 8);
+            xt_or   (&e, 10, 10, 11);
+            xt_or   (&e, 10, 10, 12);                /* a10 = .L value */
+
+            /* Post-incr src An — commit BEFORE the dst An read sync, in
+             * line with the 68k same-An semantic (dst captures the
+             * already-incremented An). */
+            xt_addi (&e, 8, 8, 4);
+            emit_write_g(&e, &rc, G_A(src_an), 8);
+            if (src_an == dst_am) {
+                xt_mov(&e, 15, 8);  /* a15 = orig+4 (the new "current" An) */
+            }
+
+            /* Dest host ptr: always RAM (dst bounds enforced above). */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 15);                  /* a9 = dst host ptr */
+
+            /* Write 4 BE bytes from a10 → [a9]. */
+            xt_extui(&e, 11, 10, 24, 7); xt_s8i(&e, 11, 9, 0);
+            xt_extui(&e, 11, 10, 16, 7); xt_s8i(&e, 11, 9, 1);
+            xt_extui(&e, 11, 10,  8, 7); xt_s8i(&e, 11, 9, 2);
+            xt_extui(&e, 11, 10,  0, 7); xt_s8i(&e, 11, 9, 3);
+
+            /* Post-incr dst An. */
+            xt_addi (&e, 15, 15, 4);
+            emit_write_g(&e, &rc, G_A(dst_am), 15);
+
+            /* MOVE-family flags from the .L value. */
+            if (!flags_dead[i]) emit_logic_flags(&e, 10);
+
+            emit_advance(&e, op_pc_mm, op_cyc_mm);
+
+            u32 mm_here = e.len;
+            i32 jo_mm = (i32)(mm_here - jmm_pos) - 4;
+            u32 jw_mm = ((u32)((u32)jo_mm & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jmm_pos    ] = (u8)jw_mm;
+            base[entry_off + jmm_pos + 1] = (u8)(jw_mm >> 8);
+            base[entry_off + jmm_pos + 2] = (u8)(jw_mm >> 16);
+
+            inline_ops++; done = true;
         } else if (top == 0x2 && ((w >> 6) & 7) == 0 && mode == 5) {
             /* MOVE.L (d16,An),Dn — bench-warm 0x202F+ at ~1000 helpers in
              * 20M cyc (M6.73). Stack-frame .L read pattern. EA = An +

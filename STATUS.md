@@ -949,6 +949,90 @@ never tested.
 
 ctest: **7 / 7** pass.
 
+**M6.76 — MOVE.L (An)+,(Am)+ mem-to-mem inline with RAM-or-ROM source.**
+Took the actually-hot helper class M6.75 misidentified — `0x28D8`
+(MOVE.L (A0)+,(A4)+) at **71 K hits in 20 M cyc** plus `0x22D8`
+(MOVE.L (A0)+,(A1)+) at **13 K hits** — and inlined it.
+
+Bit-field decode (re-derived from binary per the post-M6.75 SOP):
+
+```
+0x28D8 = 0010_1000_1101_1000
+         top=2  reg=4 m=3   m=3 reg=0
+                      dst   src
+       → top=0x2 (.L MOVE), dst_mode=3 ((An)+), src_mode=3 ((An)+)
+```
+
+Match condition: `top == 0x2 && (w >> 6) & 7 == 3 && mode == 3`.
+
+The source is in **ROM** (Speedometer reads structure-pointer tables
+at PC ≈ `0x408???`), so the fast path needs a RAM-OR-ROM gate.
+Re-introduced the M6.75-attempt literals (`LITERAL_ROM_BOUNDS`,
+`LITERAL_ROM_BASE`, `ADDR_ROM_HOST_BASE`) — this time with a real
+hot user. Destination is **RAM only** (writes to ROM are silently
+dropped by mac_write32, so we defer that to m68k_step). Bounds
+shape:
+
+```
+a10 = src & RAM_MASK
+a11 = (src & ROM_MASK) ^ ROM_BASE      ← 0 iff src in ROM
+a12 = a10 & a11                         ← 0 iff src RAM-or-ROM
+a9  = dst & RAM_MASK
+a12 |= a9                               ← 0 iff both pass
+```
+
+Fast path: pick src host base from `a10` (RAM_BASE if `a10==0`, else
+ROM_HOST_BASE), read 4 BE bytes, increment src An, write 4 BE bytes
+to dst host ptr (always RAM_BASE), increment dst An. The
+`xt_beqz a10, 6` that picks the base is a one-instruction
+conditional emit, so the common RAM-source case pays only one extra
+branch over a single-base inline shape.
+
+**Same-An edge case** (`MOVE.L (A0)+, (A0)+`): the 68k semantic does
+src ea_decode (captures orig and increments An), then dst ea_decode
+(captures the now-incremented An and increments again), so the write
+happens at `orig + 4` and An ends at `orig + 8`. The inline mirrors
+this with a one-op `xt_mov a15, a8` re-sync after the src post-incr,
+only emitted when `src_an == dst_am` at compile time.
+
+**Triple-diff workflow** (the M6.75 lesson made the boot-deterministic
+check a hard prerequisite — re-derived the opcode decode FIRST, then
+wrote the emit, then ran the suite):
+
+* ctest: 7/7
+* `--diff-jit-trace`: only the documented M6.66 cycle-11898 divergence
+* Boot @ 300 K (pre-VBL): PC=`0x40032C`, helpers=1192 — byte-identical to M6.75
+* Boot @ 5 M cyc: PC=`0x40032C`, helpers=25240 — byte-identical to M6.75
+
+**Perf:**
+
+| Workload | M6.75 | **M6.76** | Δ |
+|----------|------:|----------:|--:|
+| Bench @ 5 M cyc (PC=`0x401F52` both)  | 106 316 h, 2.850 lx7/cyc | **84 963 h, 2.767 lx7/cyc** | **−21 K h, −2.9 %** |
+| Bench @ 20 M cyc (PC=`0x40115E` both) | 434 122 h, 2.868 lx7/cyc | **349 500 h, 2.787 lx7/cyc** | **−85 K h, −2.8 %** |
+| Boot @ 5 M / 100 M cyc                | unchanged                | identical                  | — (not boot-hot) |
+
+The 20 M helper drop of 84 622 matches the predicted savings exactly
+(71 K + 13 K = 84 K for the two `(An)+→(An)+` variants).
+
+**Cumulative M6.73-76 bench progression** (5 M-cyc snapshot,
+PC=`0x401F52` throughout):
+
+| Stage | helpers | lx7/cyc |
+|-------|--------:|--------:|
+| M6.72 (pre-batch)              | 197 K  | 3.969 |
+| M6.74 (CMPA.L + …)             | 115 K  | 2.932 |
+| M6.75 (MOVEA.L (d16,An),Am)    | 106 K  | 2.850 |
+| **M6.76 (mem-to-mem RAM+ROM)** | **85 K**   | **2.767** |
+
+ctest: **7 / 7** pass.
+
+The next two top helpers (`0x4a38` TST.B (xxx).W at 15 K and
+`0xe54a` LSR.W variant at 13 K) are smaller, more specialised
+targets. The "ROM source admitted" literals are now in steady use
+and ready for other reads (e.g. `MOVE.L (xxx).W,Dn` patterns at
+boot if they surface).
+
 Alternative real-software pair if synthetic benchmarks aren't the
 goal: **Dark Castle** (VIA-timer-driven sound + raster bit-banging
 — tests M3's "good enough to pace 60 Hz VBL, not instruction-cycle-

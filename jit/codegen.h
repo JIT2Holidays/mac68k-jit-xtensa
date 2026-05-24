@@ -48,6 +48,17 @@ typedef enum {
     HELPER_JIT_MOVEM_W_TO_MEM,   /* MOVEM.W reglist,(An) fast helper */
     HELPER_JIT_MOVEM_L_TO_MEM,   /* MOVEM.L reglist,(An) fast helper */
     HELPER_JIT_MOVE_W_POSTINC_TO_DN, /* MOVE.W (An)+,Dn fast helper for MMIO */
+    /* M6.76 — ROM-source read fast path. Used by the MOVE.L (An)+,(Am)+
+     * mem-to-mem inline arm so that bench's ROM-resident pointer-table
+     * reads (~71K hits/20M cyc) can take a fast path instead of falling
+     * to m68k_step. The pair is also a reusable building block for any
+     * future "src can be RAM or ROM" inline. */
+    LITERAL_ROM_BOUNDS,   /* ~(rom_size-1) | 1 — fails AND for non-ROM addrs */
+    LITERAL_ROM_BASE,     /* MAC_ROM_BASE (0x400000) — xor-target for the */
+                          /* in-ROM range check after the AND mask. */
+    ADDR_ROM_HOST_BASE,   /* host ROM pointer shifted: rom_ptr - 0x400000, so */
+                          /* base + addr lands in the host rom[] array for any */
+                          /* admitted ROM-range guest address. */
     LITERAL_COUNT
 } literal_id;
 
