@@ -1,5 +1,56 @@
 # Status
 
+## M6.106 — BRA.W / Bcc.W disp16 inline
+
+Companion to M6.105's BSR.W: handles the conditional/unconditional .W
+(16-bit displacement) Bcc variants. Same chain-preservation lever —
+inline keeps the JIT chain unbroken through branches with displacements
+beyond ±128 bytes.
+
+**Mid-iteration bug + fix (ctest caught it!):** First version passed
+the raw 16-bit disp to `emit_bcc_branchless_tail`. ctest's
+`jit_differential` failed immediately: demo's BNE.W backward branch
+(used in the sum-loop at op_pc=0x10C) went to the wrong PC because
+the tail computes `taken = ft + disp`, but for Bcc.W `ft = op_pc + 4`
+while the m68k disp16 is relative to `op_pc + 2`. The fix is to pass
+`disp - 2` — same off-by-2 adjustment as the M6.38 DBcc arm (which
+has the same 4-byte op-length quirk).
+
+The classic `--diff-jit-trace` at 11 038 cycles passed even with the
+bug (the bench doesn't hit Bcc.W backward branches in that window),
+but `jit_differential` (the synthetic demo with explicit
+sum-loop + BNE.W backward) caught it instantly. **The synthetic ctest
+remains the most sensitive correctness signal** for new branch-tail
+arms — boot 100M cycle drift takes longer to manifest.
+
+Pre-pass extended: when block ends with BRA.W (cc=0), set
+LITERAL_BCC_PC = taken; for Bcc.W (cc≥2), set = fall-through (op_pc+4).
+Mirrors the M6.105 BSR.W handling.
+
+**Triple-diff workflow:**
+
+* ctest: 7/7 (after the disp - 2 fix; before the fix, demo BNE.W diverged)
+* `--diff-jit-trace`: clean through 11 038 cycles
+* Boot 5 M det / 100 M: byte-identical (no cycle drift)
+* Bench (20 M): 7 071 → 6 868 helpers (−203)
+* Bench (100 M): 226 649 → 226 445 (−204) — Bcc.W is less common at
+  long horizons than BSR.W since most Bcc patterns are .S
+* Boot 100 M: 185 977 → 185 842 helpers (−135)
+
+**Perf:**
+
+| Workload | M6.105 | **M6.106** | Δ |
+|----------|------:|----------:|--:|
+| Bench (20 M)     | 1.178 lx7/cyc | **1.177 lx7/cyc** | **−0.08 %** |
+| Bench (100 M)    | 1.293 lx7/cyc | **1.292 lx7/cyc** | unchanged at resolution |
+| Boot @ any       | unchanged | unchanged | — |
+
+Bench (20 M) crosses **1.177 lx7/cyc**. The marginal 100 M Δ vs M6.105's
+−0.84 % reflects that Bcc.W is much less common than BSR.W in the
+bench's longer-running paths (most branches use .S form since their
+targets fit in 8-bit disp). The infrastructure value is documenting
+the off-by-2 pattern for any future .W-displacement arm.
+
 ## M6.105 — BSR.W disp16 inline — bench 100 M crosses 5.00 × interp 🎯
 
 The M6.83 BSR.S disp8 inline only handled the 8-bit-displacement form
@@ -982,12 +1033,12 @@ them each iteration.
    intermediate register writeback. See M6.85 below for the first
    fusion lever in this class.
 
-## Where things stand right now (post-M6.105)
+## Where things stand right now (post-M6.106)
 
 | Engine | lx7 / cyc | × interp baseline |
 |--------|----------:|------------------:|
-| **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.178** | **5.49 ×** ✅ |
-| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.293** | **5.00 ×** ✅ |
+| **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.177** | **5.49 ×** ✅ |
+| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.292** | **5.00 ×** ✅ |
 | **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.717** | **3.44 ×** |
 | **Boot** (Mac Plus ROM, 5 M cycles, PC=`0x40032C` deterministic)    | **2.236** | **2.64 ×** |
 | **Boot** (Mac Plus ROM, 300 K cycles, PC=`0x40032C` deterministic)  | **1.975** | **2.99 ×** |

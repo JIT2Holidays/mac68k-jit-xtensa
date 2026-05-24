@@ -1553,6 +1553,21 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                 *(u32 *)(base + lit_off[LITERAL_BCC_PC]) = pc_const;
                 g_pc_lit_val = pc_const;
                 g_pc_lit_valid = true;
+            } else if (disp == 0 && cc != 1) {
+                /* M6.106 — BRA.W / Bcc.W disp16. For cc=0 (BRA): literal
+                 * is the taken target. For cc>=2 (Bcc): literal is the
+                 * fall-through PC (= op_pc + 4 since Bcc.W is 4 bytes).
+                 * Mirrors the .S logic above but with the 4-byte op length. */
+                u32 pc_const;
+                if (cc == 0) {
+                    u16 ext = mac_read16(cpu->mem, op_pc[n_ops - 1] + 2);
+                    pc_const = op_pc[n_ops - 1] + 2 + (u32)(i32)(i16)ext;
+                } else {
+                    pc_const = op_pc[n_ops - 1] + 4;
+                }
+                *(u32 *)(base + lit_off[LITERAL_BCC_PC]) = pc_const;
+                g_pc_lit_val = pc_const;
+                g_pc_lit_valid = true;
             }
         } else if ((last_op >> 12) == 0x5 && ((last_op >> 6) & 3) == 3
                    && ((last_op >> 3) & 7) == 1) {
@@ -4587,6 +4602,54 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
              * dependent wait-loops never exit when re-entering the
              * dispatcher is skipped.) */
             emit_branch(&e, op_pc[i], w);
+            inline_ops++; done = true;
+        } else if (top == 0x6 && (((w>>8)&0xF) != 1) && (w & 0xFF) == 0x00) {
+            /* M6.106 — BRA.W / Bcc.W disp16. Block terminator with
+             * 16-bit displacement. Same chain-preservation lever as
+             * M6.105 BSR.W — inline keeps the JIT chain unbroken
+             * through conditional/unconditional branches with
+             * displacements beyond ±128 bytes.
+             *
+             * Length 4 (op + disp16). Cycles in interp: 10 if taken/BRA,
+             * 8 if not taken — same as Bcc.S in our model. */
+            int cc = (w >> 8) & 0xF;
+            u16 ext = mac_read16(cpu->mem, op_pc[i] + 2);
+            i32 disp = (i16)ext;
+            u32 ft    = op_pc[i] + 4;
+            u32 taken = op_pc[i] + 2 + (u32)disp;
+
+            i32 extra_cyc = g_cyc_acc;
+            g_pc_acc = 0;
+            g_cyc_acc = 0;
+
+            if (cc == 0) {
+                /* BRA.W — unconditional. */
+                if (g_pc_lit_valid && taken == g_pc_lit_val) {
+                    emit_l32r_at(&e, 8, g_pc_lit_off, g_pc_lit_entry_off + e.len);
+                } else {
+                    emit_load_imm32(&e, 8, 9, taken);
+                }
+                xt_s32i(&e, 8, R_CPU, OFF_PC);
+                xt_l32i(&e, 8, R_CPU, OFF_CYCLES);
+                i32 total = 14 + extra_cyc;
+                if (total >= -128 && total <= 127) {
+                    xt_addi(&e, 8, 8, total);
+                } else {
+                    emit_load_imm(&e, 9, 10, (u32)total);
+                    xt_add(&e, 8, 8, 9);
+                }
+                xt_s32i(&e, 8, R_CPU, OFF_CYCLES);
+            } else {
+                /* Bcc.W — conditional. emit_bcc_branchless_tail computes
+                 * `taken = ft + disp`. For Bcc.W, ft = op_pc + 4 but the
+                 * disp16 is relative to op_pc + 2 (m68k semantic). To
+                 * make the tail's `ft + disp_for_tail = taken` work,
+                 * pass `disp - 2`. Same adjustment as the M6.38 DBcc arm
+                 * which has the same 4-byte op-length quirk. */
+                emit_cond(&e, cc);
+                emit_bcc_branchless_tail(&e, ft, disp - 2, 12 + extra_cyc);
+            }
+            sext_memo_invalidate();
             inline_ops++; done = true;
         } else if (top == 0x6 && (((w>>8)&0xF) == 1)
                    && (w & 0xFF) != 0x00 && (w & 0xFF) != 0xFF) {
