@@ -1,5 +1,66 @@
 # Status
 
+## M6.86 — LEA + ADDA fusion (delivered)
+
+Bench's 0x03DF4E-50 (the LEA-sibling of the 0x03DF40 MOVEA pair) was
+the next-tier candidate noted in M6.85's STATUS:
+
+```
+LEA   (2,A4,D6.W),A2 ; ADDA.W D6,A2
+                     ↓ fused into
+                     ; A2 = A4 + 2·sext_w(D6) + 2     (xt_addx2 + xt_addi)
+```
+
+Standard emit was 5 LX7 ops on the cached fast path: a13 = sext D6
+(memoized from upstream), a8 = A4 (cache hit), a8 += a13, a8 += d8 (=2),
+store back into Am — then ADDA.W's single xt_add. Fused emit collapses
+to 2 LX7: `xt_addx2 Am, a13, A4` followed by `xt_addi Am, Am, 2`
+(skipped when d8 == 0). No CCR concerns.
+
+Implemented in the existing LEA arm: peek next op for ADDA.W matching
+the LEA's index reg and destination. Fusion eligibility:
+
+* LEA srcmode == 6 (the `(d8,An,Xn)` brief-format form)
+* LEA index is `.W` (ext bit 11 == 0) and brief format (bit 8 == 0)
+* Next op is ADDA.W with `(nw >> 9) & 7 == am` and source register
+  matches the LEA's Xn (D-or-A reg)
+
+**Triple-diff workflow:**
+
+* ctest: 7/7
+* `--diff-jit-trace`: match through 11 038 cycles, 321 blocks — clean
+* Boot @ 300 K / 5 M deterministic: byte-identical to M6.85 (and M6.84)
+
+**Perf:**
+
+| Workload | M6.85 | **M6.86** | Δ |
+|----------|------:|----------:|--:|
+| Bench @ 5 M cyc   | 1.394 lx7/cyc | **1.371 lx7/cyc** | **−1.6 %** lx7 |
+| Bench @ 20 M cyc  | 1.237 lx7/cyc | **1.211 lx7/cyc** | **−2.1 %** lx7 |
+| Bench @ 100 M cyc | 1.378 lx7/cyc | **1.353 lx7/cyc** | **−1.8 %** lx7 |
+| Boot 300 K / 5 M det | identical | identical | — |
+| Boot @ 100 M cyc  | 1.734 | unchanged | — |
+
+`inline_ops` dropped from 1764 → 1763 — one new fusion site (the
+0x03DF4E LEA), firing at every bench iteration.
+
+**Cumulative M6.84 → M6.86:**
+
+| Workload | M6.84 | M6.86 | Δ |
+|----------|------:|------:|--:|
+| Bench @ 20 M cyc  | 1.257 | **1.211** | **−3.7 %** lx7 |
+| Bench @ 100 M cyc | 1.396 | **1.353** | **−3.1 %** lx7 |
+
+**Bench is now 1.211 lx7/cyc @ 20 M cyc = 5.336 × interp baseline.**
+
+The 0x03DF40 hot block (405 K hits / 20 M cyc) now has three fusion
+sites firing per iteration: MOVEA+ADDA (×1), MOVEA+ADDA+ADDA (×1 triple),
+and LEA+ADDA. The remaining ops in the block — MOVE.W (d8,A0,Xn),D5,
+MOVE.W D5,D4, MOVE.W (A2),(A3), MOVE.W D4,(A2), ADDQ.W #1,D6,
+CMPA.W (d16,A5),A6 — are mostly already pure single-op inlines or
+already-fused (CMP+Bcc). Next-tier fusion candidates noted for
+follow-up: MOVE.W Dn,Dm + MOVE.W Dm,(EA) (re-using the .W extraction).
+
 ## M6.85 — MOVEA + ADDA fusion (delivered)
 
 Bench's hot block at PC `0x03DF40` (~405 K hits / 20 M cyc) is dominated
@@ -97,12 +158,12 @@ them each iteration.
    intermediate register writeback. See M6.85 below for the first
    fusion lever in this class.
 
-## Where things stand right now (post-M6.85)
+## Where things stand right now (post-M6.86)
 
 | Engine | lx7 / cyc | × interp baseline |
 |--------|----------:|------------------:|
-| **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.237** | **5.22 ×** ✅ |
-| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.378** | **4.69 ×** |
+| **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.211** | **5.34 ×** ✅ |
+| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.353** | **4.78 ×** |
 | **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.734** | **3.40 ×** |
 | **Boot** (Mac Plus ROM, 5 M cycles, PC=`0x40032C` deterministic)    | **2.471** | **2.39 ×** |
 | **Boot** (Mac Plus ROM, 300 K cycles, PC=`0x40032C` deterministic)  | **2.159** | **2.73 ×** |

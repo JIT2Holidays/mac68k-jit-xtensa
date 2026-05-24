@@ -532,6 +532,64 @@ static void emit_movea_l_reg(xt_emit *e, int an, int src, bool src_is_an, regcac
     emit_advance(e, 2, 8);
 }
 
+/* M6.85b — Fusion: LEA (d8,An,Xn.W),Am  +  ADDA.W Xn,Am   (Xn shared).
+ *
+ * Bench's 0x03DF4E-50:
+ *   LEA (2,A4,D6.W),A2 ; ADDA.W D6,A2     →     A2 = A4 + 2·sext_w(D6) + 2
+ *
+ * Standard emit:
+ *   LEA mode 6 fast path = 4 ops (a8=A4; a13=sext D6; a8+=a13; a8+=d8)
+ *   + ADDA.W = 1 op (xt_add Am, Am, a13)
+ *   = 5 LX7 (assuming sext memo'd from the upstream ADDA)
+ *
+ * Fused emit:
+ *   xt_addx2 dst, a13, A4_src           ; dst = 2·sext + A4
+ *   xt_addi  dst, dst, d8                ; dst += d8        (skip if d8==0)
+ *   = 2 LX7 (1 if d8==0)
+ *
+ * Saves 3 LX7 per occurrence. Bench at 0x03DF4E (~405 K iters)
+ * = ~1.2 M LX7 / 20 M cyc ≈ 5 % on bench. No CCR concerns. */
+static void emit_lea_adda_fused(xt_emit *e, int dst_am, int lea_an, int idx_reg,
+                                bool idx_is_an, int d8, regcache *rc) {
+    int g_idx = idx_is_an ? G_A(idx_reg) : G_D(idx_reg);
+
+    /* Ensure sext_w(g_idx) is live in a13. Reuse if memoized. */
+    if (!g_sext_valid || g_sext_src_reg != g_idx) {
+        emit_read_g(e, rc, g_idx, 13);
+        xt_slli(e, 13, 13, 16);
+        xt_srai(e, 13, 13, 16);
+        g_sext_src_reg = g_idx;
+        g_sext_valid = true;
+    }
+
+    /* Get LEA's An base into a host reg. */
+    int xt_an = cache_lookup(rc, G_A(lea_an));
+    u8 src_reg;
+    if (xt_an >= 0) {
+        src_reg = (u8)xt_an;
+    } else {
+        xt_l32i(e, 8, R_CPU, OFF_A(lea_an));
+        src_reg = 8;
+    }
+
+    int xt_dst = cache_lookup(rc, G_A(dst_am));
+    if (xt_dst >= 0) {
+        u8 d = (u8)xt_dst;
+        xt_addx2(e, d, 13, src_reg);                 /* d = 2·sext + An */
+        if (d8 != 0) xt_addi(e, d, d, d8);
+        for (int i = 0; i < rc->active; i++)
+            if (rc->guest[i] == (u8)G_A(dst_am)) { rc->dirty |= (u16)(1u << i); break; }
+    } else {
+        xt_addx2(e, 9, 13, src_reg);
+        if (d8 != 0) xt_addi(e, 9, 9, d8);
+        xt_s32i(e, 9, R_CPU, OFF_A(dst_am));
+    }
+
+    /* PC delta: 4 (LEA mode 6) + 2 (ADDA.W) = 6.
+     * Cycles:   8 (LEA flat) + 12 (ADDA.W)  = 20. */
+    emit_advance(e, 6, 20);
+}
+
 /* M6.85 — Fusion: MOVEA.L An|Dn,Am  +  ADDA.W Dx|Ax,Am  [+ ADDA.W Dx|Ax,Am].
  *
  * Bench's hot block 0x03DF40 (405 K hits / 20 M cyc) is dominated by
@@ -3767,7 +3825,36 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                       ? mac_read16(cpu->mem, op_pc[i] + 2) : 0;
             u32 ext32 = (mode == 7 && sr == 1)
                       ? mac_read32(cpu->mem, op_pc[i] + 2) : 0;
-            emit_lea(&e, (w >> 9) & 7, mode, sr, ext, ext32, &rc);
+            int am = (w >> 9) & 7;
+
+            /* M6.85b — Fusion: LEA (d8,An,Xn.W),Am + ADDA.W Xn,Am.
+             * Only the (d8,An,Xn) brief-format form with a .W index
+             * matches — and Xn must equal the ADDA's source Dn|An. */
+            bool lea_fused = false;
+            if (mode == 6 && (ext & 0x0800) == 0      /* .W index */
+                && (ext & 0x0100) == 0                /* brief format */
+                && i + 1 < n_ops) {
+                u16 nw = op_word[i + 1];
+                if (((nw >> 12) & 0xF) == 0xD          /* ADD/ADDA */
+                    && ((nw >> 6) & 7) == 3            /* ADDA.W */
+                    && ((nw >> 3) & 7) <= 1            /* src is Dn or An */
+                    && ((nw >> 9) & 7) == am) {        /* same dst */
+                    int adda_src    = nw & 7;
+                    bool adda_is_an = ((nw >> 3) & 7) == 1;
+                    int lea_idx     = (ext >> 12) & 7;
+                    bool lea_idx_an = (ext & 0x8000) != 0;
+                    if (adda_src == lea_idx && adda_is_an == lea_idx_an) {
+                        int d8 = (i8)(ext & 0xFF);
+                        emit_lea_adda_fused(&e, am, sr,
+                                            lea_idx, lea_idx_an, d8, &rc);
+                        i++;                  /* skip absorbed ADDA */
+                        lea_fused = true;
+                    }
+                }
+            }
+            if (!lea_fused) {
+                emit_lea(&e, am, mode, sr, ext, ext32, &rc);
+            }
             inline_ops++; done = true;
         } else if (top == 0x6 && (((w>>8)&0xF) != 1)
                    && (w & 0xFF) != 0x00 && (w & 0xFF) != 0xFF) {
