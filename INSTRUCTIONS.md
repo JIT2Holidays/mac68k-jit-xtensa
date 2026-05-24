@@ -28,12 +28,12 @@ MOVES, divs.l etc.) — so the table below is the complete ISA target.
 | Data movement | 16 | 22 | 4 | 1 |
 | Arithmetic | 18 | 7 | 0 | 3 |
 | Logical | 8 | 4 | 0 | 1 |
-| Bit ops | 4 | 4 | 0 | 8 |
+| Bit ops | 8 | 4 | 0 | 4 |
 | Shift / rotate | 9 | 0 | 0 | 9 |
 | Compare | 5 | 4 | 0 | 4 |
 | Control flow | 11 | 3 | 1 | 4 |
 | System | 1 | 2 | 0 | 10 |
-| **Totals** | **72** | **46** | **5** | **40** |
+| **Totals** | **76** | **46** | **5** | **36** |
 
 The bare numbers undersell the inline coverage on hot paths. The ~21K-fire
 opcodes that drive bench's `lx7/cyc` metric are all inline; the remaining
@@ -145,15 +145,15 @@ m68k_step rows are mostly rare-fire system / exception ops.
 
 | Form | Style | Milestone | Notes |
 |------|:-----:|----------:|-------|
-| `BTST #imm,Dn` | ✅ | M5.2 | |
+| `BTST #imm,Dn` | ✅ | M6.154 | sibling family with BCHG/BCLR/BSET |
 | `BTST Dm,Dn` | ✅ | M5.2 | |
 | `BTST #imm,(d16,An)` | ⚡ | M6.31 | `m68k_jit_btst_b_mmio` |
 | `BTST #imm,(xxx).W` | ⚡ | M6.113 | |
 | `BTST Dm,(EA)` | 🐢 | — | dynamic-Dm to memory |
-| `BSET / BCLR / BCHG #imm,Dn` | 🐢 | — | **boot-hot 0x08C0 BSET #imm,D0 (390 fires) — sibling candidate** |
-| `BSET / BCLR / BCHG Dm,Dn` | 🐢 | — | |
+| `BCHG / BCLR / BSET #imm,Dn` | ✅ | M6.154 | bench/boot saw 390 fires/100M on 0x08C0 (BSET #imm,D0) |
+| `BSET / BCLR / BCHG Dm,Dn` | 🐢 | — | dynamic-Dm form |
 | `BSET / BCLR / BCHG #imm,(xxx).W` | ⚡ | M6.113 | static-imm to abs.W |
-| `BSET / BCLR / BCHG #imm,(EA)` | 🐢 | — | other modes |
+| `BSET / BCLR / BCHG #imm,(EA)` | 🐢 | — | other memory modes |
 
 ## Shift / rotate
 
@@ -261,10 +261,9 @@ Sorted by likely win, accounting for trajectory-safety
 | Candidate | Boot 100M fires | Bench fires | Why |
 |-----------|----------------:|-------------:|-----|
 | `ASL.L #imm,Dn` | 120 (`0xE181`) | small | Sibling of M6.151 ASL.B/W and M6.146 LSL.L |
-| `BSET #imm,Dn` | 390 (`0x08C0`) | small | Pure register-op, no bridge — same shape as M6.139 CLR.B/W/L |
-| `BCLR / BCHG #imm,Dn` | siblings of BSET | | |
 | `SUBA.L Dn/Am,An` | small | tiny | Sibling of M6.152 ADDA.L |
 | `NOT Dn` | tiny | 36 (`0x4641`) | Pure register-op |
+| ~~`BSET / BCLR / BCHG #imm,Dn`~~ | ~~390~~ | — | ✅ Landed as M6.154 (-434 boot 100M helpers) |
 
 ### Compile-time fusion (safe — emits no new runtime code)
 

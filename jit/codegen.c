@@ -6081,6 +6081,70 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             }
             emit_advance(&e, 2, 8);
             inline_ops++; done = true;
+        } else if (top == 0x4 && ((w >> 8) & 0xF) == 0x6
+                   && (szf == 0 || szf == 1 || szf == 2) && mode == 0) {
+            /* M6.156 — NOT.B/W/L Dn — pure register-op. Bench 0x4641
+             * (NOT.W D1) at 36 hits / pc=0x40a5ea in the stable 20M
+             * pre-divergence window. Boot 100M shows zero fires of this
+             * family. Sibling of M6.139 CLR.B/W/L Dn — same merge shape
+             * for .B/.W (preserve upper bits), direct in-place for .L.
+             *
+             * Semantics: Dn[size] = ~Dn[size]. For .B/.W, upper bits
+             * preserved; for .L the whole register is inverted.
+             * CCR: N from bit (size-1) of result, Z from
+             * (result & size_mask) == 0, V=C=0, X preserved.
+             * Length 2; cycles 8 (m68k_step base 4 + handler 4 — flat
+             * 4 per m68k_interp's sel==0x6 NOT case at line 1186 of
+             * m68k_interp.c). */
+            int dn = w & 7;
+            int size_bits = (szf == 0) ? 8 : (szf == 1) ? 16 : 32;
+            int dn_xt = cache_lookup(&rc, G_D(dn));
+            u8 src_reg = (dn_xt >= 0) ? (u8)dn_xt : 8;
+            if (dn_xt < 0) emit_read_g(&e, &rc, G_D(dn), 8);
+
+            u8 dst_reg = (dn_xt >= 0) ? (u8)dn_xt : 8;
+            if (size_bits == 32) {
+                /* NOT.L: dst = ~src — full 32-bit XOR with -1. */
+                xt_movi(&e, 9, -1);
+                xt_xor (&e, dst_reg, src_reg, 9);
+            } else {
+                /* NOT.B/W: invert low size_bits, preserve upper bits.
+                 * a9 = ~src.size (already size-masked); a10 = upper
+                 * bits of src; OR them together. */
+                xt_extui(&e, 9, src_reg, 0, (u8)(size_bits - 1));
+                xt_movi (&e, 10, -1);
+                xt_xor  (&e, 9, 9, 10);
+                xt_extui(&e, 9, 9, 0, (u8)(size_bits - 1));
+                xt_srli (&e, 10, src_reg, (u8)size_bits);
+                xt_slli (&e, 10, 10, (u8)size_bits);
+                xt_or   (&e, dst_reg, 10, 9);
+            }
+
+            if (dn_xt >= 0) {
+                for (int s = 0; s < rc.active; s++)
+                    if (rc.guest[s] == (u8)G_D(dn)) { rc.dirty |= (u16)(1u << s); break; }
+            } else {
+                emit_write_g(&e, &rc, G_D(dn), dst_reg);
+            }
+
+            if (!flags_dead[i]) {
+                /* CCR: clear N/Z/V/C (bits 0..3), preserve X (bit 4).
+                 * For .B/.W: N/Z derived from a9 (size-masked result).
+                 * For .L: N/Z derived from dst_reg (the result). */
+                xt_movi(&e, 12, -16);
+                xt_and (&e, R_SR, R_SR, 12);
+                u8 sz_reg = (size_bits == 32) ? dst_reg : (u8)9;
+                xt_extui(&e, 12, sz_reg, (u8)(size_bits - 1), 0);
+                xt_slli (&e, 12, 12, 3);
+                xt_or   (&e, R_SR, R_SR, 12);            /* N */
+                xt_movi (&e, 12, 0x04);
+                xt_bnez (&e, sz_reg, 6);
+                xt_or   (&e, R_SR, R_SR, 12);            /* Z */
+                g_sr_dirty = true;
+                sext_memo_invalidate();
+            }
+            emit_advance(&e, 2, 8);
+            inline_ops++; done = true;
         } else if (top == 0x4 && ((w >> 8) & 0xF) == 0xA && szf == 1 && mode == 0) {
             /* M6.138 — TST.W Dn — boot 5 M det's biggest helper (4a45 =
              * TST.W D5 at 38 hits / 5 M cyc, ≈41 % of all det-window
