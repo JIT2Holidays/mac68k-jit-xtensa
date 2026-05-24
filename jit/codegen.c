@@ -1550,6 +1550,11 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
         else        xt_l32i(&e, cache_xt_slot(slot), R_CPU, OFF_A(gi - 8));
     }
 
+    /* M6.62: record the offset where the body begins — chain-skip target
+     * when the predecessor's cache + SR state already matches what this
+     * block's prologue would have set up. */
+    u32 body_off = entry_off + e.len;
+
     /* 6. Body. */
     u32 inline_ops = 0, helper_ops = 0;
     for (u32 i = 0; i < n_ops; i++) {
@@ -3011,11 +3016,11 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
      *   jx a0
      */
     {
-        u32 off_pred_pc = (u32)offsetof(m68k_block, predicted_next_pc);
-        u32 off_pred    = (u32)offsetof(m68k_block, predicted_next);
-        u32 off_entry_addr = (u32)offsetof(m68k_block, entry_addr);
-        u32 off_cur     = (u32)offsetof(m68k_cpu, current_block);
-        u32 off_budget  = (u32)offsetof(m68k_cpu, chain_budget);
+        u32 off_pred_pc    = (u32)offsetof(m68k_block, predicted_next_pc);
+        u32 off_pred       = (u32)offsetof(m68k_block, predicted_next);
+        u32 off_pred_entry = (u32)offsetof(m68k_block, predicted_next_entry);
+        u32 off_cur        = (u32)offsetof(m68k_cpu, current_block);
+        u32 off_budget     = (u32)offsetof(m68k_cpu, chain_budget);
 
         xt_l32i(&e, 8,  R_CPU, OFF_PC);
         xt_l32i(&e, 9,  R_CPU, off_cur);
@@ -3035,15 +3040,17 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
         xt_s32i(&e, 10, R_CPU, off_cur);     /* current_block = predicted_next */
         /* Restore a0 = jit_ret_pc BEFORE chaining: the next block's
          * prologue does `s32i a0, OFF_JITRETPC` to save its own
-         * return-to-dispatcher address — but a0 has been clobbered by
-         * any helper CALLs in this block, so without this reload the
-         * next block would overwrite cpu->jit_ret_pc with garbage and
-         * the eventual standard return would JX to a bad PC. */
+         * return-to-dispatcher address. M6.62 skip-prologue chain JX
+         * also requires a0 correct, because the body_addr path doesn't
+         * re-save (cpu->jit_ret_pc must already hold the dispatcher
+         * return PC). */
         xt_l32i(&e, 0, R_CPU, OFF_JITRETPC);
-        /* M6.58: one l32i instead of l32i+l32i+add — predicted_next's
-         * entry_addr field is precomputed at compile time. -2 LX7 ops
-         * per chain hit. Boot has ~965 K chain hits per 100 M cycles. */
-        xt_l32i(&e, 11, 10, off_entry_addr);
+        /* M6.62: load the predict-time-chosen entry from the *current*
+         * block (not from predicted_next). Dispatcher picked either
+         * next->entry_addr or next->body_addr based on cache+SR compat,
+         * so the chain JX skips the entire prologue when compatible
+         * (saves ~5 LX7 ops per chain hit on boot; 99.7 % match rate). */
+        xt_l32i(&e, 11, 9, off_pred_entry);
         xt_jx  (&e, 11);
         u32 fallback_off = e.len;
 
@@ -3087,10 +3094,13 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
     b->code_size = actual;
     b->entry_off = entry_off;
     b->entry_addr = (void *)(base + entry_off);
+    b->body_addr = (void *)(base + body_off);
+    b->sr_loaded = (u8)(block_needs_sr_load ? 1 : 0);
     b->inline_ops = inline_ops;
     b->helper_ops = helper_ops;
     b->predicted_next = NULL;
     b->predicted_next_pc = 0xFFFFFFFFu;
+    b->predicted_next_entry = NULL;
     /* Pack the rc into a u32: low nibble = active count, then 4 nibbles
      * giving the guest reg (0..15) for slots 0..3 (slot is unused → 0xF). */
     {

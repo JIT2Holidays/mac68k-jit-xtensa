@@ -66,6 +66,17 @@ typedef struct m68k_block {
     void *entry_addr;   /* precomputed `code + entry_off`. Native chain
                          * epilogue (ESP32) does one l32i + jx instead of
                          * l32i+l32i+add+jx — saves 2 LX7 ops per chain hit. */
+    void *body_addr;    /* M6.62 cross-block-cache fast-chain entry: address
+                         * of the first body instruction, *after* the
+                         * prologue (cpu_base load, jit_ret_pc save,
+                         * sr_reload, cache_load). Chain JX uses this when
+                         * prev block's cache + SR state is compatible
+                         * (see dispatcher's predict-time selection). */
+    u8   sr_loaded;     /* M6.62: whether prologue did `l32i a14, OFF_SR`
+                         * — i.e., a14 holds a valid SR at block start.
+                         * Used by predict-time compat check: a chained
+                         * successor that *needs* SR can only skip the
+                         * prologue if the predecessor *also* loaded SR. */
 
     u32  inline_ops;    /* how many ops were translated inline       */
     u32  helper_ops;    /* how many fell back to the interpreter     */
@@ -74,6 +85,11 @@ typedef struct m68k_block {
      * a fixed PC, the dispatcher caches the successor here. */
     struct m68k_block *predicted_next;
     u32                predicted_next_pc;
+    void              *predicted_next_entry;   /* M6.62: precomputed JX target —
+                                                * either next->entry_addr (full
+                                                * prologue) or next->body_addr
+                                                * (skip prologue, registers
+                                                * already valid from this block). */
 
     /* Cache configuration signature: packs (active, guest[0..3]) so two
      * blocks with identical cache layouts compare equal. Used to gate the

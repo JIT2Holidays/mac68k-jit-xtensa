@@ -477,6 +477,71 @@ Expected ESP32 gain on boot: 962 K × ~5 ops (cpu_base + jit_ret_pc
 save + sr_reload + cache_load) ≈ 4.8 M ops out of 159 M = **~3 %
 boot win**. Host metric unchanged (chain epilogue ESP32-only).
 
+**M6.62 — cross-block register caching (DELIVERED for ESP32).**
+The user's #1 high-gain item, finally implemented. Adds three fields
+to `m68k_block`:
+
+* `void *body_addr` — `code + body_off`, where `body_off` is the
+  offset right after the prologue (cpu_base + jit_ret_pc save +
+  sr_reload + cache_load). Chain JX skips straight here when
+  registers are already valid from the predecessor block.
+* `u8 sr_loaded` — set from `block_needs_sr_load`. The
+  compatibility check needs to know whether `a14` (R_SR) held a
+  loaded value at this block's start.
+* `void *predicted_next_entry` — the dispatcher precomputes this at
+  chain-establish time to either `next->entry_addr` (full prologue)
+  or `next->body_addr` (skip prologue entirely).
+
+Compatibility logic (in dispatcher when setting `prev->predicted_next
+= b`):
+
+```c
+bool compat = (prev->cache_sig == b->cache_sig) &&
+              (!b->sr_loaded || prev->sr_loaded);
+prev->predicted_next_entry = compat ? b->body_addr : b->entry_addr;
+```
+
+ESP32 chain epilogue change (codegen.c):
+
+```diff
+-xt_l32i(&e, 11, 10, off_entry_addr);     /* M6.58 — from predicted_next */
++xt_l32i(&e, 11, 9, off_pred_entry);      /* M6.62 — from current_block */
+ xt_jx(&e, 11);
+```
+
+Same op count as the M6.58 epilogue (1 l32i + 1 jx); just dereferences
+the *current* block's predict-time field instead of the *next* block's
+entry. Predict-time selection of body_addr vs entry_addr is the
+optimization — the chain JX itself stays as small as in M6.58.
+
+Conditions verified for safe skip-prologue chain:
+* a0 (jit_ret_pc) — chain epilogue does `l32i a0, OFF_JITRETPC`
+  before JX. Every block uses the same dispatcher return PC, so
+  cpu->jit_ret_pc is already valid; body_addr path doesn't re-save.
+* a1 (SP) — never modified by any JIT block (invariant).
+* a3 (R_CPU) — preserved by chain JX, set by prev's prologue.
+* a4..a7 (cache slots) — preserved by chain JX; their content
+  matches what next's prologue would have loaded *if and only if*
+  cache_sig matches.
+* a14 (R_SR) — preserved by chain JX; valid for use by next *if and
+  only if* next->sr_loaded ⇒ prev->sr_loaded.
+
+SMC flush also clears `predicted_next_entry` along with the existing
+`predicted_next` and `predicted_next_pc` invalidation.
+
+Host metrics unchanged (chain epilogue still `#ifdef ESP_PLATFORM`).
+ctest 3/3 pass. Cannot validate the body_addr code path on host —
+xt_sim runs one block per invocation, so a JX into another block's
+code is unreachable. Code review only.
+
+Expected ESP32 boot win: ~3 % (962 K chain matches × ~5 LX7 ops
+saved). Negligible on bench (1.4 % chain-match rate).
+
+**This completes the user's three high-gain items:**
+* #1 cross-block register caching: M6.62 ✅
+* #2 comprehensive lazy CCs: M6.16–M6.30 ✅
+* #3 native block chaining on ESP32: M6.54 + audit M6.55–M6.58 ✅
+
 **Cross-block register caching.** The other unimplemented item.
 M6.10's regcache caches D/A regs *within* a block (loaded at
 prologue, flushed at epilogue). Extending across blocks would

@@ -187,6 +187,7 @@ static bool smc_flush(m68k_dispatcher *d) {
         for (m68k_block *b = d->buckets[i]; b; b = b->hash_next) {
             b->predicted_next = NULL;
             b->predicted_next_pc = 0xFFFFFFFFu;
+            b->predicted_next_entry = NULL;
         }
     return true;
 }
@@ -407,6 +408,17 @@ void m68k_dispatcher_run_until(m68k_dispatcher *d, u64 until) {
             if (prev && !d->no_cache) {
                 prev->predicted_next = b;
                 prev->predicted_next_pc = pc;
+                /* M6.62 cross-block-cache: precompute the chain JX target.
+                 * If prev's cache + SR state is compatible with what b's
+                 * prologue would set up, JX directly to b->body_addr,
+                 * skipping the entire prologue (cpu_base load, jit_ret_pc
+                 * save, sr_reload, cache_load — ~5 LX7 ops). Compat:
+                 *   cache_sig must match (a4..a7 hold correct values), AND
+                 *   if b needs SR, prev must also have had SR loaded
+                 *   (a14 holds the correct R_SR value). */
+                bool compat = (prev->cache_sig == b->cache_sig) &&
+                              (!b->sr_loaded || prev->sr_loaded);
+                prev->predicted_next_entry = compat ? b->body_addr : b->entry_addr;
             }
         }
 
