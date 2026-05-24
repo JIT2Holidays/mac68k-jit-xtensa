@@ -168,6 +168,23 @@ static u16 g_helper_touched_mask = 0xFFFFu;
  * flush/reload for subsequent helpers that DO touch SR, corrupting CCR. */
 static u8 g_helper_sr_mask = 3u;
 
+/* M6.162 — per-helper arg-setup skip mask. Default 3u writes BOTH
+ * jit_arg1 and jit_arg2 (the conservative behavior). Helpers that
+ * don't read jit_arg1 (RTS / BSR via cpu->pc) can set bit 0 to skip
+ * the arg1 s32i. Helpers that don't read jit_arg2 (RTS / BSR /
+ * CLR.W (An)+ which only uses jit_arg2 OR helpers using only jit_arg1)
+ * can set bit 1 to skip the arg2 movi+s32i.
+ *
+ *   bit 0 = WRITE jit_arg1   (clear to skip)
+ *   bit 1 = WRITE jit_arg2   (clear to skip)
+ *
+ * Saves 3-6 LX7 per slow-path execution depending on which bits are
+ * cleared. Bench RTS+BSR ~21K fires each = ~180K LX7 saved.
+ *
+ * MUST be reset to 3u after each helper bridge — leaks would skip
+ * arg setup for subsequent helpers that DO read those args. */
+static u8 g_helper_arg_mask = 3u;
+
 /* Reload every cached slot from cpu state. Called after a helper.
  * Selective per g_helper_touched_mask — slots whose guest reg the
  * helper didn't touch are skipped (cpu state already matches the
@@ -439,9 +456,12 @@ static void emit_jit_fast_helper(xt_emit *e, u8 a8_arg1_reg, i32 imm2,
      * matters when we DID flush (otherwise g_sr_dirty wasn't cleared). */
     bool was_sr_dirty = g_sr_dirty;
     if (g_helper_sr_mask & 1) emit_sr_flush(e);
-    xt_s32i(e, a8_arg1_reg, R_CPU, OFF_JIT_ARG1);
-    xt_movi(e, 9, imm2);
-    xt_s32i(e, 9, R_CPU, OFF_JIT_ARG2);
+    /* M6.162: skip arg setups when the helper doesn't read them. */
+    if (g_helper_arg_mask & 1) xt_s32i(e, a8_arg1_reg, R_CPU, OFF_JIT_ARG1);
+    if (g_helper_arg_mask & 2) {
+        xt_movi(e, 9, imm2);
+        xt_s32i(e, 9, R_CPU, OFF_JIT_ARG2);
+    }
     xt_mov (e, R_ARG, R_CPU);
     emit_l32r_at(e, R_HELP, helper_lit_off, entry_off + e->len);
     xt_callx0(e, R_HELP);
@@ -463,8 +483,9 @@ static u32 emit_movem_fast_bridge_size(u32 list, const regcache *rc);
  * M6.158: tracks g_helper_sr_mask so callers that have set it to 0u
  * (skip flush AND reload) get the smaller bridge size. */
 static u32 emit_jit_fast_helper_size(const regcache *rc) {
-    u32 sz = 3u /*s32i arg1*/ + 3u /*movi*/ + 3u /*s32i arg2*/
-           + 3u /*mov R_ARG*/ + 3u /*l32r*/ + 3u /*callx0*/;
+    u32 sz = 3u /*mov R_ARG*/ + 3u /*l32r*/ + 3u /*callx0*/;
+    if (g_helper_arg_mask & 1) sz += 3u;            /* s32i arg1 */
+    if (g_helper_arg_mask & 2) sz += 3u + 3u;       /* movi + s32i arg2 */
     if ((g_helper_sr_mask & 1) && g_sr_dirty) sz += 3u;  /* emit_sr_flush */
     if (g_helper_sr_mask & 2)                 sz += 3u;  /* emit_sr_reload */
     if (rc) {
@@ -2192,6 +2213,7 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             i32 op_cyc_rts = 16;      /* m68k_step base 4 + handler 12 */
             g_helper_touched_mask = (u16)(1u << G_A(7));
             g_helper_sr_mask = 0u;     /* M6.158 — RTS doesn't touch SR */
+            g_helper_arg_mask = 0u;    /* M6.162 — RTS reads neither jit_arg */
             u32 rts_bridge_size = emit_jit_fast_helper_size(&rc);
             xt_beqz (&e, 10, (i32)(6u + rts_bridge_size));
             /* Fast helper bridge: helper reads cpu->a[7] directly. */
@@ -2200,6 +2222,7 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                                  entry_off, &rc);
             g_helper_touched_mask = 0xFFFFu;
             g_helper_sr_mask = 3u;
+            g_helper_arg_mask = 3u;
             (void)op_pc_rts; (void)op_cyc_rts;
             /* No emit_advance here — the fast path below owns pc/cyc. */
             u32 jrts_pos = e.len;
@@ -4761,6 +4784,7 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
              * cpu->sr to preserve X), so we leave g_helper_sr_mask=3u
              * (default) — flush+reload still needed. */
             g_helper_touched_mask = (u16)(1u << G_A(an));
+            g_helper_arg_mask = 2u;    /* M6.162 — CLR.W reads only jit_arg2 (an) */
             u32 clr_bridge_size = emit_jit_fast_helper_size(&rc);
             xt_beqz (&e, 10, (i32)(6u + clr_bridge_size));
 
@@ -4769,6 +4793,7 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                                  lit_off[HELPER_JIT_CLR_W_ANPI_MMIO],
                                  entry_off, &rc);
             g_helper_touched_mask = 0xFFFFu;
+            g_helper_arg_mask = 3u;
             (void)op_pc_clr; (void)op_cyc_clr;
             u32 jclr_pos = e.len;
             xt_j    (&e, 4);
@@ -5851,6 +5876,7 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
              * and the pc/cyc-undo dance — real_helpers drops 21 K. */
             g_helper_touched_mask = (u16)(1u << G_A(7));
             g_helper_sr_mask = 0u;     /* M6.158 — BSR.S doesn't touch SR */
+            g_helper_arg_mask = 1u;    /* M6.162 — BSR.S reads only jit_arg1 (target_pc) */
             /* Load target_pc into a15 BEFORE the cache-flush so emit_jit_
              * fast_helper can write it from a register. */
             if (g_pc_lit_valid && target_pc == g_pc_lit_val) {
@@ -5866,6 +5892,7 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                                  entry_off, &rc);
             g_helper_touched_mask = 0xFFFFu;
             g_helper_sr_mask = 3u;
+            g_helper_arg_mask = 3u;
             (void)op_pc_bsr; (void)op_cyc_bsr;
             u32 jbsr_pos = e.len;
             xt_j    (&e, 4);
@@ -5925,6 +5952,7 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             /* M6.132 — slow path uses m68k_jit_bsr_w_mmio fast helper. */
             g_helper_touched_mask = (u16)(1u << G_A(7));
             g_helper_sr_mask = 0u;     /* M6.158 — BSR.W doesn't touch SR */
+            g_helper_arg_mask = 1u;    /* M6.162 — BSR.W reads only jit_arg1 */
             /* Load target_pc into a15 so both fast and slow paths share it. */
             if (g_pc_lit_valid && target_pc == g_pc_lit_val) {
                 emit_l32r_at(&e, 15, g_pc_lit_off, g_pc_lit_entry_off + e.len);
@@ -5938,6 +5966,7 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                                  entry_off, &rc);
             g_helper_touched_mask = 0xFFFFu;
             g_helper_sr_mask = 3u;
+            g_helper_arg_mask = 3u;
             (void)op_pc_bsw; (void)op_cyc_bsw;
             u32 jbsw_pos = e.len;
             xt_j    (&e, 4);
