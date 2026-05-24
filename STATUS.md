@@ -1,5 +1,27 @@
 # Status
 
+## M6.94 — MOVE.B (An)+,Dn + MOVE.B Dn,(An)+ inline (delivered)
+
+Post-increment variants of the M6.92 MOVE.B (An),Dn / Dn,(An) arms.
+Catches boot's 0x1218 (MOVE.B (A0)+,D1) at 1.1 K helpers and the
+sibling write variants.
+
+Same RAM-or-ROM byte bounds (src), RAM-only byte bounds (dst). The
+post-increment commits AFTER the byte read so a same-An edge case
+reads the byte at the original An first, then increments by 1.
+
+**Triple-diff workflow:**
+
+* ctest: 7/7
+* `--diff-jit-trace`: clean through 11 038 cycles
+* Boot 300 K / 5 M det: unchanged
+* Boot 100 M: 194 458 → 193 269 compile-time helpers (−1 189)
+              jit_cost: 172 098 358 → 172 053 058 lx7 (−45 300 LX7)
+
+**Perf:** marginal at lx7/cyc resolution (1.721 unchanged) but real
+on the raw counter. The MOVE.B (An)+ variants are less common in boot
+than the plain (An) forms, hence the smaller catch.
+
 ## M6.93 — MOVE.L Dn|Am,(An) inline (delivered)
 
 Fills the dst_mode=2 gap in the MOVE.L Dn|Am,<ea> arm series.
