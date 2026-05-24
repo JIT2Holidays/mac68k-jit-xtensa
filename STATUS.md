@@ -1,33 +1,85 @@
 # Status
 
-## Summary
+## Where things stand right now (post-M6.70)
 
-A 68000 Macintosh emulator with a 68000→Xtensa-LX7 JIT, targeting the
-ESP32-S3. Milestones M1–M4 and M6 are done: a reference interpreter, a
-working JIT, the emulator on `qemu-system-xtensa`, and a **real
-Macintosh Plus ROM + System 6.0.8 booting to the Finder** under both
-engines. The interpreter and JIT reach byte-identical state, and the
-ADDX/SUBX/NEGX condition-code fix found via the mini vMac differential
-is in (`ctest` 3/3).
+| Engine | lx7 / cyc | × interp baseline |
+|--------|----------:|------------------:|
+| **Bench** (Speedometer frozen snapshot, 60 M cycles) | **1.279** | **5.05 ×** ✅ |
+| **Boot** (Mac Plus ROM, 100 M cycles)                | **1.735** | **3.40 ×** |
 
-**M5 — JIT optimisation — is the current work.** The basic-block JIT
-does not beat the interpreter: every non-inlined opcode is a `CALLX0`
-into `m68k_step`, and a block pays a full dispatch round-trip per
-iteration. The work below closes that gap.
+Bench cleared the 5×-interp goal at M6.31; M6.51 stretched it to
+5.16 ×, M6.68 reset to the current 5.05 × (the SR-flush bug had been
+masking some inline work — the new number reflects honest cost).
+ctest: **4/4** including the M6.68 SR-flush regression guard.
 
-### Session result — M6.2 → M6.49 (real-cost basis, post-M6.41 metric correction)
+The JIT exceeds interp on every host metric. The remaining ESP32-only
+optimisations (M6.54 native chaining, M6.62 cross-block register
+caching) add an estimated ~12 % + ~3 % boot win on real hardware —
+untestable via the host Xtensa sim, which runs one block per
+invocation.
 
-| Engine | Start (M6.2) | Current (M6.49) | Ratio | × Mac Plus | × Interp |
-|--------|-------------:|----------------:|------:|-----------:|---------:|
-| Bench  | 4.008 lx7/cyc | **1.288 lx7/cyc** | **3.11 ×** | **23.78 ×** | **5.13 ×** ✅ |
-| Boot   | 5.376 lx7/cyc | **1.727 lx7/cyc** | **3.11 ×** | **17.74 ×** | **3.43 ×** |
+### Run it
 
-Both engines coincidentally tripled in real performance. Bench cleared
-the user's 5×-interp goal at M6.31 (M6.49 stretches it to 5.13 ×).
-Boot's gains came from a sequence of inline expansions and finally a
-specialised "fast-path MMIO helper" framework (M6.42–M6.47) that
-bypasses `m68k_step`'s decode overhead for the common VIA-register
-read/write paths.
+```sh
+./scripts/build.sh        # cmake + build
+./scripts/test.sh         # ctest, 4/4
+./scripts/gui.sh          # SDL GUI — Mac Plus ROM + System 6 floppy
+./scripts/bench.sh        # JIT cost on the Speedometer snapshot
+./scripts/diff.sh         # JIT vs interp lockstep (triple-diff SOP)
+```
+
+Direct flags (`./build/mac68k_host --help`): `--interp` / `--jit`,
+`--rom`, `--disk`, `--load-snapshot`, `--max-cycles`,
+`--arena-kb N`, `--evict none|lru|fifo`, `--diff-jit`,
+`--diff-jit-trace`, `--no-irq`.
+
+### Session arc (M6.2 → M6.70 highlights)
+
+| Stage | Bench lx7/cyc | Boot lx7/cyc | What landed |
+|-------|--------------:|-------------:|-------------|
+| M6.2  | 4.008 | 5.376 | First optimisation pass |
+| M6.30 | ~1.45 | ~3.5  | Comprehensive lazy CCs, fused CMP+Bcc |
+| M6.49 | 1.288 | 1.727 | Inlined RTS, JMP .L, push/pop extensions |
+| M6.54 | 1.279 | 1.739 | ESP32 native block chaining (`#ifdef ESP_PLATFORM` only) |
+| M6.62 | 1.279 | 1.739 | Cross-block register caching (ESP32 only, 99.7 % match rate on boot) |
+| M6.63 | 1.279 | 1.735 | Runtime LRU/FIFO eviction policies + sweep |
+| **M6.68** | 1.279 | 1.735 | **Latent SR-flush bug fixed** (was set since M6.61, caught by `--diff-jit`) |
+| M6.70 | 1.279 | 1.735 | New ctest locks M6.68 in |
+
+`memory/triple-differential.md` records the workflow that found
+M6.68: always `--diff-jit` after any JIT change — ctest's curated
+snippets miss whole bug classes.
+
+### Original session summary (preserved for historical context)
+
+A 68000 Macintosh emulator with a 68000 → Xtensa-LX7 JIT, targeting
+the ESP32-S3. Milestones M1–M4 and M6 are done: a reference
+interpreter, a working JIT, the emulator on `qemu-system-xtensa`, and
+a **real Macintosh Plus ROM + System 6.0.8 booting to the Finder**
+under both engines. The interpreter and JIT reach byte-identical
+state (modulo VIA-tick timing past ~12 K cycles), and the ADDX/SUBX/
+NEGX condition-code fix found via the mini vMac differential is in.
+
+**M5 — JIT optimisation — was the prior current work, now done.**
+The basic-block JIT did not initially beat the interpreter; the
+M6.10–M6.70 sub-milestones closed that gap.
+
+### Session result — M6.2 → M6.70 (real-cost basis, post-M6.41 metric correction)
+
+| Engine | Start (M6.2) | M6.49 stop | M6.70 (current) | × Interp |
+|--------|-------------:|-----------:|----------------:|---------:|
+| Bench  | 4.008 lx7/cyc | 1.288 | **1.279 lx7/cyc** | **5.05 ×** ✅ |
+| Boot   | 5.376 lx7/cyc | 1.727 | **1.735 lx7/cyc** | **3.40 ×** |
+
+Both engines tripled in real performance during M6.2 → M6.49. Bench
+cleared the user's 5×-interp goal at M6.31. Boot's gains came from a
+sequence of inline expansions and finally a specialised "fast-path
+MMIO helper" framework (M6.42–M6.47) that bypasses `m68k_step`'s
+decode overhead for the common VIA-register read / write paths.
+
+The M6.54 → M6.62 native-chaining + cross-block-register-cache work
+is ESP32-only and not reflected in host metrics; the M6.68 SR-flush
+fix is a correctness improvement that left perf unchanged.
 
 ## Benchmark
 
