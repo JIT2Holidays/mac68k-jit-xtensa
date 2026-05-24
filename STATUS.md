@@ -1,11 +1,11 @@
 # Status
 
-## Where things stand right now (post-M6.77)
+## Where things stand right now (post-M6.78)
 
 | Engine | lx7 / cyc | × interp baseline |
 |--------|----------:|------------------:|
-| **Bench** (Speedometer frozen snapshot, 20 M cycles, PC=`0x03DF58`) | **1.304** | **4.96 ×** ✅ |
-| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.446** | **4.47 ×** |
+| **Bench** (Speedometer frozen snapshot, 20 M cycles, PC=`0x03DF58`) | **1.296** | **4.99 ×** ✅ |
+| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.442** | **4.48 ×** |
 | **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.779** | **3.31 ×** |
 
 **Important note — M6.77 reset.** The bench numbers in this table
@@ -1151,6 +1151,70 @@ defensive-shadow pattern as the standard fix. Linked from
 scratch-clobber to ship undetected by ctest's 11K bench window
 (after the M6.75 `xt_movi`-12-bit-range one — see
 `xtensa-movi-range.md`).
+
+ctest: **7 / 7** pass.
+
+**M6.78 — JSR (d16,PC) + MOVE.L #imm32,-(An) inline + dispatch-arm
+arity bug fix.**
+
+Two opcodes (3571 combined helpers/20 M cyc on the M6.77 corrected
+bench path):
+
+* `0x4EBA` JSR (d16,PC) — 2563 hits. Block terminator. Mirrors the
+  existing RTS arm: read SP, decrement by 4, bounds-check new SP,
+  helper bridge on failure, fast path writes the return PC
+  (= `cpu->pc + 4` after `emit_advance_flush` lands cpu->pc on
+  source_pc) as 4 BE bytes to `[ram_base + new_SP]`, commits new
+  SP via `emit_write_g`, then loads target PC from LITERAL_BCC_PC
+  (= source_pc + 2 + sext_d16, stored in the per-block literal
+  slot by the block-setup pre-pass — same single-l32r-instead-of-
+  10-op-build trick already used by JMP.L) and writes it to
+  cpu->pc. Cycles 20 (interp base 4 + handler 16). Length 4.
+
+* `0x2F3C` MOVE.L #imm32,-(An) — 1008 hits. Immediate push. Same
+  shape as the existing MOVE.L Dn|Am,-(An) arm but with a compile-
+  time-known src: 4 `xt_movi + xt_s8i` pairs to write the byte
+  constants directly (skipping the 10-op `emit_load_imm32` +
+  4 `extui` extract pattern), and a compile-time-folded MOVE-family
+  flag update (N/Z derived from the imm at compile time, emitted as
+  a 4-op mask+OR sequence vs `emit_logic_flags`' 8-op runtime path).
+  Length 6, cycles 8.
+
+**Dispatch-arm arity bug found and fixed during measurement.** First
+build had the new MOVE.L #imm32,-(An) arm placed AFTER the existing
+`MOVE.L / MOVEA.L #imm32,Dn/An` arm. The existing arm's outer `if`
+condition matched ANY dst_mode (it just gated the immediate-src
+shape), then handled only dst_mode ∈ {0,1} inside; for other
+dst_modes (4 = -(An)) the arm exited without setting `done = true`.
+The dispatch's `else if` chain then **never tried the subsequent
+arms** because the outer condition already matched — JSR's helper
+count dropped to 0 (its own dispatch was clean), but the histogram
+still showed 0x2F3C at 1008, surfacing the issue. **Fix:** tighten
+the outer condition on the existing arm to
+`((w >> 6) & 7) == 0 || ((w >> 6) & 7) == 1` so non-matching
+dst_modes fall through to the new arm. A line comment now warns
+about the prior trap. (Recorded in `memory/dispatch-arm-arity.md`.)
+
+**Triple-diff workflow:**
+
+* ctest: 7/7
+* `--diff-jit-trace`: only the documented M6.66 cycle-11898 divergence
+* Boot @ 300 K det: PC=`0x40032C`, helpers=1192 — byte-identical to M6.77
+* Boot @ 5 M det: PC=`0x40032C`, helpers=25240 — byte-identical to M6.77
+
+**Perf:**
+
+| Workload | M6.77 | **M6.78** | Δ |
+|----------|------:|----------:|--:|
+| Bench @ 5 M cyc   | 14 124 h, 1.487 lx7/cyc | **12 314 h, 1.470 lx7/cyc** | **−1 810 h, −1.1 %** |
+| Bench @ 20 M cyc  | 20 766 h, 1.304 lx7/cyc | **17 195 h, 1.296 lx7/cyc** | **−3 571 h, −0.6 %** |
+| Bench @ 100 M cyc | 344 973 h, 1.446 lx7/cyc | **336 119 h, 1.442 lx7/cyc** | **−8 854 h, −0.3 %** |
+| Boot @ 5 M / 100 M | unchanged | identical | — (not boot-hot) |
+
+The 20 M helper drop of 3571 matches the predicted savings exactly
+(2563 + 1008). Bench `1.296` at 20 M cyc lands at **4.99 × interp
+baseline** (6.462 / 1.296) — just under the clean 5× line on the
+*correct* execution path.
 
 ctest: **7 / 7** pass.
 

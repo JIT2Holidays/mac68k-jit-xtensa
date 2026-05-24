@@ -1328,6 +1328,14 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             *(u32 *)(base + lit_off[LITERAL_BCC_PC]) = pc_const;
             g_pc_lit_val = pc_const;
             g_pc_lit_valid = true;
+        } else if (last_op == 0x4EBA) {
+            /* JSR (d16,PC) — store target PC (= source_pc + 2 + sext_d16)
+             * for the M6.78 inline arm to load with a 1-op l32r. */
+            u16 ext = mac_read16(cpu->mem, op_pc[n_ops - 1] + 2);
+            u32 pc_const = op_pc[n_ops - 1] + 2 + (u32)(i32)(i16)ext;
+            *(u32 *)(base + lit_off[LITERAL_BCC_PC]) = pc_const;
+            g_pc_lit_val = pc_const;
+            g_pc_lit_valid = true;
         }
     }
 
@@ -1676,6 +1684,72 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
 
             sext_memo_invalidate();
             inline_ops++; done = true;
+        } else if (w == 0x4EBA) {
+            /* JSR (d16,PC) — push return address, jump to PC + 2 + sext_d16.
+             * Block terminator. Bench-hot at 2563 hits/20 M cyc on the
+             * post-M6.77 corrected path (M6.78).
+             *
+             * Compile-time constants:
+             *   target_pc = source_pc + 2 + sext16(d16)   (stashed in
+             *                                              LITERAL_BCC_PC
+             *                                              by the block
+             *                                              setup pre-pass)
+             *   return_pc = source_pc + 4                 (computed at
+             *                                              runtime as
+             *                                              cpu->pc + 4,
+             *                                              since the
+             *                                              emit_advance_flush
+             *                                              just landed
+             *                                              cpu->pc on
+             *                                              source_pc) */
+            emit_advance_flush(&e);            /* cpu->pc = source_pc */
+            emit_read_g(&e, &rc, G_A(7), 8);   /* a8 = SP */
+            xt_addi(&e, 8, 8, -4);              /* a8 = new SP */
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_jsr = 0;        /* m68k_step sets cpu->pc directly */
+            i32 op_cyc_jsr = 20;      /* full m68k_step: base 4 + handler 16 */
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_jsr, op_cyc_jsr)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_jsr, op_cyc_jsr);
+            u32 jjsr_pos = e.len;
+            xt_j    (&e, 4);
+            /* Fast path: write return_pc (= cpu->pc + 4) as 4 BE bytes to
+             * [ram_base + new SP]; commit new SP; load target_pc into
+             * cpu->pc. */
+            xt_l32i (&e, 10, R_CPU, OFF_PC);
+            xt_addi (&e, 10, 10, 4);            /* a10 = return_pc */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);
+            xt_extui(&e, 11, 10, 24, 7); xt_s8i(&e, 11, 9, 0);
+            xt_extui(&e, 11, 10, 16, 7); xt_s8i(&e, 11, 9, 1);
+            xt_extui(&e, 11, 10,  8, 7); xt_s8i(&e, 11, 9, 2);
+            xt_extui(&e, 11, 10,  0, 7); xt_s8i(&e, 11, 9, 3);
+            emit_write_g(&e, &rc, G_A(7), 8);
+            /* Set cpu->pc = target. LITERAL_BCC_PC holds target_pc. */
+            if (g_pc_lit_valid) {
+                emit_l32r_at(&e, 10, g_pc_lit_off,
+                             g_pc_lit_entry_off + e.len);
+            } else {
+                u16 ext = mac_read16(cpu->mem, op_pc[i] + 2);
+                u32 target_pc = op_pc[i] + 2 + (u32)(i32)(i16)ext;
+                emit_load_imm32(&e, 10, 11, target_pc);
+            }
+            xt_s32i(&e, 10, R_CPU, OFF_PC);
+            emit_advance(&e, op_pc_jsr, op_cyc_jsr);
+
+            u32 here_jsr = e.len;
+            i32 jo_jsr = (i32)(here_jsr - jjsr_pos) - 4;
+            u32 jw_jsr = ((u32)((u32)jo_jsr & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jjsr_pos    ] = (u8)jw_jsr;
+            base[entry_off + jjsr_pos + 1] = (u8)(jw_jsr >> 8);
+            base[entry_off + jjsr_pos + 2] = (u8)(jw_jsr >> 16);
+
+            sext_memo_invalidate();
+            inline_ops++; done = true;
         } else if (top == 0xD && szf == 2 && !((w >> 8) & 1) && mode == 0) {
             /* ADD.L Dm,Dn */
             emit_add_l_dd(&e, (w >> 9) & 7, w & 7, flags_dead[i], &rc);
@@ -1690,8 +1764,15 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             int data = (w >> 9) & 7; if (data == 0) data = 8;
             emit_addq_an(&e, w & 7, ((w >> 8) & 1) ? -data : data, &rc);
             inline_ops++; done = true;
-        } else if (top == 0x2 && ((w >> 3) & 7) == 7 && (w & 7) == 4) {
-            /* MOVE.L / MOVEA.L #imm32,<dst>  (src = immediate). */
+        } else if (top == 0x2 && ((w >> 3) & 7) == 7 && (w & 7) == 4
+                   && (((w >> 6) & 7) == 0 || ((w >> 6) & 7) == 1)) {
+            /* MOVE.L / MOVEA.L #imm32, Dn / An  (src = immediate, dst_mode
+             * 0 or 1 only — other dst_modes (e.g. -(An), (d16,An)) get
+             * their own arms later in this chain). The previous form of
+             * this `else if` matched ANY dst_mode and left `done = false`
+             * for dst_modes ∉ {0,1}, suppressing dispatch of those later
+             * arms — caught when the M6.78 MOVE.L #imm32,-(An) arm never
+             * fired against the bench's 0x2F3C hot spot. */
             u32 imm = mac_read32(cpu->mem, op_pc[i] + 2);
             int dst_mode = (w >> 6) & 7, dst_reg = (w >> 9) & 7;
             if (dst_mode == 0) {
@@ -2028,6 +2109,71 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + jpdl_pos    ] = (u8)jw;
             base[entry_off + jpdl_pos + 1] = (u8)(jw >> 8);
             base[entry_off + jpdl_pos + 2] = (u8)(jw >> 16);
+
+            inline_ops++; done = true;
+        } else if (top == 0x2 && ((w >> 6) & 7) == 4 && mode == 7 && (w & 7) == 4) {
+            /* MOVE.L #imm32,-(An) — immediate push. Bench-hot 0x2F3C
+             * (MOVE.L #imm32,-(SP)) at 1008 hits/20 M cyc on the
+             * corrected M6.77 path. Mirrors the MOVE.L Dn|Am,-(An) arm
+             * above but with a compile-time-known src value: the
+             * four byte stores load the byte constants directly via
+             * `xt_movi` (range -2048..+2047 — every byte 0..255 fits)
+             * instead of `extui`-ing them out of a runtime register.
+             * Also folds the MOVE-family CCR update into compile-time:
+             * the imm's N/Z bits are constant, so we emit the SR
+             * mask + OR with a constant set-bits value (4 ops vs
+             * emit_logic_flags' 8 ops on a runtime value). */
+            int an = (w >> 9) & 7;
+            u32 imm = mac_read32(cpu->mem, op_pc[i] + 2);
+
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(an), 8);
+            xt_addi(&e, 8, 8, -4);                    /* a8 = new An */
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_pi = 6, op_cyc_pi = 8;     /* len 6 (op + imm32), 8 cyc */
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_pi, op_cyc_pi)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_pi, op_cyc_pi);
+            u32 jpi_pos = e.len;
+            xt_j    (&e, 4);
+
+            /* Fast path: write imm32 as 4 BE bytes to [ram_base + new An]. */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);
+            xt_movi (&e, 11, (i32)((imm >> 24) & 0xFF)); xt_s8i(&e, 11, 9, 0);
+            xt_movi (&e, 11, (i32)((imm >> 16) & 0xFF)); xt_s8i(&e, 11, 9, 1);
+            xt_movi (&e, 11, (i32)((imm >>  8) & 0xFF)); xt_s8i(&e, 11, 9, 2);
+            xt_movi (&e, 11, (i32)((imm >>  0) & 0xFF)); xt_s8i(&e, 11, 9, 3);
+            emit_write_g(&e, &rc, G_A(an), 8);
+
+            if (!flags_dead[i]) {
+                /* Compile-time MOVE-family flags from the imm. Clear low
+                 * 4 bits of SR (preserve X via -16 mask), OR in the
+                 * statically-known N/Z bits. */
+                xt_movi (&e, 12, -16);
+                xt_and  (&e, R_SR, R_SR, 12);
+                u32 set_bits = 0;
+                if (imm == 0)          set_bits = 0x04;  /* Z */
+                else if ((i32)imm < 0) set_bits = 0x08;  /* N */
+                if (set_bits) {
+                    xt_movi(&e, 12, (i32)set_bits);
+                    xt_or  (&e, R_SR, R_SR, 12);
+                }
+                g_sr_dirty = true;
+                sext_memo_invalidate();
+            }
+            emit_advance(&e, op_pc_pi, op_cyc_pi);
+
+            u32 here_pi = e.len;
+            i32 jo_pi = (i32)(here_pi - jpi_pos) - 4;
+            u32 jw_pi = ((u32)((u32)jo_pi & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jpi_pos    ] = (u8)jw_pi;
+            base[entry_off + jpi_pos + 1] = (u8)(jw_pi >> 8);
+            base[entry_off + jpi_pos + 2] = (u8)(jw_pi >> 16);
 
             inline_ops++; done = true;
         } else if (top == 0x2 && ((w >> 6) & 7) == 3 && (mode == 0 || mode == 1)) {
