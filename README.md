@@ -12,14 +12,14 @@ simulator.
 
 ## Headline numbers (host, JIT vs interp)
 
-State at **M6.162**.
+State at **M6.164**.
 
 | Workload | interp lx7/cyc | JIT lx7/cyc | speedup |
 |---|---:|---:|---:|
 | Speedometer 20 M cycles (frozen snapshot) | 6.462 | **1.162** | **5.56 ×** |
-| Speedometer 100 M cycles | 6.462 | **1.180** | 5.48 × |
-| Mac Plus ROM boot (100 M cyc) | 5.895 | **1.658** | 3.89 × |
-| Mac Plus ROM boot (5 M cyc, det) | 5.895 | **2.196** | 2.94 × |
+| Speedometer 100 M cycles | 6.462 | **1.179** | 5.48 × |
+| Mac Plus ROM boot (100 M cyc) | 5.895 | **1.657** | 3.89 × |
+| Mac Plus ROM boot (5 M cyc, det) | 5.895 | **2.195** | 2.94 × |
 
 The bench exceeds the original "5 × interp" goal (M6.31, M6.51) and has
 since moved another ~9 % faster across the M6.91–M6.152 inline rounds.
