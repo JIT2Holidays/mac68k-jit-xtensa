@@ -1,13 +1,101 @@
 # Status
 
-## Where things stand right now (post-M6.132)
+## Where things stand right now (post-M6.135)
 
 | Engine | lx7 / cyc | real_lx7 / cyc | × interp baseline (host) |
 |--------|----------:|---------------:|-------------------------:|
 | **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.168** | **1.169** | **5.53 ×** ✅ |
 | **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.197** | **1.212** | **5.40 ×** ✅ |
-| **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.667** | **1.688** | **3.87 ×** |
-| **Boot** (Mac Plus ROM, 5 M cycles, PC=`0x40032C` deterministic)    | **2.214** | **2.569** | **2.92 ×** |
+| **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.665** | **1.666** | **3.88 ×** |
+| **Boot** (Mac Plus ROM, 5 M cycles, PC=`0x40032C` deterministic)    | **2.197** | **2.197** | **2.94 ×** |
+
+## High-gain backlog — the next structural moves
+
+The inline-arm + fast-helper rounds (M6.91–M6.135) have hit diminishing
+returns: every remaining hot op in boot 100 M is in the M6.66 post-
+divergence chaotic region (see `memory/m6.66-trajectory-traps.md`), so
+new inline arms shift the trajectory more than they shave LX7. The path
+forward is structural, not piecemeal. Three items, biggest-win-first:
+
+### 1. Full register caching of hot D/A regs across a block
+
+Current cache holds 4 hot guest regs in `a4..a7` (`R_CACHE0..3`), picked
+at block-compile time. Hits eliminate `l32i`/`s32i`; misses fall back to
+`cpu_state` loads/stores. Two known limits:
+
+* **Cache survival at helper boundaries.** Currently every helper
+  bridge does `emit_cache_flush` (write all dirty back) and
+  `emit_cache_reload` (read all in `g_helper_touched_mask` back). The
+  M6.132–M6.135 fast-helpers are direct `callx0` C functions — under
+  CALL0 ABI the callee can clobber `a4..a11`, so cache regs are
+  *physically* lost across the call (the reload covers this). The
+  `m68k_step` path goes through `m68k_step_call0` which uses `call8`;
+  the window rotation means the JIT's `a0..a7` survive *physically*,
+  but cache-vs-memory consistency still needs the flush/reload because
+  `m68k_step` reads and writes `cpu->d[]/cpu->a[]` directly.
+  **Win**: hand-written asm trampolines for the fast helpers that
+  spill/restore `a4..a7` around the C body (10 ops). Combined with a
+  helper-`read_mask` (sibling to the existing `g_helper_touched_mask`),
+  the JIT could skip the flush of dirty-cache slots the helper doesn't
+  read AND skip the reload of slots the helper doesn't write. Per
+  bridge this saves 2 × |unaffected dirty/cached slots| `l32i`/`s32i`.
+* **Cache width.** Today 4 slots — covers the 4 hottest of up to 16
+  guest regs. On the ESP32, `a8..a11` are callee-clobberable scratch in
+  CALL0; `a12..a15` are split (R_HELP, R_SR, scratch). With the
+  trampoline-preserves-a4..a11 approach above, the cache could expand
+  to 6–8 slots in blocks that don't use those regs as inline scratch.
+  Per-block analysis would assign extra slots only when safe.
+
+### 2. Comprehensive lazy CCs with a classifier modelling helper CCR usage
+
+`classify_op` already partitions opcodes into SET-only vs SET+CONS for
+the lazy-CC path, but helper-fall-back ops are conservatively treated
+as "consumes + sets everything" — every helper-bridged op forces a
+`emit_sr_flush` and the subsequent inline-arm CC computation can't
+assume any flag is preloaded. A per-op-helper CCR mask (which bits
+*this specific* helper actually reads / writes) would let the JIT:
+
+* skip `emit_sr_flush` before helpers that don't read SR
+* skip the slow-path post-helper `emit_sr_reload` if the helper writes
+  no CCR bits
+* allow the inline emit *after* a helper to keep using preloaded NZVC
+  from a prior inline op if the helper didn't touch them
+
+This wants per-opcode CCR-write/read tables in `m68k_decode_at`'s
+neighbourhood (or a small static table indexed by the 7-bit opcode
+category).
+
+### 3. Native block chaining on the ESP32 target
+
+The host xt_sim runs one block per `xt_sim_run`, so any chain JX exits
+the sim and returns to the C dispatcher. On the ESP32 the JX from a
+predecessor block's epilogue to a successor's entry stays in JIT-land,
+eliminating one dispatcher round-trip per chained block. The
+infrastructure (`predicted_next_entry`, `chain_entry_addr`, cache_sig
+compat) is already in place — the host metric can't observe this win,
+but real-hardware boot/bench should see ~5–15 LX7 savings per chained
+block (predicting >90 % of chains on bench).
+
+This isn't a code change so much as a measurement gap: once we have an
+on-device profile run, we'll know how big the chaining win actually is.
+
+## M6.136 — AND.B / OR.B (d16,An),Dn inline — REVERTED 🔻
+
+Boot's 0xC029 (AND.B (d16,A1),D0) fires 390 helpers/100M cyc in the
+divergence region. Inlined it mirroring the M6.91 MOVE.B (d16,An),Dn
+pattern — full RAM-or-ROM byte bounds, then AND/OR with Dn[7:0] and
+merge.
+
+Result: **arm itself correct (ctest 7/7, --diff-jit-trace 11 038 clean),
+but boot 100 M regressed +3.5 %** (1.665 → 1.724). Bench unchanged,
+boot 5 M det unchanged — the op only fires post-M6.66-divergence, so
+adding the arm shifted the chaotic trajectory into a heavier helper
+path. Classic [[m6.66-trajectory-traps]] case. Reverted.
+
+**Net post-M6.135 conclusion:** boot 100 M cannot be improved by more
+inline arms targeting the divergence region. Real progress needs one
+of the three high-gain items above OR an M6.66 root-cause structural
+fix.
 
 ## M6.132 — fast-helpers for RTS / BSR.S / BSR.W MMIO — bench 100 M real_lx7 1.253 → 1.212 (−3.27 %) 🎯
 
