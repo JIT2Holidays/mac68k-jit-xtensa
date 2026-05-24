@@ -1527,10 +1527,10 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
     g_pc_lit_entry_off = lit_bytes;
     {
         u16 last_op = op_word[n_ops - 1];
-        if ((last_op >> 12) == 0x6) {        /* BRA.S / Bcc.S family */
+        if ((last_op >> 12) == 0x6) {        /* BRA / Bcc / BSR family */
             int cc = (last_op >> 8) & 0xF;
             i32 disp = (i8)(last_op & 0xFF);
-            if (disp != 0 && disp != -1) {  /* not .W/.L variants (handled by helper) */
+            if (disp != 0 && disp != -1) {  /* .S form */
                 u32 pc_const;
                 if (cc == 0 || cc == 1) {
                     /* BRA.S / BSR.S — both unconditional, literal is the
@@ -1540,6 +1540,16 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                     /* Bcc.S: literal is the fall-through PC. */
                     pc_const = op_pc[n_ops - 1] + 2;
                 }
+                *(u32 *)(base + lit_off[LITERAL_BCC_PC]) = pc_const;
+                g_pc_lit_val = pc_const;
+                g_pc_lit_valid = true;
+            } else if (disp == 0 && cc == 1) {
+                /* M6.105 — BSR.W disp16: target = source_pc + 2 +
+                 * sext16(disp16). Unconditional; literal is the taken
+                 * target. Bench has 0x6100 (BSR.W) at 117 hits / 20 M cyc;
+                 * boot has BSR.W variants in subroutine-heavy code paths. */
+                u16 ext = mac_read16(cpu->mem, op_pc[n_ops - 1] + 2);
+                u32 pc_const = op_pc[n_ops - 1] + 2 + (u32)(i32)(i16)ext;
                 *(u32 *)(base + lit_off[LITERAL_BCC_PC]) = pc_const;
                 g_pc_lit_val = pc_const;
                 g_pc_lit_valid = true;
@@ -4636,6 +4646,67 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + jbsr_pos    ] = (u8)jw_bsr;
             base[entry_off + jbsr_pos + 1] = (u8)(jw_bsr >> 8);
             base[entry_off + jbsr_pos + 2] = (u8)(jw_bsr >> 16);
+
+            sext_memo_invalidate();
+            inline_ops++; done = true;
+        } else if (top == 0x6 && (((w >> 8) & 0xF) == 1) && (w & 0xFF) == 0) {
+            /* M6.105 — BSR.W disp16. Bench-warm 0x6100 (BSR.W with
+             * disp16) at 117 helpers / 20 M cyc. Block terminator —
+             * inlining keeps the JIT chain unbroken through subroutine
+             * calls, matching the same chain-preservation insight that
+             * drove M6.102's DBEQ win.
+             *
+             * Same structure as BSR.S but the 16-bit displacement is in
+             * the ext word; length is 4 bytes (op + disp16). The target
+             * is op_pc + 2 + sext16(disp16), stashed in LITERAL_BCC_PC
+             * by the block-setup pre-pass extended above.
+             *
+             * Cycles: 22 (m68k_step base 4 + handler 18, same as BSR.S). */
+            u16 ext = mac_read16(cpu->mem, op_pc[i] + 2);
+            i32 disp16 = (i16)ext;
+            u32 target_pc = op_pc[i] + 2 + (u32)disp16;
+
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(7), 8);
+            xt_addi(&e, 8, 8, -4);
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_bsw = 0;        /* m68k_step sets cpu->pc directly */
+            i32 op_cyc_bsw = 22;
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_bsw, op_cyc_bsw)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_bsw, op_cyc_bsw);
+            u32 jbsw_pos = e.len;
+            xt_j    (&e, 4);
+            /* Fast path: write return PC (= cpu->pc + 4 since BSR.W is 4
+             * bytes), commit new SP, set cpu->pc = target. */
+            xt_l32i (&e, 10, R_CPU, OFF_PC);
+            xt_addi (&e, 10, 10, 4);
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);
+            xt_extui(&e, 11, 10, 24, 7); xt_s8i(&e, 11, 9, 0);
+            xt_extui(&e, 11, 10, 16, 7); xt_s8i(&e, 11, 9, 1);
+            xt_extui(&e, 11, 10,  8, 7); xt_s8i(&e, 11, 9, 2);
+            xt_extui(&e, 11, 10,  0, 7); xt_s8i(&e, 11, 9, 3);
+            emit_write_g(&e, &rc, G_A(7), 8);
+            if (g_pc_lit_valid && target_pc == g_pc_lit_val) {
+                emit_l32r_at(&e, 10, g_pc_lit_off,
+                             g_pc_lit_entry_off + e.len);
+            } else {
+                emit_load_imm32(&e, 10, 11, target_pc);
+            }
+            xt_s32i(&e, 10, R_CPU, OFF_PC);
+            emit_advance(&e, op_pc_bsw, op_cyc_bsw);
+
+            u32 here_bsw = e.len;
+            i32 jo_bsw = (i32)(here_bsw - jbsw_pos) - 4;
+            u32 jw_bsw = ((u32)((u32)jo_bsw & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jbsw_pos    ] = (u8)jw_bsw;
+            base[entry_off + jbsw_pos + 1] = (u8)(jw_bsw >> 8);
+            base[entry_off + jbsw_pos + 2] = (u8)(jw_bsw >> 16);
 
             sext_memo_invalidate();
             inline_ops++; done = true;

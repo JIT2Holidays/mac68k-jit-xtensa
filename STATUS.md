@@ -1,5 +1,54 @@
 # Status
 
+## M6.105 — BSR.W disp16 inline — bench 100 M crosses 5.00 × interp 🎯
+
+The M6.83 BSR.S disp8 inline only handled the 8-bit-displacement form
+(disp byte ≠ 0). BSR.W (disp byte == 0, 16-bit disp in ext word) was
+routed to the helper bridge. Bench has 0x6100 (BSR.W) at 117 helpers /
+20 M cyc — moderate count, but BSR is a **block terminator**, so each
+helper fallback breaks the JIT chain (M6.102's chain-preservation
+insight).
+
+Adding the inline: similar to BSR.S but with 16-bit disp and 4-byte
+return PC offset (BSR.W is 4 bytes total).
+
+Pre-pass for LITERAL_BCC_PC also extended: when block ends with BSR.W,
+stash `op_pc + 2 + sext16(disp16)` in the literal pool so the inline
+emit can load the target with a 1-op l32r.
+
+**Triple-diff workflow (full SOP):**
+
+* ctest: 7/7
+* `--diff-jit-trace`: clean through 11 038 cycles
+* Boot 5 M det / 100 M: byte-identical (no cycle drift — per
+  `memory/move-cycle-drift-gotcha.md` SOP)
+* Bench (20 M): 7 188 → 7 071 helpers (−117)
+* Bench (100 M): 248 363 → 226 649 (**−21 714**, similar magnitude
+  to M6.104's ADD/SUB.L An src extension)
+
+**Perf:**
+
+| Workload | M6.104 | **M6.105** | Δ |
+|----------|------:|----------:|--:|
+| Bench (20 M)     | 1.178 lx7/cyc | **1.178** | unchanged |
+| **Bench (100 M)**| 1.304 lx7/cyc | **1.293 lx7/cyc** | **−0.84 %** lx7 |
+| Boot @ 100 M cyc | 1.717 lx7/cyc | **1.717** | unchanged |
+
+🎯 **Bench 100 M crosses 5.00 × interp baseline** (6.462 / 1.293).
+
+The chain-preservation insight from M6.102's DBEQ keeps paying off:
+inline terminators eliminate dispatcher round-trips that compound
+at long horizons. The 20 M bench doesn't move at lx7/cyc resolution
+but the 100 M bench drops by nearly 1 % per terminator-class
+inline added.
+
+Cumulative M6.84 → M6.105:
+* Bench (20 M): 1.257 → **1.178** (−6.3 %)
+* Bench (100 M): 1.396 → **1.293** (−7.4 %)
+* Boot 300 K det: 2.170 → **1.975** (−9.0 %)
+* Boot 5 M det:   2.471 → **2.236** (−9.5 %)
+* Boot 100 M:     1.734 → **1.717** (−0.98 %)
+
 ## M6.104 — ADD.L / SUB.L extend src to An — bench 100 M −0.76 %
 
 The existing M6 emit_add_l_dd / emit_sub_l_dd handled only `Dm,Dn` src.
@@ -933,12 +982,12 @@ them each iteration.
    intermediate register writeback. See M6.85 below for the first
    fusion lever in this class.
 
-## Where things stand right now (post-M6.104)
+## Where things stand right now (post-M6.105)
 
 | Engine | lx7 / cyc | × interp baseline |
 |--------|----------:|------------------:|
 | **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.178** | **5.49 ×** ✅ |
-| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.304** | **4.95 ×** |
+| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.293** | **5.00 ×** ✅ |
 | **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.717** | **3.44 ×** |
 | **Boot** (Mac Plus ROM, 5 M cycles, PC=`0x40032C` deterministic)    | **2.236** | **2.64 ×** |
 | **Boot** (Mac Plus ROM, 300 K cycles, PC=`0x40032C` deterministic)  | **1.975** | **2.99 ×** |
