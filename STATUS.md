@@ -1,5 +1,58 @@
 # Status
 
+## M6.97 — LSR.W / ASR.W #imm,Dn inline (delivered)
+
+The boot 5M det helper count dropped from **2 923 → 185** (a 94 %
+reduction in remaining helpers for that window). The biggest single
+boot inline win in many milestones.
+
+**Mid-iteration bit-precision lesson:** boot's e442 helper at 3 K hits
+was initially decoded as LSR.W (bits 4-3 = 01); ACTUAL decode is
+**ASR.W** (bits 4-3 = 00 — arithmetic shift, sign-extending). The
+first LSR-only arm fired ~10 boot calls; extending to ASR captured
+the actual 3 K hot path plus its dependent blocks.
+
+The two shift types share the value-merge structure; ASR adds a
+`xt_slli; xt_srai 16+imm; xt_extui 0,15` sign-propagation chain
+where LSR uses a single `xt_srli imm`. Both compute last_out (bit
+imm-1 of original Dn.W) for C/X, and both merge into Dn's low 16
+preserving Dn.high_16.
+
+**Triple-diff workflow:**
+
+* ctest: 7/7
+* `--diff-jit-trace`: clean through 11 038 cycles
+* Boot 300 K det: 187 → 113 helpers (−74)
+* Boot 5 M det: 2 923 → 185 helpers (**−2 738**, **−94 %**)
+* Boot 100 M: 193 269 → 190 225 compile-time helpers (−3 044)
+
+**Perf:**
+
+| Workload | M6.96 | **M6.97** | Δ |
+|----------|------:|----------:|--:|
+| Bench (any size) | 1.183 lx7/cyc | **1.183** | unchanged (no shift in bench hot loop) |
+| Boot @ 300 K det | 1.995 lx7/cyc | **1.982 lx7/cyc** | **−0.65 %** |
+| Boot @ 5 M det   | 2.266 lx7/cyc | **2.236 lx7/cyc** | **−1.3 %** |
+| Boot @ 100 M cyc | 1.721 lx7/cyc | **1.719 lx7/cyc** | −0.1 % |
+
+**Cumulative M6.84 → M6.97 on boot:**
+
+| Workload | M6.84 | **M6.97** | Δ |
+|----------|------:|----------:|--:|
+| Boot 300 K det | 2.170 | **1.982** | **−8.7 %** |
+| Boot 5 M det   | 2.471 | **2.236** | **−9.5 %** |
+| Boot 100 M     | 1.734 | **1.719** | **−0.86 %** |
+
+Boot 100M is gated by the 174 K bogus-PC helpers from the M6.66 VIA-
+tick divergence (post-cycle-11898). The deterministic windows show
+the inline work's real value — early-init code is shift-and-byte-op
+heavy, and these are now mostly inlined.
+
+The arm covers immediate-count LSR.W and ASR.W. Extending to .B and
+.L sizes, plus LSL/ASL (left shifts) and register-count variants,
+would chip away at the remaining shift-family helpers (e208 ASR.B
+780 hits, e311 ROXL register-count variants).
+
 ## M6.96 — TST.B (xxx).W + Bcc.S fusion (delivered)
 
 Sibling of M6.95 TST.L + Bcc fusion, applied to the M6.77 TST.B (xxx).W
@@ -569,15 +622,15 @@ them each iteration.
    intermediate register writeback. See M6.85 below for the first
    fusion lever in this class.
 
-## Where things stand right now (post-M6.93)
+## Where things stand right now (post-M6.97)
 
 | Engine | lx7 / cyc | × interp baseline |
 |--------|----------:|------------------:|
-| **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.184** | **5.46 ×** ✅ |
+| **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.183** | **5.46 ×** ✅ |
 | **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.328** | **4.87 ×** |
-| **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.721** | **3.43 ×** |
-| **Boot** (Mac Plus ROM, 5 M cycles, PC=`0x40032C` deterministic)    | **2.266** | **2.61 ×** |
-| **Boot** (Mac Plus ROM, 300 K cycles, PC=`0x40032C` deterministic)  | **1.995** | **2.96 ×** |
+| **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.719** | **3.44 ×** |
+| **Boot** (Mac Plus ROM, 5 M cycles, PC=`0x40032C` deterministic)    | **2.236** | **2.64 ×** |
+| **Boot** (Mac Plus ROM, 300 K cycles, PC=`0x40032C` deterministic)  | **1.982** | **2.98 ×** |
 
 **Important note — M6.77 reset.** The bench numbers in this table
 are the **first correct measurements** of the milestone in many

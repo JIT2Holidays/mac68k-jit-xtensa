@@ -5190,6 +5190,89 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + joo_pos + 2] = (u8)(jw_oo >> 16);
 
             inline_ops++; done = true;
+        } else if (top == 0xE && !((w >> 8) & 1)
+                   && ((w >> 6) & 3) == 1
+                   && !((w >> 5) & 1)
+                   && (((w >> 3) & 3) == 1 || ((w >> 3) & 3) == 0)) {
+            /* M6.97 — LSR.W / ASR.W #imm,Dn — boot's e442 (ASR.W #2,D2)
+             * at 3 K helpers / 100 M cyc is the dominant hit. Initially
+             * decoded as LSR.W but bits 4-3 = 00 means ASR (arithmetic
+             * sign-extending right shift); LSR is 01. Both share the
+             * value-merge structure; ASR uses xt_srai with a left-shift
+             * to put Dn.W's bit 15 at bit 31 for sign propagation.
+             *
+             * Bit-field decode:
+             *   bits 11-9 = count (1..7, 0 means 8)
+             *   bit 8 = 0 (right shift)
+             *   bits 7-6 = 01 (.W size)
+             *   bit 5 = 0 (immediate count)
+             *   bits 4-3 = 00 (ASR) or 01 (LSR)
+             *   bits 2-0 = Dn
+             *
+             * Semantics:
+             *   LSR: result = Dn.W >> imm    (zero fill, N=0)
+             *   ASR: result = sext(Dn.W) >> imm  (sign fill, N=sign)
+             *   common: Z=(result==0); C=X=bit(imm-1) of Dn.W; V=0
+             *           Dn = (Dn & 0xFFFF0000) | (result & 0xFFFF)
+             *
+             * Cycles: m68k_step base 4 + handler `6 + 2*cnt`. */
+            int imm = (w >> 9) & 7; if (imm == 0) imm = 8;
+            int dn = w & 7;
+            bool is_asr = ((w >> 3) & 3) == 0;
+
+            int dn_xt = cache_lookup(&rc, G_D(dn));
+            u8 src_reg = (dn_xt >= 0) ? (u8)dn_xt : 8;
+            if (dn_xt < 0) emit_read_g(&e, &rc, G_D(dn), 8);
+
+            xt_extui(&e, 9, src_reg, 0, 15);             /* a9 = Dn.W zero-ext */
+            xt_extui(&e, 10, 9, imm - 1, 0);             /* a10 = last_out (bit imm-1) */
+            if (is_asr) {
+                /* Sign-extend .W to 32 then arith shift. */
+                xt_slli (&e, 9, 9, 16);                   /* sign of .W at bit 31 */
+                xt_srai (&e, 9, 9, 16 + imm);             /* arith shift; result.W in bits 0..15 */
+                xt_extui(&e, 9, 9, 0, 15);                /* mask to 16 bits */
+            } else {
+                xt_srli (&e, 9, 9, imm);                  /* a9 = result.W */
+            }
+            xt_extui(&e, 11, src_reg, 16, 15);            /* a11 = Dn.high_16 */
+            xt_slli (&e, 11, 11, 16);
+            u8 dst_reg = (dn_xt >= 0) ? (u8)dn_xt : 8;
+            xt_or   (&e, dst_reg, 11, 9);                 /* combined */
+
+            if (dn_xt >= 0) {
+                for (int s = 0; s < rc.active; s++)
+                    if (rc.guest[s] == (u8)G_D(dn)) { rc.dirty |= (u16)(1u << s); break; }
+            } else {
+                emit_write_g(&e, &rc, G_D(dn), 8);
+            }
+
+            if (!flags_dead[i]) {
+                /* SR update: clear C, V, Z, N, X (bits 0-4); keep upper.
+                 * C bit 0 = last_out, X bit 4 = C, Z = (result==0).
+                 * For LSR: N = 0. For ASR: N = bit 15 of result (= bit 31
+                 * of the pre-extui sign-extended a9, but we already extui'd;
+                 * need to read it from src_reg's bit (15 - sign-propagated)
+                 * — simplest is to look at bit 15 of a9 which is the
+                 * result's bit 15 = the propagated sign for ASR). */
+                xt_movi (&e, 12, -32);                    /* mask = ~0x1F */
+                xt_and  (&e, R_SR, R_SR, 12);
+                xt_or   (&e, R_SR, R_SR, 10);             /* set C from a10 */
+                xt_slli (&e, 12, 10, 4);
+                xt_or   (&e, R_SR, R_SR, 12);             /* set X from bit 4 */
+                if (is_asr) {
+                    /* N = bit 15 of result.W (the new .W's sign). */
+                    xt_extui(&e, 12, 9, 15, 0);
+                    xt_slli (&e, 12, 12, 3);
+                    xt_or   (&e, R_SR, R_SR, 12);
+                }
+                xt_movi (&e, 12, 0x04);
+                xt_bnez (&e, 9, 6);                       /* skip Z if result != 0 */
+                xt_or   (&e, R_SR, R_SR, 12);
+                g_sr_dirty = true;
+                sext_memo_invalidate();
+            }
+            emit_advance(&e, 2, 10 + 2 * imm);  /* base 4 + handler 6 + 2*cnt */
+            inline_ops++; done = true;
         }
 
         if (!done) {
