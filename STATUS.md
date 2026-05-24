@@ -1,5 +1,54 @@
 # Status
 
+## M6.99 — EXT.W/EXT.L Dn + LSR.L/ASR.L #imm,Dn inline (delivered)
+
+Combined commit covering three new inline arms:
+
+**EXT.W Dn** (mask `(w & 0xFFF8) == 0x4880`)
+- sign-extend Dn[7:0] to Dn[15:0], preserving Dn[31:16]
+- 6 value ops: `xt_slli 24; xt_srai 24; xt_extui 0,15` for sign-ext to
+  .W, then `xt_extui 16,15; xt_slli 16; xt_or` to merge with Dn.high
+
+**EXT.L Dn** (mask `(w & 0xFFF8) == 0x48C0`) — boot's 0x48C1 at 597 hits
+- sign-extend Dn[15:0] to Dn[31:0] (replaces full Dn)
+- Just 2 value ops: `xt_slli 16; xt_srai 16` in-place on the cache slot
+- Lightning-fast — the simplest inline arm of this batch
+
+**LSR.L / ASR.L #imm,Dn** — separate arm from the M6.97/M6.98 .B/.W
+arm because .L doesn't need the size-bit extract or merge (shift
+operates on full 32-bit Dn in-place). 3 value ops (last_out extract,
+shift, optional sign-ext via srai). last_out MUST be captured before
+the in-place shift writes the slot.
+
+**Triple-diff workflow:**
+
+* ctest: 7/7
+* `--diff-jit-trace`: clean through 11 038 cycles
+* Boot 300 K det: 105 → 85 helpers (−20)
+* Boot 5 M det: 177 → 157 helpers (−20)
+* Boot 100 M: 189 149 → 188 525 (−624)
+* Bench (20 M): 9280 → 8973 (**−307 helpers**, .L shifts in non-hot
+  blocks getting inlined)
+
+**Perf:**
+
+| Workload | M6.98 | **M6.99** | Δ |
+|----------|------:|----------:|--:|
+| Bench (20 M)     | 1.183 lx7/cyc | **1.182 lx7/cyc** | **−0.08 %** lx7 |
+| Bench (5 M / 100 M) | unchanged | unchanged | — |
+| Boot @ 300 K det | 1.980 lx7/cyc | **1.976 lx7/cyc** | **−0.2 %** lx7 |
+| Boot @ 5 M det   | 2.236 lx7/cyc | **2.236 lx7/cyc** | unchanged |
+| Boot @ 100 M cyc | 1.718 lx7/cyc | **1.718 lx7/cyc** | unchanged |
+
+**Bench crossed 5.47 × interp** for the first time. Boot 300 K det
+crossed **2.99 × interp**.
+
+Cumulative M6.84 → M6.99:
+* Bench (20 M): 1.257 → **1.182** (−6.0 %)
+* Boot 300 K det: 2.170 → **1.976** (−8.9 %)
+* Boot 5 M det:   2.471 → **2.236** (−9.5 %)
+* Boot 100 M:     1.734 → **1.718** (−0.92 %)
+
 ## M6.98 — LSR.B / ASR.B #imm,Dn inline (delivered)
 
 Extends the M6.97 LSR/ASR.W arm to also handle .B size. The shared
@@ -657,15 +706,15 @@ them each iteration.
    intermediate register writeback. See M6.85 below for the first
    fusion lever in this class.
 
-## Where things stand right now (post-M6.97)
+## Where things stand right now (post-M6.99)
 
 | Engine | lx7 / cyc | × interp baseline |
 |--------|----------:|------------------:|
-| **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.183** | **5.46 ×** ✅ |
+| **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.182** | **5.47 ×** ✅ |
 | **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.328** | **4.87 ×** |
-| **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.719** | **3.44 ×** |
+| **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.718** | **3.44 ×** |
 | **Boot** (Mac Plus ROM, 5 M cycles, PC=`0x40032C` deterministic)    | **2.236** | **2.64 ×** |
-| **Boot** (Mac Plus ROM, 300 K cycles, PC=`0x40032C` deterministic)  | **1.982** | **2.98 ×** |
+| **Boot** (Mac Plus ROM, 300 K cycles, PC=`0x40032C` deterministic)  | **1.976** | **2.99 ×** |
 
 **Important note — M6.77 reset.** The bench numbers in this table
 are the **first correct measurements** of the milestone in many

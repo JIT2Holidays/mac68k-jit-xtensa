@@ -4712,6 +4712,73 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             if (!flags_dead[i]) emit_logic_flags(&e, 8);
             emit_advance(&e, 2, 4);
             inline_ops++; done = true;
+        } else if ((w & 0xFFF8) == 0x48C0) {
+            /* M6.99 — EXT.L Dn — boot-warm 0x48C1 (EXT.L D1) at ~600
+             * helpers / 100 M cyc. Sign-extend Dn[15:0] to Dn[31:0]:
+             * bit 15 propagates into bits 16-31.
+             *
+             * Implementation: xt_slli 16; xt_srai 16. Two ops total.
+             * Replaces the full 32-bit Dn (no merge needed). Flags are
+             * the classic MOVE-family: N=bit31(result), Z=(result==0),
+             * V=C=0, X preserved. Length 2, 4 cycles. */
+            int dn = w & 7;
+            int dn_xt = cache_lookup(&rc, G_D(dn));
+            u8 src_reg = (dn_xt >= 0) ? (u8)dn_xt : 8;
+            if (dn_xt < 0) emit_read_g(&e, &rc, G_D(dn), 8);
+            u8 dst_reg = (dn_xt >= 0) ? (u8)dn_xt : 8;
+            xt_slli(&e, dst_reg, src_reg, 16);          /* .W at bit 31 */
+            xt_srai(&e, dst_reg, dst_reg, 16);          /* arith shift back */
+            if (dn_xt >= 0) {
+                for (int s = 0; s < rc.active; s++)
+                    if (rc.guest[s] == (u8)G_D(dn)) { rc.dirty |= (u16)(1u << s); break; }
+            } else {
+                emit_write_g(&e, &rc, G_D(dn), 8);
+            }
+            if (!flags_dead[i]) emit_logic_flags(&e, dst_reg);
+            emit_advance(&e, 2, 4);
+            inline_ops++; done = true;
+        } else if ((w & 0xFFF8) == 0x4880) {
+            /* M6.99 — EXT.W Dn — sign-extend Dn[7:0] to Dn[15:0],
+             * preserving Dn[31:16]. Less common than EXT.L but cheap
+             * to add alongside.
+             *
+             * Implementation:
+             *   xt_slli a9, Dn, 24       ; bit 7 at bit 31
+             *   xt_srai a9, a9, 24       ; arith shift; sign-ext .B to .L
+             *   xt_extui a9, a9, 0, 15   ; mask to 16 bits (= .W result)
+             *   xt_extui a11, Dn, 16, 15 ; Dn.high_16
+             *   xt_slli  a11, a11, 16
+             *   xt_or    Dn, a11, a9     ; merge
+             *
+             * Flag bit 15 of result is N (sign of new .W); shift to bit 31
+             * for emit_logic_flags. Z = (result.W == 0). V=C=0, X preserved.
+             * Length 2, 4 cycles. */
+            int dn = w & 7;
+            int dn_xt = cache_lookup(&rc, G_D(dn));
+            u8 src_reg = (dn_xt >= 0) ? (u8)dn_xt : 8;
+            if (dn_xt < 0) emit_read_g(&e, &rc, G_D(dn), 8);
+
+            xt_slli (&e, 9, src_reg, 24);
+            xt_srai (&e, 9, 9, 24);                      /* sign-ext .B to 32 */
+            xt_extui(&e, 9, 9, 0, 15);                   /* low 16 = result.W */
+            xt_extui(&e, 11, src_reg, 16, 15);            /* Dn.high_16 */
+            xt_slli (&e, 11, 11, 16);
+            u8 dst_reg = (dn_xt >= 0) ? (u8)dn_xt : 8;
+            xt_or   (&e, dst_reg, 11, 9);
+
+            if (dn_xt >= 0) {
+                for (int s = 0; s < rc.active; s++)
+                    if (rc.guest[s] == (u8)G_D(dn)) { rc.dirty |= (u16)(1u << s); break; }
+            } else {
+                emit_write_g(&e, &rc, G_D(dn), 8);
+            }
+            if (!flags_dead[i]) {
+                /* For .W: N = bit 15. Shift to bit 31 for emit_logic_flags. */
+                xt_slli (&e, 8, 9, 16);
+                emit_logic_flags(&e, 8);
+            }
+            emit_advance(&e, 2, 4);
+            inline_ops++; done = true;
         } else if (top == 0x4 && ((w >> 8) & 0xF) == 0xA && szf == 0
                    && mode == 7 && (w & 7) == 0) {
             /* TST.B (xxx).W — bench-hot 0x4A38 at ~15 K helpers in 20 M cyc
@@ -5189,6 +5256,57 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + joo_pos + 1] = (u8)(jw_oo >> 8);
             base[entry_off + joo_pos + 2] = (u8)(jw_oo >> 16);
 
+            inline_ops++; done = true;
+        } else if (top == 0xE && !((w >> 8) & 1)
+                   && ((w >> 6) & 3) == 2
+                   && !((w >> 5) & 1)
+                   && (((w >> 3) & 3) == 1 || ((w >> 3) & 3) == 0)) {
+            /* M6.99 — LSR.L / ASR.L #imm,Dn. Special-cased separately
+             * from the .B/.W arm below because .L doesn't need the
+             * size-bit extract or merge (the shift operates on the full
+             * 32-bit Dn in-place). Length 2, cycles 4 + 8 + 2*imm. */
+            int imm = (w >> 9) & 7; if (imm == 0) imm = 8;
+            int dn = w & 7;
+            bool is_asr = ((w >> 3) & 3) == 0;
+
+            int dn_xt = cache_lookup(&rc, G_D(dn));
+            u8 src_reg = (dn_xt >= 0) ? (u8)dn_xt : 8;
+            if (dn_xt < 0) emit_read_g(&e, &rc, G_D(dn), 8);
+
+            /* last_out MUST be captured before in-place shift writes
+             * dst_reg (which is the same as src_reg when cached). */
+            xt_extui(&e, 10, src_reg, imm - 1, 0);
+            u8 dst_reg = (dn_xt >= 0) ? (u8)dn_xt : 8;
+            if (is_asr) xt_srai(&e, dst_reg, src_reg, imm);
+            else        xt_srli(&e, dst_reg, src_reg, imm);
+
+            if (dn_xt >= 0) {
+                for (int s = 0; s < rc.active; s++)
+                    if (rc.guest[s] == (u8)G_D(dn)) { rc.dirty |= (u16)(1u << s); break; }
+            } else {
+                emit_write_g(&e, &rc, G_D(dn), 8);
+            }
+
+            if (!flags_dead[i]) {
+                /* C=X=last_out (a10); Z=(result==0); N: 0 for LSR (zero
+                 * fill), bit 31 of result for ASR. V=0. */
+                xt_movi (&e, 12, -32);
+                xt_and  (&e, R_SR, R_SR, 12);
+                xt_or   (&e, R_SR, R_SR, 10);
+                xt_slli (&e, 12, 10, 4);
+                xt_or   (&e, R_SR, R_SR, 12);
+                if (is_asr) {
+                    xt_extui(&e, 12, dst_reg, 31, 0);
+                    xt_slli (&e, 12, 12, 3);
+                    xt_or   (&e, R_SR, R_SR, 12);
+                }
+                xt_movi (&e, 12, 0x04);
+                xt_bnez (&e, dst_reg, 6);
+                xt_or   (&e, R_SR, R_SR, 12);
+                g_sr_dirty = true;
+                sext_memo_invalidate();
+            }
+            emit_advance(&e, 2, 10 + 2 * imm);
             inline_ops++; done = true;
         } else if (top == 0xE && !((w >> 8) & 1)
                    && (((w >> 6) & 3) == 0 || ((w >> 6) & 3) == 1)
