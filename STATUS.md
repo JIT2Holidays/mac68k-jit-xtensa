@@ -395,6 +395,72 @@ Suggested next steps if pursuing this further:
   same-position clicks — the OS may need CrsrNew to be raised
   even on no-position-change for double-click registration.
 
+**M6.67 — bench scripting unblocked: x-coord was wrong, mouse works.**
+
+Resumed the bench-scripting attempt. The earlier "double-click won't
+open the icon" was a coordinate bug, not a mouse-delivery problem.
+Probed icon x positions on the System 6 desktop:
+
+```
+x=444, y=170 → cursor lands between icons, no selection
+x=465, y=170 → icon SELECTED + DOUBLE-CLICK OPENS THE WINDOW
+```
+
+The Mac Plus desktop puts disk icons centered around x=465 (~20 px
+further right than my original guess). Once corrected, double-click
+at `(465, 170)` opens Infinite HD straight to its top-level window.
+
+Achieved in this iteration:
+* Open Infinite HD via double-click. (host 9 software-category
+  folders visible.)
+* Open Utilities folder via double-click at `(370, 240)`.
+* Open TattleTech sub-folder via single-click + `Cmd-O` (the
+  keyboard-event scripting extension from M6.64 is critical here).
+  Saw the inner window with the actual app `TattleTech 2.84` and
+  `READ ME`.
+* Select `TattleTech 2.84` app at `(225, 255)` — icon inverts on
+  selection.
+
+Still stuck: launching the selected `TattleTech 2.84` app. Both
+double-click and `Cmd-O` after select fail to actually fire the
+"open application" Finder action. The folder-open path works, the
+app-launch path doesn't. Possible causes:
+* App's CREATOR/TYPE codes lost during the infinitemac.org chunked-
+  HFS reassembly — Finder can't identify the binary as launchable.
+* Different click-region semantics for app icons vs folder icons.
+* `LM_DoubleTime` or focus issue specific to apps.
+
+Mouse script primitive that works:
+```
+# Cycles are 7.83 MHz emulated; 600K cycles = ~77 ms hold.
+<cyc>       <x> <y> 0    # initial position-set + release
+<cyc+300K>  <x> <y> 1    # first press
+<cyc+900K>  <x> <y> 0    # first release
+<cyc+1.5M>  <x> <y> 1    # second press
+<cyc+2.1M>  <x> <y> 0    # second release
+```
+
+The frame-by-frame coordinate probe technique used here:
+```sh
+for y in 155 160 165 170 175 180; do
+    cat > /tmp/probe.mscript <<EOF
+1500000000 444 \$y 0
+1500200000 444 \$y 1
+1500800000 444 \$y 0
+EOF
+    rm -f /tmp/macframes/*.bmp
+    MAC68K_MOUSESCRIPT=/tmp/probe.mscript MAC68K_FRAMEDIR=/tmp/macframes \
+        MAC68K_FRAME_EVERY=50000000 MAC68K_END_CYCLE=1700000000 \
+        ./build/mac68k_host --jit --rom roms/macplus.rom \
+            --disk roms/disks/System6.dsk --server >/dev/null 2>&1
+    sips -s format png /tmp/macframes/frame_031.bmp --out /tmp/probe_y\$y.png
+done
+```
+
+Quick to iterate; the BMP→PNG conversion (sips) is what makes it
+readable. With this technique, finding icon coords is ~30 sec per
+icon.
+
 **M6.65 — `--diff-jit` finds a real pre-existing JIT divergence
 (not introduced by recent commits; ctest misses it).**
 
