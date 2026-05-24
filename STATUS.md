@@ -1,5 +1,50 @@
 # Status
 
+## M6.95 — TST.L + Bcc.S fusion (delivered)
+
+Extends the M6.30 CMP+Bcc fusion infrastructure to TST.L Dn followed
+by a Bcc.S with cc∈{6, 7, 13, 15} (NE / EQ / BLT / BLE). Skips the
+~8-op `emit_logic_flags` SR write and the Bcc's `emit_cond` SR read,
+computing the condition directly from the Dn value.
+
+**The trick:** reuse `emit_cmp_cond_fused(cc, s, d, r)` by passing
+`s == d == r == Dn`. With s == d, the V term `(s^d) & (d^r)` collapses
+to 0, leaving N = bit31(r) and Z = (r == 0) — exactly TST's CCR
+convention. cc=13 (BLT) reduces to `N` (since V=0), cc=15 (BLE) to
+`N | Z`, cc=6/7 to just the Z test on r.
+
+**Mid-iteration bug + fix:** First attempt didn't call
+`emit_advance_flush` before the fusion path. `emit_bcc_branchless_tail`
+OVERWRITES `cpu->pc` directly, so any compile-time-accumulated
+`g_pc_acc` from prior inline ops in the block was LOST. ctest's
+`diff_jit_bench_lockstep` caught the regression immediately — block
+at PC `0x038B74` (`MOVE.L (A0)+,A7 ; TST.L D7 ; BEQ.S +0x42`) was
+off by ~2 bytes of PC. Fixed by flushing pc/cycles before entering
+the fusion path.
+
+**Also caught a subtle scratch-register conflict:** the first
+implementation passed `r = a8` to `emit_cmp_cond_fused` for the cc=6/7
+case, where the fused-cond emit writes a8 with the cond literal
+before testing r via `bnez`. With r == a8 that bnez tests the
+just-overwritten 1/0, giving wrong cond. Fixed by reading Dn into
+a9 (or directly from the cache slot via `emit_read_g_in`).
+
+**Triple-diff workflow:**
+
+* ctest: 7/7 pass (after the emit_advance_flush fix)
+* `--diff-jit-trace`: clean through 11 038 cycles
+* Boot 300 K / 5 M det: unchanged (TST.L + Bcc not on these paths)
+* Boot 100 M: jit_cost 172 053 058 → 172 053 037 (−21 LX7, ~rounding)
+
+**Perf:** Bench at 20 M dropped from 23 668 212 → 23 666 465 lx7
+(−1 747 LX7, < 0.01 %). The fusion fires modestly — bench's TST.L
+sites are fewer than the CMP.W sites it parallels.
+
+The win is mostly structural: established the pattern for extending
+fusion to other single-operand-then-Bcc ops (TST.W, TST.B, SWAP+Bcc,
+EXT+Bcc, etc.). All those follow the same s=d=r=value-register
+trick.
+
 ## M6.94 — MOVE.B (An)+,Dn + MOVE.B Dn,(An)+ inline (delivered)
 
 Post-increment variants of the M6.92 MOVE.B (An),Dn / Dn,(An) arms.

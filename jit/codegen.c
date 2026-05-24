@@ -4638,11 +4638,60 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             inline_ops++; done = true;
         } else if (top == 0x4 && ((w >> 8) & 0xF) == 0xA && szf == 2 && mode == 0) {
             /* TST.L Dn — bench-warm 0x4A80/0x4A81 (~4 K). N/Z from Dn,
-             * V=C=0, X preserved. */
+             * V=C=0, X preserved.
+             *
+             * M6.95 — TST+Bcc fusion: when followed by Bcc.S
+             * cc∈{6,7,13,15} (NE/EQ/BLT/BLE), skip the R_SR write and
+             * compute the condition directly from Dn. Reuses
+             * `emit_cmp_cond_fused` by passing s=d=r=Dn: with s==d the
+             * V term `(s^d)&(d^r)` collapses to 0, leaving N=bit31(r)
+             * and Z=(r==0) — exactly TST's CCR convention. Saves the
+             * ~8-op emit_logic_flags + the ~3-op emit_cond's R_SR read
+             * per TST+Bcc fast-path call. */
             int dn = w & 7;
-            emit_read_g(&e, &rc, G_D(dn), 8);
-            if (!flags_dead[i]) emit_logic_flags(&e, 8);
-            emit_advance(&e, 2, 4);
+
+            bool fuse = false;
+            int fuse_cc = 0;
+            i32 fuse_disp = 0;
+            u32 fuse_ft = 0;
+            if (i + 1 < n_ops) {
+                u16 nw = op_word[i + 1];
+                if ((nw >> 12) == 0x6) {
+                    int cc = (nw >> 8) & 0xF;
+                    i32 disp = (i8)(nw & 0xFF);
+                    if ((cc == 6 || cc == 7 || cc == 13 || cc == 15) && disp != 0 && disp != -1) {
+                        fuse = true;
+                        fuse_cc = cc;
+                        fuse_disp = disp;
+                        fuse_ft = op_pc[i + 1] + 2;
+                    }
+                }
+            }
+
+            /* emit_bcc_branchless_tail OVERWRITES cpu->pc directly — any
+             * compile-time-accumulated g_pc_acc / g_cyc_acc from prior
+             * inline ops would be lost. Flush them to memory first when
+             * we're going to fuse. (The non-fused path keeps the deferred-
+             * accumulator pattern via emit_advance.) */
+            if (fuse) emit_advance_flush(&e);
+
+            /* Use emit_read_g_in so a cached Dn is read in-place; the
+             * scratch register is a9, NOT a8 — emit_cmp_cond_fused writes
+             * cond into a8, so we must not pass r=a8 (the bnez in cc=6/7
+             * would self-read the just-overwritten value). */
+            u8 dn_reg = emit_read_g_in(&e, &rc, G_D(dn), 9);
+
+            if (fuse) {
+                emit_cmp_cond_fused(&e, fuse_cc, dn_reg, dn_reg, dn_reg);
+                /* TST.L base 4 + Bcc.S base 12 = 16 cycles folded. */
+                emit_bcc_branchless_tail(&e, fuse_ft, fuse_disp, 16);
+                g_pc_acc = 0;
+                g_cyc_acc = 0;
+                i++;   /* skip the absorbed Bcc.S */
+            } else {
+                if (!flags_dead[i]) emit_logic_flags(&e, dn_reg);
+                emit_advance(&e, 2, 4);
+            }
             inline_ops++; done = true;
         } else if ((w & 0xFFF8) == 0x4840) {
             /* SWAP Dn — bench-warm 0x4840+ at ~246 hits/20 M cyc (M6.83).
