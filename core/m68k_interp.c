@@ -753,6 +753,24 @@ void m68k_jit_move_l_dn_to_anpi_mmio(m68k_cpu *cpu) {
     m68k_set_ccr(cpu, ccr);
 }
 
+void m68k_jit_move_b_addr_to_an_mmio(m68k_cpu *cpu) {
+    /* MOVE.B src_addr→(Am) — mem-to-mem byte copy. Used by the M6.91
+     * MOVE.B (d16,An),(Am) arm. Boot's 0x10A8 (MOVE.B (d16,A0),(A0))
+     * at 12 K helpers / 100 M cyc.
+     *
+     * jit_arg1 = src_addr (pre-computed by JIT: An + sext16(d16))
+     * jit_arg2 = dst_an (0..7) — helper reads cpu->a[dst_an] for dst */
+    u32 src_addr = cpu->jit_arg1;
+    int dst_an = (int)(cpu->jit_arg2 & 7);
+    u32 dst_addr = cpu->a[dst_an];
+    u8 v = mac_read8(cpu->mem, src_addr);
+    mac_write8(cpu->mem, dst_addr, v);
+    u8 ccr = m68k_get_ccr(cpu) & CCR_X;
+    if (v == 0)        ccr |= CCR_Z;
+    if (v & 0x80)      ccr |= CCR_N;
+    m68k_set_ccr(cpu, ccr);
+}
+
 void m68k_jit_move_b_addr_to_dn_mmio(m68k_cpu *cpu) {
     /* Generic MOVE.B src→Dn fast helper. Caller pre-computes the source
      * address in jit_arg1; jit_arg2 holds the destination Dn (0..7).

@@ -31,6 +31,7 @@ void m68k_jit_move_l_postinc_to_dn_mmio(m68k_cpu *cpu);
 void m68k_jit_move_b_addr_to_dn_mmio(m68k_cpu *cpu);
 void m68k_jit_move_b_dn_to_addr_mmio(m68k_cpu *cpu);
 void m68k_jit_move_l_dn_to_anpi_mmio(m68k_cpu *cpu);
+void m68k_jit_move_b_addr_to_an_mmio(m68k_cpu *cpu);
 
 /* Run the pure interpreter until cpu->cycles >= until or the CPU halts.
  * Polls interrupts and ticks the peripherals between instructions. */

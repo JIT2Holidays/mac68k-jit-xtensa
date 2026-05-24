@@ -3627,13 +3627,17 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
 
             emit_cache_flush(&e, &rc);
             i32 op_pc_mb2 = 4, op_cyc_mb2 = 8;
-            /* M6.127 — MOVE.B (d16,An),(Am) modifies no D/A reg
-             * (memory + CCR only; both An and Am are read for EAs). */
+            /* M6.134 — fast helper: a8 has src_addr (= An + d16). dst_am
+             * passed as imm2; helper reads cpu->a[dst_am] for dst_addr.
+             * touched_mask = 0 (no D/A reg modified). */
             g_helper_touched_mask = 0u;
-            xt_beqz (&e, 12, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_mb2, op_cyc_mb2)));
-            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
-                                              entry_off, &rc, op_pc_mb2, op_cyc_mb2);
+            u32 mb2_bridge_size = emit_jit_fast_helper_size(&rc);
+            xt_beqz (&e, 12, (i32)(6u + mb2_bridge_size));
+            emit_jit_fast_helper(&e, 8, dst_am,
+                                 lit_off[HELPER_JIT_MOVE_B_ADDR_TO_AN_MMIO],
+                                 entry_off, &rc);
             g_helper_touched_mask = 0xFFFFu;
+            (void)op_pc_mb2; (void)op_cyc_mb2;
             u32 jmb2_pos = e.len;
             xt_j    (&e, 4);
 
