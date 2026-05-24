@@ -1,5 +1,50 @@
 # Status
 
+## M6.109 — MOVE.W / MOVE.B (xxx).W,Dn — bench 100 M crosses 5.12 × interp
+
+Continues the (xxx).W class from M6.108 for the smaller .W and .B sizes.
+Bench's 0x1638 (MOVE.B (xxx).W,D3) at 21 K helpers / 100 M cyc is the
+.B variant; .W is moderately common too. Both use the same M6.77 / M6.108
+compile-time RAM check.
+
+The .W form needs the abs address to be 2-aligned; .B has no alignment
+requirement. Both merge into Dn[size-1:0] preserving the upper bits,
+using the cache-slot-direct path when Dn is cached (skips emit_read_g's
+xt_mov + emit_write_g's xt_mov).
+
+**Triple-diff workflow:**
+
+* ctest: 7/7
+* `--diff-jit-trace`: clean through 11 038 cycles
+* Boot 5 M det / 100 M: byte-identical (no cycle drift)
+* Bench (20 M): 6 705 → 6 666 helpers (−39)
+* Bench (100 M): 183 084 → 161 448 helpers (**−21 636**)
+
+**Perf:**
+
+| Workload | M6.108 | **M6.109** | Δ |
+|----------|------:|----------:|--:|
+| Bench (20 M)     | 1.177 lx7/cyc | **1.177** | unchanged |
+| **Bench (100 M)** | 1.271 lx7/cyc | **1.261 lx7/cyc** | **−0.79 %** lx7 |
+| Boot @ 100 M cyc | 1.716 lx7/cyc | **1.716** | within noise |
+
+🎯 **Bench 100 M crosses 5.12 × interp** — fourth consecutive 100-M-bench
+gain this iteration:
+* M6.105 BSR.W:       crossed 5.00 × interp
+* M6.107 LEA(d16,PC): crossed 5.04 ×
+* M6.108 (xxx).W .L: crossed 5.08 ×
+* M6.109 (xxx).W .W/.B: crosses 5.12 ×
+
+Cumulative this iteration (M6.105 → M6.109): bench 100 M **1.293 → 1.261**
+(**−2.5 %**), boot 100 M unchanged at lx7/cyc resolution.
+
+Cumulative M6.84 → M6.109:
+* Bench (20 M): 1.257 → **1.177** (−6.4 %)
+* Bench (100 M): 1.396 → **1.261** (−9.7 %)
+* Boot 300 K det: 2.170 → **1.975** (−9.0 %)
+* Boot 5 M det:   2.471 → **2.236** (−9.5 %)
+* Boot 100 M:     1.734 → **1.716** (−1.0 %)
+
 ## M6.108 — MOVE.L / MOVEA.L (xxx).W → Dn/An — bench 100 M crosses 5.08 × interp
 
 The (xxx).W absolute-addressing source mode reads a signed 16-bit
@@ -1129,12 +1174,12 @@ them each iteration.
    intermediate register writeback. See M6.85 below for the first
    fusion lever in this class.
 
-## Where things stand right now (post-M6.108)
+## Where things stand right now (post-M6.109)
 
 | Engine | lx7 / cyc | × interp baseline |
 |--------|----------:|------------------:|
 | **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.177** | **5.49 ×** ✅ |
-| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.271** | **5.08 ×** ✅ |
+| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.261** | **5.12 ×** ✅ |
 | **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.716** | **3.45 ×** |
 | **Boot** (Mac Plus ROM, 5 M cycles, PC=`0x40032C` deterministic)    | **2.236** | **2.64 ×** |
 | **Boot** (Mac Plus ROM, 300 K cycles, PC=`0x40032C` deterministic)  | **1.975** | **2.99 ×** |

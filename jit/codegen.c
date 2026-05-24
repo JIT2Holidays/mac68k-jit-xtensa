@@ -4318,6 +4318,114 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
               base[entry_off + jix_pos + 2] = (u8)(jw >> 16); }
 
             inline_ops++; done = true;
+        } else if (top == 0x3 && ((w >> 6) & 7) == 0 && mode == 7 && (w & 7) == 0) {
+            /* M6.109 — MOVE.W (xxx).W,Dn — sibling of M6.108's MOVE.L
+             * (xxx).W form, for .W reads from a static low-RAM address.
+             * Same compile-time RAM check; on RAM hit, inline 2-byte
+             * BE read + merge into Dn[15:0]. Length 4, cycles 8. */
+            int dn = (w >> 9) & 7;
+            u16 ext = mac_read16(cpu->mem, op_pc[i] + 2);
+            u32 abs_addr = (u32)(i32)(i16)ext;
+            abs_addr &= 0xFFFFFFu;
+
+            u32 ram_size = cpu->mem ? cpu->mem->ram_size : 0;
+            bool overlay = cpu->mem ? cpu->mem->overlay : true;
+            bool ram_pow2 = ram_size > 0 && (ram_size & (ram_size - 1)) == 0;
+            bool addr_in_ram = !overlay && ram_pow2
+                               && abs_addr < ram_size
+                               && (abs_addr & 1) == 0;
+
+            if (addr_in_ram) {
+                emit_advance_flush(&e);
+                emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                             entry_off + e.len);
+                if ((i32)abs_addr >= -128 && (i32)abs_addr <= 127) {
+                    xt_addi(&e, 9, 9, (i32)abs_addr);
+                } else if ((i32)abs_addr >= -2048 && (i32)abs_addr <= 2047) {
+                    xt_movi(&e, 10, (i32)abs_addr);
+                    xt_add (&e, 9, 9, 10);
+                } else {
+                    emit_load_imm(&e, 10, 11, abs_addr);
+                    xt_add (&e, 9, 9, 10);
+                }
+                xt_l8ui (&e, 10, 9, 0);            /* high byte */
+                xt_l8ui (&e, 11, 9, 1);            /* low byte */
+                xt_slli (&e, 10, 10, 8);
+                xt_or   (&e, 10, 10, 11);          /* a10 = .W */
+
+                /* Merge into Dn[15:0] preserving Dn[31:16]. Use the
+                 * cache-slot-direct path when Dn is cached. */
+                int dn_xt = cache_lookup(&rc, G_D(dn));
+                u8 dn_reg = (dn_xt >= 0) ? (u8)dn_xt : 11;
+                if (dn_xt < 0) emit_read_g(&e, &rc, G_D(dn), 11);
+                xt_srli(&e, dn_reg, dn_reg, 16);
+                xt_slli(&e, dn_reg, dn_reg, 16);
+                xt_or  (&e, dn_reg, dn_reg, 10);
+                if (dn_xt >= 0) {
+                    for (int s = 0; s < rc.active; s++)
+                        if (rc.guest[s] == (u8)G_D(dn)) { rc.dirty |= (u16)(1u << s); break; }
+                } else {
+                    emit_write_g(&e, &rc, G_D(dn), 11);
+                }
+                if (!flags_dead[i]) {
+                    xt_slli(&e, 8, 10, 16);
+                    emit_logic_flags(&e, 8);
+                }
+                emit_advance(&e, 4, 8);
+                inline_ops++; done = true;
+            }
+            /* else: fall through to helper. */
+        } else if (top == 0x1 && ((w >> 6) & 7) == 0 && mode == 7 && (w & 7) == 0) {
+            /* M6.109 — MOVE.B (xxx).W,Dn. Bench-hot 0x1638 at 21 K helpers /
+             * 100 M cyc. Compile-time RAM check; on RAM hit, read 1 byte
+             * and merge into Dn[7:0] preserving Dn[31:8]. Length 4,
+             * cycles 8. */
+            int dn = (w >> 9) & 7;
+            u16 ext = mac_read16(cpu->mem, op_pc[i] + 2);
+            u32 abs_addr = (u32)(i32)(i16)ext;
+            abs_addr &= 0xFFFFFFu;
+
+            u32 ram_size = cpu->mem ? cpu->mem->ram_size : 0;
+            bool overlay = cpu->mem ? cpu->mem->overlay : true;
+            bool ram_pow2 = ram_size > 0 && (ram_size & (ram_size - 1)) == 0;
+            bool addr_in_ram = !overlay && ram_pow2 && abs_addr < ram_size;
+            /* MOVE.B has no alignment requirement (vs .W/.L). */
+
+            if (addr_in_ram) {
+                emit_advance_flush(&e);
+                emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                             entry_off + e.len);
+                if ((i32)abs_addr >= -128 && (i32)abs_addr <= 127) {
+                    xt_addi(&e, 9, 9, (i32)abs_addr);
+                } else if ((i32)abs_addr >= -2048 && (i32)abs_addr <= 2047) {
+                    xt_movi(&e, 10, (i32)abs_addr);
+                    xt_add (&e, 9, 9, 10);
+                } else {
+                    emit_load_imm(&e, 10, 11, abs_addr);
+                    xt_add (&e, 9, 9, 10);
+                }
+                xt_l8ui (&e, 10, 9, 0);
+
+                /* Merge byte into Dn[7:0] preserving Dn[31:8]. */
+                int dn_xt = cache_lookup(&rc, G_D(dn));
+                u8 dn_reg = (dn_xt >= 0) ? (u8)dn_xt : 11;
+                if (dn_xt < 0) emit_read_g(&e, &rc, G_D(dn), 11);
+                xt_srli(&e, dn_reg, dn_reg, 8);
+                xt_slli(&e, dn_reg, dn_reg, 8);
+                xt_or  (&e, dn_reg, dn_reg, 10);
+                if (dn_xt >= 0) {
+                    for (int s = 0; s < rc.active; s++)
+                        if (rc.guest[s] == (u8)G_D(dn)) { rc.dirty |= (u16)(1u << s); break; }
+                } else {
+                    emit_write_g(&e, &rc, G_D(dn), 11);
+                }
+                if (!flags_dead[i]) {
+                    xt_slli(&e, 8, 10, 24);
+                    emit_logic_flags(&e, 8);
+                }
+                emit_advance(&e, 4, 8);
+                inline_ops++; done = true;
+            }
         } else if (top == 0x3 && ((w >> 6) & 7) == 0 && mode == 2) {
             /* MOVE.W (An),Dn — guest-RAM fast path with helper fallback.
              *
