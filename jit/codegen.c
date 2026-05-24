@@ -278,8 +278,24 @@ static void emit_sr_reload(xt_emit *e) {
     g_sr_dirty = false;
 }
 
+/* The default helper-step bridge. When `is_last_op` is true (caller has
+ * determined this op is the last in the block), skip emit_cache_reload:
+ * no inline op after this bridge reads cache, and the epilogue's
+ * cache_flush sees dirty=0 (cleared by the bridge's cache_flush) so it
+ * writes nothing back. Cache registers end the block holding stale
+ * values, which is fine — the next block's prologue reloads them.
+ *
+ * Only safe for emit_helper_step (the default fallback path). The
+ * conditional bridges (emit_helper_step_after_flush_undo, emit_jit_
+ * fast_helper) live inside inline arms whose FAST PATH may dirty cache
+ * slots — at runtime, when the slow path is taken (cache_reload
+ * skipped), cache stays stale; but compile-time dirty bits set by the
+ * fast path's emit_write_g cause the epilogue's cache_flush to write
+ * those STALE values back, CORRUPTING cpu state the helper just
+ * updated. M6.121 attempted to generalize this — caught by bench 100M
+ * regression (1.210 → 1.339 lx7/cyc, real_helpers 135K → 305K). */
 static void emit_helper_step(xt_emit *e, u32 helper_lit_off, u32 entry_off,
-                             regcache *rc) {
+                             regcache *rc, bool is_last_op) {
     g_block_emitted_callx0 = true;
     emit_advance_flush(e);
     emit_cache_flush(e, rc);
@@ -288,7 +304,7 @@ static void emit_helper_step(xt_emit *e, u32 helper_lit_off, u32 entry_off,
     emit_l32r_at(e, R_HELP, helper_lit_off, entry_off + e->len);
     xt_callx0(e, R_HELP);
     emit_sr_reload(e);
-    emit_cache_reload(e, rc);
+    if (!is_last_op) emit_cache_reload(e, rc);
     sext_memo_invalidate();
 }
 
@@ -6454,8 +6470,16 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
         }
 
         if (!done) {
-            /* Helper fallback: m68k_step(cpu). a3 survives the call. */
-            emit_helper_step(&e, lit_off[HELPER_M68K_STEP], entry_off, &rc);
+            /* Helper fallback: m68k_step(cpu). a3 survives the call.
+             *
+             * M6.121 — at LAST op (i == n_ops-1), skip post-helper
+             * cache_reload (no inline op afterward uses cache; the
+             * epilogue's cache_flush sees dirty=0 from the bridge's
+             * cache_flush and writes nothing back). This default
+             * fallback path has NO fast path with cache writes — unlike
+             * the inline-arm conditional bridges — so the skip is safe. */
+            emit_helper_step(&e, lit_off[HELPER_M68K_STEP], entry_off, &rc,
+                             /*is_last_op=*/i + 1 == n_ops);
             helper_ops++;
         }
     }
