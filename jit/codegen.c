@@ -878,10 +878,12 @@ static inline void emit_addsub_flags_long(xt_emit *e, bool is_sub, bool keep_x) 
  * `add dn_slot, dn_slot, dm_slot` (1 op) replaces the classic 4-op
  * sequence (2 movs + add + write-back mov). The flag emit takes the
  * pre-add d via a saved a9 when flags aren't dead. */
-static void emit_add_l_dd(xt_emit *e, int dn, int dm, bool skip_flags, regcache *rc) {
-    int xt_dm = cache_lookup(rc, G_D(dm));
+static void emit_add_l_dd(xt_emit *e, int dn, int dm, bool src_is_an,
+                          bool skip_flags, regcache *rc) {
+    int g_src = src_is_an ? G_A(dm) : G_D(dm);
+    int xt_dm = cache_lookup(rc, g_src);
     int xt_dn = cache_lookup(rc, G_D(dn));
-    if (xt_dm >= 0 && xt_dn >= 0 && dn != dm) {
+    if (xt_dm >= 0 && xt_dn >= 0 && (src_is_an || dn != dm)) {
         u8 dm_reg = (u8)xt_dm, dn_reg = (u8)xt_dn;
         if (!skip_flags) xt_mov(e, 9, dn_reg);     /* a9 = pre-add d */
         xt_add(e, dn_reg, dn_reg, dm_reg);          /* in-place add */
@@ -892,7 +894,7 @@ static void emit_add_l_dd(xt_emit *e, int dn, int dm, bool skip_flags, regcache 
         emit_advance(e, 2, 8);
         return;
     }
-    emit_read_g(e, rc, G_D(dm), 8);     /* s */
+    emit_read_g(e, rc, g_src, 8);       /* s */
     emit_read_g(e, rc, G_D(dn), 9);     /* d */
     xt_add (e, 10, 8, 9);
     emit_write_g(e, rc, G_D(dn), 10);
@@ -937,11 +939,14 @@ static void emit_cmp_l_dd(xt_emit *e, int dn, int dm, regcache *rc, u8 cc_mask) 
     emit_advance(e, 2, 8);
 }
 
-/* SUB.L Dm,Dn — d[dn] -= d[dm], full CCR (mirrors emit_add_l_dd). */
-static void emit_sub_l_dd(xt_emit *e, int dn, int dm, bool skip_flags, regcache *rc) {
-    int xt_dm = cache_lookup(rc, G_D(dm));
+/* SUB.L Dm/Am,Dn — d[dn] -= src.L, full CCR (mirrors emit_add_l_dd).
+ * M6.104 — src_is_an supports SUB.L An,Dn (bench-warm 0x948a). */
+static void emit_sub_l_dd(xt_emit *e, int dn, int dm, bool src_is_an,
+                          bool skip_flags, regcache *rc) {
+    int g_src = src_is_an ? G_A(dm) : G_D(dm);
+    int xt_dm = cache_lookup(rc, g_src);
     int xt_dn = cache_lookup(rc, G_D(dn));
-    if (xt_dm >= 0 && xt_dn >= 0 && dn != dm) {
+    if (xt_dm >= 0 && xt_dn >= 0 && (src_is_an || dn != dm)) {
         u8 dm_reg = (u8)xt_dm, dn_reg = (u8)xt_dn;
         if (!skip_flags) xt_mov(e, 9, dn_reg);     /* a9 = pre-sub d */
         xt_sub(e, dn_reg, dn_reg, dm_reg);
@@ -952,7 +957,7 @@ static void emit_sub_l_dd(xt_emit *e, int dn, int dm, bool skip_flags, regcache 
         emit_advance(e, 2, 8);
         return;
     }
-    emit_read_g(e, rc, G_D(dm), 8);
+    emit_read_g(e, rc, g_src, 8);
     emit_read_g(e, rc, G_D(dn), 9);
     xt_sub (e, 10, 9, 8);
     emit_write_g(e, rc, G_D(dn), 10);
@@ -2063,9 +2068,9 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
 
             sext_memo_invalidate();
             inline_ops++; done = true;
-        } else if (top == 0xD && szf == 2 && !((w >> 8) & 1) && mode == 0) {
-            /* ADD.L Dm,Dn */
-            emit_add_l_dd(&e, (w >> 9) & 7, w & 7, flags_dead[i], &rc);
+        } else if (top == 0xD && szf == 2 && !((w >> 8) & 1) && (mode == 0 || mode == 1)) {
+            /* ADD.L Dm/Am,Dn — M6.104 extends to An source. */
+            emit_add_l_dd(&e, (w >> 9) & 7, w & 7, mode == 1, flags_dead[i], &rc);
             inline_ops++; done = true;
         } else if (top == 0x5 && szf == 2 && mode == 0) {
             /* ADDQ.L / SUBQ.L #imm,Dn */
@@ -5107,9 +5112,9 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             /* CMP.L Dm,Dn */
             emit_cmp_l_dd(&e, (w >> 9) & 7, w & 7, &rc, flags_needed[i]);
             inline_ops++; done = true;
-        } else if (top == 0x9 && szf == 2 && !((w >> 8) & 1) && mode == 0) {
-            /* SUB.L Dm,Dn */
-            emit_sub_l_dd(&e, (w >> 9) & 7, w & 7, flags_dead[i], &rc);
+        } else if (top == 0x9 && szf == 2 && !((w >> 8) & 1) && (mode == 0 || mode == 1)) {
+            /* SUB.L Dm/Am,Dn — M6.104 extends to An source (bench 0x948A). */
+            emit_sub_l_dd(&e, (w >> 9) & 7, w & 7, mode == 1, flags_dead[i], &rc);
             inline_ops++; done = true;
         } else if (top == 0xC && szf == 3
                    && mode == 7 && (w & 7) == 4) {

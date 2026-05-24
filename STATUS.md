@@ -1,5 +1,53 @@
 # Status
 
+## M6.104 — ADD.L / SUB.L extend src to An — bench 100 M −0.76 %
+
+The existing M6 emit_add_l_dd / emit_sub_l_dd handled only `Dm,Dn` src.
+Extending the condition from `mode == 0` to `mode == 0 || mode == 1`
+(and threading a `src_is_an` flag through to the helpers) covers
+`ADD.L Am,Dn` and `SUB.L Am,Dn` patterns — common in pointer-arithmetic
+loops where An is added to or subtracted from a Dn accumulator.
+
+Bench's 0x948A (SUB.L A2,D2) at 72 helpers / 20 M cyc was the trigger.
+At 100 M, the pattern scales up dramatically — bench 100 M helpers
+dropped **22 K** (270 056 → 248 363).
+
+The cache-direct fast path (`in-place add/sub` when both src and dst
+are cached) now works for An src too. The `dn != dm` check was
+relaxed to `src_is_an || dn != dm` since An and Dn are in different
+guest-reg namespaces (no aliasing risk between A_x and D_x).
+
+**Triple-diff workflow (full SOP):**
+
+* ctest: 7/7
+* `--diff-jit-trace`: clean through 11 038 cycles
+* Boot 5 M det / 100 M: byte-identical (no cycle drift — per
+  `memory/move-cycle-drift-gotcha.md` SOP)
+* Bench (20 M): 7 284 → 7 188 helpers (−96)
+* Bench (100 M): 270 056 → 248 363 (**−21 693** at long horizon)
+
+**Perf:**
+
+| Workload | M6.103 | **M6.104** | Δ |
+|----------|------:|----------:|--:|
+| Bench (20 M)     | 1.178 lx7/cyc | **1.178** | unchanged |
+| Bench (100 M)    | 1.314 lx7/cyc | **1.304 lx7/cyc** | **−0.76 %** |
+| Boot @ 100 M cyc | 1.717 lx7/cyc | **1.717** | unchanged |
+
+Bench 100 M crosses **4.95 × interp** for the first time.
+
+Same chain-preservation insight as M6.102's DBEQ: the 20 M bench
+doesn't move at lx7/cyc resolution, but the 100 M bench compounds the
+saving via preserved chain transitions (each `ADD.L An,Dn` no longer
+forces a dispatcher round-trip).
+
+Cumulative M6.84 → M6.104:
+* Bench (20 M): 1.257 → **1.178** (−6.3 %)
+* Bench (100 M): 1.396 → **1.304** (−6.6 %)
+* Boot 300 K det: 2.170 → **1.975** (−9.0 %)
+* Boot 5 M det:   2.471 → **2.236** (−9.5 %)
+* Boot 100 M:     1.734 → **1.717** (−0.98 %)
+
 ## M6.103 — MOVEA.L (An),Am inline
 
 Adds the mode 2 ((An)) source variant to the MOVEA.L family — sibling
@@ -885,12 +933,12 @@ them each iteration.
    intermediate register writeback. See M6.85 below for the first
    fusion lever in this class.
 
-## Where things stand right now (post-M6.103)
+## Where things stand right now (post-M6.104)
 
 | Engine | lx7 / cyc | × interp baseline |
 |--------|----------:|------------------:|
 | **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.178** | **5.49 ×** ✅ |
-| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.314** | **4.92 ×** |
+| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.304** | **4.95 ×** |
 | **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.717** | **3.44 ×** |
 | **Boot** (Mac Plus ROM, 5 M cycles, PC=`0x40032C` deterministic)    | **2.236** | **2.64 ×** |
 | **Boot** (Mac Plus ROM, 300 K cycles, PC=`0x40032C` deterministic)  | **1.975** | **2.99 ×** |
