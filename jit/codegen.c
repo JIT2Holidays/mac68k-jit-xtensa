@@ -4966,6 +4966,77 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + jcmpa_pos + 2] = (u8)(cw >> 16);
 
             inline_ops++; done = true;
+        } else if (top == 0xB && szf == 3 && ((w >> 8) & 1) == 1 && mode == 5) {
+            /* M6.170 — CMPA.L (d16,An),An. thinkc8-folder-open bench's
+             * 638 K helpers/100 M cyc on the Finder linked-list walk
+             * at PC=0x3E5826 (companion to TST.B (d16,An) at PC=3E580E
+             * — same loop). Trajectory-safe (B1ED absent from speedo
+             * and from boot 100 M).
+             *
+             * Combines two sibling patterns: M6.75 MOVEA.L (d16,An),Am
+             * provides the .L-from-RAM byte-by-byte read; M6.129 CMPA.W
+             * (d16,An),An provides the compare + flag-set structure
+             * (and the MMIO bridge via emit_helper_step_after_flush_undo
+             * — CMP is flag-only so g_helper_touched_mask = 0u).
+             *
+             * Length 4 (opword + d16), 14 cycles (interp base 4 +
+             * handler 10 for CMPA.L vs CMPA.W's 6). */
+            int dst_an = (w >> 9) & 7;
+            int src_an = w & 7;
+            u16 ext  = mac_read16(cpu->mem, op_pc[i] + 2);
+            i32 d16  = (i16)ext;
+
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(src_an), 8);
+            if (d16 >= -128 && d16 <= 127) {
+                xt_addi(&e, 8, 8, d16);
+            } else {
+                emit_load_imm(&e, 11, 12, (u32)d16);
+                xt_add(&e, 8, 8, 11);
+            }
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_cmpaL = 4, op_cyc_cmpaL = 14;
+            g_helper_touched_mask = 0u;
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_cmpaL, op_cyc_cmpaL)));
+
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_cmpaL, op_cyc_cmpaL);
+            g_helper_touched_mask = 0xFFFFu;
+
+            u32 jcmpaL_pos = e.len;
+            xt_j    (&e, 4);
+
+            /* Fast path: 4 BE byte loads → .L src in a8; CMP against
+             * dst An; emit full flag set. */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);
+            xt_l8ui (&e, 11, 9, 0);
+            xt_l8ui (&e, 12, 9, 1);
+            xt_slli (&e, 8, 11, 24);
+            xt_slli (&e, 12, 12, 16);
+            xt_or   (&e, 8, 8, 12);
+            xt_l8ui (&e, 11, 9, 2);
+            xt_l8ui (&e, 12, 9, 3);
+            xt_slli (&e, 11, 11, 8);
+            xt_or   (&e, 8, 8, 11);
+            xt_or   (&e, 8, 8, 12);                /* a8 = src .L */
+            emit_read_g(&e, &rc, G_A(dst_an), 9);  /* a9 = dst .L */
+            xt_sub  (&e, 10, 9, 8);
+            emit_addsub_flags_long_masked(&e, true, true, 8, 9, 10, flags_needed[i]);
+            emit_advance(&e, op_pc_cmpaL, op_cyc_cmpaL);
+
+            u32 cmpaL_here = e.len;
+            i32 cmpaL_off = (i32)(cmpaL_here - jcmpaL_pos) - 4;
+            u32 cwL = ((u32)((u32)cmpaL_off & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jcmpaL_pos    ] = (u8)cwL;
+            base[entry_off + jcmpaL_pos + 1] = (u8)(cwL >> 8);
+            base[entry_off + jcmpaL_pos + 2] = (u8)(cwL >> 16);
+
+            inline_ops++; done = true;
         } else if (top == 0xB && szf == 1 && ((w >> 8) & 1) == 0 && mode == 5) {
             /* CMP.W (d16,An),Dn — bench-hot 0xBC6D (~6.8 %).
              *   EA = a[an] + sext16(d16); read .W; sext to 32; compare
