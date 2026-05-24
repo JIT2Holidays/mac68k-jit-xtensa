@@ -234,6 +234,18 @@ static void emit_advance(xt_emit *e, i32 pc_delta, i32 cyc) {
  * with few inline flag emits. */
 static bool g_sr_dirty;
 
+/* M6.84 — set true by any function that emits a CALLX0 (which is the
+ * only thing in the JIT's emitted code that clobbers a0 between the
+ * prologue's `s32i a0, OFF_JITRETPC` and the epilogue's matching
+ * `l32i a0, OFF_JITRETPC` + `jx a0`). When false at the epilogue, the
+ * `l32i` can be skipped because a0 still holds the RET sentinel (= 0
+ * from sim_init on host; = the chain-preserved value on ESP32). The
+ * existing `helper_ops` counter only tracks the DEFAULT helper bridge
+ * at the bottom of the dispatch chain; it misses the per-inline
+ * bridges inside specific arms (MOVE.W (An), MOVEA.L (d16,An), etc.).
+ * This flag catches all of them. */
+static bool g_block_emitted_callx0;
+
 /* Per-block compile-time memoization of sext(.W) results in a13.
  *   `g_sext_src_reg`: guest reg whose .W was sign-extended to 32 bits.
  *   `g_sext_valid`  : true if a13 currently holds that sext result.
@@ -268,6 +280,7 @@ static void emit_sr_reload(xt_emit *e) {
 
 static void emit_helper_step(xt_emit *e, u32 helper_lit_off, u32 entry_off,
                              regcache *rc) {
+    g_block_emitted_callx0 = true;
     emit_advance_flush(e);
     emit_cache_flush(e, rc);
     emit_sr_flush(e);
@@ -300,6 +313,7 @@ static u32 helper_step_after_flush_base_size(const regcache *rc) {
 static void emit_helper_step_after_flush_undo(xt_emit *e, u32 helper_lit_off,
                                               u32 entry_off, regcache *rc,
                                               i32 pc_undo, i32 cyc_undo) {
+    g_block_emitted_callx0 = true;   /* M6.84 — see g_block_emitted_callx0 doc */
     /* M6.68 — the emit_sr_flush we're about to emit is in the SLOW-path
      * branch (caller put a beqz over us). At runtime it only runs if
      * the slow path is taken; the fast path skips it entirely. But the
@@ -354,6 +368,7 @@ static u32 helper_step_after_flush_undo_size(const regcache *rc,
 static void emit_jit_fast_helper(xt_emit *e, u8 a8_arg1_reg, i32 imm2,
                                  u32 helper_lit_off, u32 entry_off,
                                  regcache *rc) {
+    g_block_emitted_callx0 = true;   /* M6.84 — see g_block_emitted_callx0 doc */
     sext_memo_invalidate();
     /* M6.69 — same compile-time-leak class as M6.68. This helper is
      * called from the slow-path branch of a beqz/bnez; its emit_sr_flush
@@ -1588,6 +1603,8 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
     g_cyc_acc = 0;
     g_sext_valid = false;
     g_sext_src_reg = -1;
+    g_block_emitted_callx0 = false;   /* M6.84 — epilogue uses this to gate
+                                       * the a0 reload before `jx a0`. */
     emit_l32r_at(&e, R_CPU, lit_off[ADDR_CPU_BASE], entry_off + e.len);
     xt_s32i(&e, 0, R_CPU, OFF_JITRETPC);
     /* M6.82 — chain_entry skip target. Both the l32r above and the s32i
@@ -4274,6 +4291,7 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             emit_l32r_at(&e, R_HELP, lit_off[HELPER_JIT_BTST_B_MMIO],
                          entry_off + e.len);
             xt_callx0(&e, R_HELP);
+            g_block_emitted_callx0 = true;  /* M6.84 */
             emit_sr_reload(&e);
             emit_cache_reload(&e, &rc);
             /* --- end custom bridge --- */
@@ -4344,6 +4362,7 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             emit_l32r_at(&e, R_HELP, lit_off[HELPER_JIT_ORI_B_MMIO],
                          entry_off + e.len);
             xt_callx0(&e, R_HELP);
+            g_block_emitted_callx0 = true;  /* M6.84 */
             emit_sr_reload(&e);
             emit_cache_reload(&e, &rc);
             /* --- end custom bridge --- */
@@ -4473,7 +4492,17 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
         }
     }
 #endif
-    xt_l32i(&e, 0, R_CPU, OFF_JITRETPC);
+    /* M6.84 — only reload a0 from OFF_JITRETPC if some emit on the
+     * compile-time path put a CALLX0 in the block (the only thing
+     * that clobbers a0 between the prologue's `s32i a0` and here).
+     * `helper_ops` only tracks the default helper bridge at the
+     * bottom of the dispatch chain; conditional bridges inside
+     * inline arms (MOVE.W (An), MOVEA.L (d16,An), etc.) are tracked
+     * via `g_block_emitted_callx0` instead. Skipping the l32i saves
+     * 1 LX7 op per helper-less-block invocation. */
+    if (g_block_emitted_callx0) {
+        xt_l32i(&e, 0, R_CPU, OFF_JITRETPC);
+    }
     xt_jx(&e, 0);
 
     if (e.overflow) {

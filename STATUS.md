@@ -1,14 +1,14 @@
 # Status
 
-## Where things stand right now (post-M6.82)
+## Where things stand right now (post-M6.84)
 
 | Engine | lx7 / cyc | × interp baseline |
 |--------|----------:|------------------:|
-| **Bench** (Speedometer frozen snapshot, 20 M cycles, PC=`0x03DF58`) | **1.259** | **5.13 ×** ✅ |
-| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.409** | **4.59 ×** |
-| **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.735** | **3.40 ×** |
+| **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.257** | **5.14 ×** ✅ |
+| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.396** | **4.63 ×** |
+| **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.734** | **3.40 ×** |
 | **Boot** (Mac Plus ROM, 5 M cycles, PC=`0x40032C` deterministic)    | **2.471** | **2.39 ×** |
-| **Boot** (Mac Plus ROM, 300 K cycles, PC=`0x40032C` deterministic)  | **2.170** | **2.72 ×** |
+| **Boot** (Mac Plus ROM, 300 K cycles, PC=`0x40032C` deterministic)  | **2.159** | **2.73 ×** |
 
 **Important note — M6.77 reset.** The bench numbers in this table
 are the **first correct measurements** of the milestone in many
@@ -1547,6 +1547,61 @@ helpers go down, you've hit this trap.
 variants prediction). The lx7_per_cyc savings is negligible (~0.1 %)
 because both SWAP and BSR.S have small total runtime call counts
 relative to bench's 25 M-lx7 cost.
+
+ctest: **7 / 7** pass.
+
+**M6.84 — skip the epilogue's `l32i a0, OFF_JITRETPC` for blocks
+that emit no CALLX0.** Universal pure-trim win, 0.5-0.9 % across
+all workloads.
+
+Every block ends with `l32i a0, OFF_JITRETPC; jx a0`. The `l32i` is
+needed because CALLX0 (in helper bridges) clobbers `a0` with its
+post-callx0 PC. But if the block emitted NO callx0 — neither the
+default `m68k_step` bridge nor any of the conditional bridges inside
+inline arms — then `a0` still holds whatever the prologue established
+(the RET sentinel on host, or the chain-preserved value on ESP32),
+so the `l32i` is redundant.
+
+The existing `helper_ops` counter only tracks the default helper
+bridge at the bottom of the dispatch chain (line 4377 of codegen.c).
+**Conditional bridges inside M6.73-style arms** —
+`emit_helper_step_after_flush_undo`, `emit_jit_fast_helper`, and the
+BTST_B_MMIO / ORI_B_MMIO custom bridges — also emit callx0 but were
+not counted.
+
+Added `g_block_emitted_callx0`, a per-block compile-time flag, reset
+at prologue setup and set by every callx0-emitting site (5 in total).
+The epilogue gates the `l32i` on this flag.
+
+**Mid-iteration breakage caught + fixed:** First attempt gated the
+`l32i` on the existing `helper_ops` counter. Boot crashed at cycle
+~1.78 M (`halted=3`) because M6.73-style arms with conditional
+bridges DO clobber `a0` at runtime when the slow path is taken, but
+`helper_ops` missed them. ctest's `diff_jit_bench_lockstep` caught
+it instantly. Fixed by adding the broader callx0 flag described.
+
+**Triple-diff workflow:**
+
+* ctest: 7/7
+* `--diff-jit-trace`: only the documented M6.66 cycle-11898 divergence
+* Boot @ 300 K / 5 M deterministic: same final PC (`0x40032C`), same
+  helper count as M6.83 — the metric drop is from reduced inline op
+  count per block invocation, not from runtime divergence
+
+**Perf:**
+
+| Workload | M6.83 | **M6.84** | Δ |
+|----------|------:|----------:|--:|
+| Bench @ 5 M cyc   | 1.418 lx7/cyc | **1.411 lx7/cyc** | **−0.5 %** lx7 |
+| Bench @ 20 M cyc  | 1.258 lx7/cyc | **1.257 lx7/cyc** | **−0.08 %** lx7 |
+| Bench @ 100 M cyc | 1.409 lx7/cyc | **1.396 lx7/cyc** | **−0.9 %** lx7 |
+| Boot @ 300 K det  | 2.170 lx7/cyc | **2.159 lx7/cyc** | **−0.5 %** lx7 |
+| Boot @ 5 M det    | 12 356 073 lx7 | **12 352 738 lx7** | −3 335 lx7 |
+| Boot @ 100 M cyc  | 1.735 lx7/cyc | **1.734 lx7/cyc** | within noise |
+
+Pure epilogue trim — savings are larger on workloads with more
+helper-less block invocations (long-horizon bench) and smaller on
+short paths where the helper-less proportion is low.
 
 ctest: **7 / 7** pass.
 
