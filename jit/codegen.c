@@ -150,6 +150,24 @@ static void emit_cache_flush(xt_emit *e, regcache *rc) {
  * silently produce stale cache for subsequent helpers' touched regs. */
 static u16 g_helper_touched_mask = 0xFFFFu;
 
+/* M6.158 — per-helper SR usage mask. Default 3u means "helper may both
+ * read and write cpu->sr" (the conservative m68k_step assumption).
+ *
+ *   bit 0 = helper READS cpu->sr at runtime
+ *           → JIT must emit_sr_flush before the call so cpu->sr is
+ *             up-to-date when the helper reads it.
+ *   bit 1 = helper WRITES cpu->sr at runtime
+ *           → JIT must emit_sr_reload after the call so R_SR matches
+ *             cpu->sr's new value.
+ *
+ * Specific fast helpers that touch neither (RTS / BSR / MOVEM family —
+ * verified by code inspection in core/m68k_interp.c) narrow this to 0u
+ * before the bridge call, saving 3-6 LX7 per slow-path execution.
+ *
+ * MUST be reset to 3u after each helper bridge — leaks would skip
+ * flush/reload for subsequent helpers that DO touch SR, corrupting CCR. */
+static u8 g_helper_sr_mask = 3u;
+
 /* Reload every cached slot from cpu state. Called after a helper.
  * Selective per g_helper_touched_mask — slots whose guest reg the
  * helper didn't touch are skipped (cpu state already matches the
@@ -413,18 +431,26 @@ static void emit_jit_fast_helper(xt_emit *e, u8 a8_arg1_reg, i32 imm2,
      * called from the slow-path branch of a beqz/bnez; its emit_sr_flush
      * is inside that branch but clears g_sr_dirty in the compile-time
      * state. Snapshot + restore so the fast-path case (where the s16i
-     * never runs) still has the epilogue flush R_SR. */
+     * never runs) still has the epilogue flush R_SR.
+     *
+     * M6.158 — flush/reload are now gated on g_helper_sr_mask. Helpers
+     * that don't read SR skip the flush (bit 0); helpers that don't
+     * write SR skip the reload (bit 1). The was_sr_dirty restore only
+     * matters when we DID flush (otherwise g_sr_dirty wasn't cleared). */
     bool was_sr_dirty = g_sr_dirty;
-    emit_sr_flush(e);
+    if (g_helper_sr_mask & 1) emit_sr_flush(e);
     xt_s32i(e, a8_arg1_reg, R_CPU, OFF_JIT_ARG1);
     xt_movi(e, 9, imm2);
     xt_s32i(e, 9, R_CPU, OFF_JIT_ARG2);
     xt_mov (e, R_ARG, R_CPU);
     emit_l32r_at(e, R_HELP, helper_lit_off, entry_off + e->len);
     xt_callx0(e, R_HELP);
-    emit_sr_reload(e);
+    if (g_helper_sr_mask & 2) emit_sr_reload(e);
     emit_cache_reload(e, rc);
-    if (was_sr_dirty) g_sr_dirty = true;
+    /* Only restore was_sr_dirty if the flush or reload cleared the
+     * compile-time flag. With mask=0u both branches skipped — g_sr_dirty
+     * is untouched and no restore is needed. */
+    if ((g_helper_sr_mask & 3u) && was_sr_dirty) g_sr_dirty = true;
 }
 
 /* Size of an emit_load_imm(list) + emit_jit_fast_helper sequence —
@@ -432,12 +458,15 @@ static void emit_jit_fast_helper(xt_emit *e, u8 a8_arg1_reg, i32 imm2,
  * with a fast-helper bridge. */
 static u32 emit_movem_fast_bridge_size(u32 list, const regcache *rc);
 
-/* Size in bytes (must match emit_jit_fast_helper exactly). */
+/* Size in bytes (must match emit_jit_fast_helper exactly).
+ *
+ * M6.158: tracks g_helper_sr_mask so callers that have set it to 0u
+ * (skip flush AND reload) get the smaller bridge size. */
 static u32 emit_jit_fast_helper_size(const regcache *rc) {
     u32 sz = 3u /*s32i arg1*/ + 3u /*movi*/ + 3u /*s32i arg2*/
-           + 3u /*mov R_ARG*/ + 3u /*l32r*/ + 3u /*callx0*/
-           + 3u /*sr_reload*/;
-    if (g_sr_dirty) sz += 3u;
+           + 3u /*mov R_ARG*/ + 3u /*l32r*/ + 3u /*callx0*/;
+    if ((g_helper_sr_mask & 1) && g_sr_dirty) sz += 3u;  /* emit_sr_flush */
+    if (g_helper_sr_mask & 2)                 sz += 3u;  /* emit_sr_reload */
     if (rc) {
         for (int i = 0; i < rc->active; i++) {
             int gi = rc->guest[i];
@@ -2162,6 +2191,7 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             i32 op_pc_rts = 0;        /* helper sets pc directly */
             i32 op_cyc_rts = 16;      /* m68k_step base 4 + handler 12 */
             g_helper_touched_mask = (u16)(1u << G_A(7));
+            g_helper_sr_mask = 0u;     /* M6.158 — RTS doesn't touch SR */
             u32 rts_bridge_size = emit_jit_fast_helper_size(&rc);
             xt_beqz (&e, 10, (i32)(6u + rts_bridge_size));
             /* Fast helper bridge: helper reads cpu->a[7] directly. */
@@ -2169,6 +2199,7 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                                  lit_off[HELPER_JIT_RTS_MMIO],
                                  entry_off, &rc);
             g_helper_touched_mask = 0xFFFFu;
+            g_helper_sr_mask = 3u;
             (void)op_pc_rts; (void)op_cyc_rts;
             /* No emit_advance here — the fast path below owns pc/cyc. */
             u32 jrts_pos = e.len;
@@ -5353,11 +5384,13 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                  * fast helper — sz=.W → movem_w_to_mem, sz=.L → movem_l_to_mem. */
                 literal_id mmio_helper = (sz == 2) ? HELPER_JIT_MOVEM_W_TO_MEM
                                                    : HELPER_JIT_MOVEM_L_TO_MEM;
+                g_helper_sr_mask = 0u;     /* M6.158 — MOVEM helpers don't touch SR */
                 u32 msm_bridge_size = emit_movem_fast_bridge_size((u32)list, &rc);
                 xt_beqz(&e, 10, (i32)(6u + msm_bridge_size));
                 emit_load_imm(&e, 8, 9, (u32)list);
                 emit_jit_fast_helper(&e, 8, an, lit_off[mmio_helper],
                                      entry_off, &rc);
+                g_helper_sr_mask = 3u;
                 (void)op_pc_msm; (void)op_cyc_msm;
                 u32 jmsm_pos = e.len;
                 xt_j(&e, 4);
@@ -5398,8 +5431,10 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                 emit_advance_flush(&e);
                 emit_cache_flush(&e, &rc);
                 emit_load_imm(&e, 8, 9, (u32)list);
+                g_helper_sr_mask = 0u;     /* M6.158 — MOVEM helpers don't touch SR */
                 emit_jit_fast_helper(&e, 8, an, lit_off[mmio_helper],
                                      entry_off, &rc);
+                g_helper_sr_mask = 3u;
                 emit_advance(&e, 4, 20);
                 inline_ops++; done = true;
             }
@@ -5432,12 +5467,14 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                  * Only .L has a fast helper (m68k_jit_movem_l_predec_from_regs);
                  * for .W -(An) we keep m68k_step. */
                 if (sz == 4) {
+                    g_helper_sr_mask = 0u;     /* M6.158 — MOVEM.L predec doesn't touch SR */
                     u32 pdm_bridge_size = emit_movem_fast_bridge_size((u32)list, &rc);
                     xt_beqz(&e, 10, (i32)(6u + pdm_bridge_size));
                     emit_load_imm(&e, 8, 9, (u32)list);
                     emit_jit_fast_helper(&e, 8, an,
                                          lit_off[HELPER_JIT_MOVEM_L_PREDEC],
                                          entry_off, &rc);
+                    g_helper_sr_mask = 3u;
                 } else {
                     xt_beqz(&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_pdm, op_cyc_pdm)));
                     emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
@@ -5485,9 +5522,11 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                 emit_advance_flush(&e);
                 emit_cache_flush(&e, &rc);
                 emit_load_imm(&e, 8, 9, (u32)list);
+                g_helper_sr_mask = 0u;     /* M6.158 — MOVEM.L predec doesn't touch SR */
                 emit_jit_fast_helper(&e, 8, an,
                                      lit_off[HELPER_JIT_MOVEM_L_PREDEC],
                                      entry_off, &rc);
+                g_helper_sr_mask = 3u;
                 emit_advance(&e, 4, 20);
                 inline_ops++; done = true;
             }
@@ -5521,12 +5560,14 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                 /* Helper bridge: route MMIO bounds-fail to the fast
                  * MOVEM helper instead of m68k_step (saves ~50 LX7 per
                  * VIA-targeted MOVEM in boot). */
+                g_helper_sr_mask = 0u;     /* M6.158 — MOVEM.L postinc doesn't touch SR */
                 u32 mvm_bridge_size = emit_movem_fast_bridge_size((u32)list, &rc);
                 xt_beqz(&e, 10, (i32)(6u + mvm_bridge_size));
                 emit_load_imm(&e, 8, 9, (u32)list);
                 emit_jit_fast_helper(&e, 8, an,
                                      lit_off[HELPER_JIT_MOVEM_L_POSTINC],
                                      entry_off, &rc);
+                g_helper_sr_mask = 3u;
                 u32 jmvm_pos = e.len;
                 xt_j(&e, 4);
                 /* Fast path. a8 still = An (the beqz skipped past the
@@ -5571,9 +5612,11 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                 emit_advance_flush(&e);
                 emit_cache_flush(&e, &rc);
                 emit_load_imm(&e, 8, 9, (u32)list);
+                g_helper_sr_mask = 0u;     /* M6.158 — MOVEM.L postinc doesn't touch SR */
                 emit_jit_fast_helper(&e, 8, an,
                                      lit_off[HELPER_JIT_MOVEM_L_POSTINC],
                                      entry_off, &rc);
+                g_helper_sr_mask = 3u;
                 emit_advance(&e, 4, 20);
                 inline_ops++; done = true;
             }
@@ -5730,6 +5773,7 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
              * Cache touched_mask = {A7}. Bridge skips m68k_step decode
              * and the pc/cyc-undo dance — real_helpers drops 21 K. */
             g_helper_touched_mask = (u16)(1u << G_A(7));
+            g_helper_sr_mask = 0u;     /* M6.158 — BSR.S doesn't touch SR */
             /* Load target_pc into a15 BEFORE the cache-flush so emit_jit_
              * fast_helper can write it from a register. */
             if (g_pc_lit_valid && target_pc == g_pc_lit_val) {
@@ -5744,6 +5788,7 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                                  lit_off[HELPER_JIT_BSR_S_MMIO],
                                  entry_off, &rc);
             g_helper_touched_mask = 0xFFFFu;
+            g_helper_sr_mask = 3u;
             (void)op_pc_bsr; (void)op_cyc_bsr;
             u32 jbsr_pos = e.len;
             xt_j    (&e, 4);
@@ -5802,6 +5847,7 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             i32 op_cyc_bsw = 22;
             /* M6.132 — slow path uses m68k_jit_bsr_w_mmio fast helper. */
             g_helper_touched_mask = (u16)(1u << G_A(7));
+            g_helper_sr_mask = 0u;     /* M6.158 — BSR.W doesn't touch SR */
             /* Load target_pc into a15 so both fast and slow paths share it. */
             if (g_pc_lit_valid && target_pc == g_pc_lit_val) {
                 emit_l32r_at(&e, 15, g_pc_lit_off, g_pc_lit_entry_off + e.len);
@@ -5814,6 +5860,7 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                                  lit_off[HELPER_JIT_BSR_W_MMIO],
                                  entry_off, &rc);
             g_helper_touched_mask = 0xFFFFu;
+            g_helper_sr_mask = 3u;
             (void)op_pc_bsw; (void)op_cyc_bsw;
             u32 jbsw_pos = e.len;
             xt_j    (&e, 4);
