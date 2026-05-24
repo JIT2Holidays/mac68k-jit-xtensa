@@ -3212,9 +3212,12 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
 
             emit_cache_flush(&e, &rc);
             i32 op_pc_mm = 2, op_cyc_mm = 8;
+            /* M6.130 — MOVE.L (An)+,(Am)+ modifies An and Am (post-incr). */
+            g_helper_touched_mask = (u16)((1u << G_A(src_an)) | (1u << G_A(dst_am)));
             xt_beqz (&e, 12, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_mm, op_cyc_mm)));
             emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
                                               entry_off, &rc, op_pc_mm, op_cyc_mm);
+            g_helper_touched_mask = 0xFFFFu;
             u32 jmm_pos = e.len;
             xt_j    (&e, 4);
 
@@ -4219,10 +4222,13 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             xt_and  (&e, 10, 8, 9);
             emit_cache_flush(&e, &rc);
             i32 op_pc_clrl = 2, op_cyc_clrl = 8;
+            /* M6.130 — CLR.L (An)+ modifies only An (post-incr) and CCR. */
+            g_helper_touched_mask = (u16)(1u << G_A(an));
             xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_clrl, op_cyc_clrl)));
 
             emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
                                               entry_off, &rc, op_pc_clrl, op_cyc_clrl);
+            g_helper_touched_mask = 0xFFFFu;
             u32 jclrl_pos = e.len;
             xt_j    (&e, 4);
 
@@ -4270,11 +4276,14 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             xt_and  (&e, 10, 8, 9);
             emit_cache_flush(&e, &rc);   /* before conditional helper */
             i32 op_pc_clr = 2, op_cyc_clr = 8;
+            /* M6.130 — CLR.W (An)+ modifies only An (post-incr) and CCR. */
+            g_helper_touched_mask = (u16)(1u << G_A(an));
             xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_clr, op_cyc_clr)));
 
             /* Helper. */
             emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
                                               entry_off, &rc, op_pc_clr, op_cyc_clr);
+            g_helper_touched_mask = 0xFFFFu;
             u32 jclr_pos = e.len;
             xt_j    (&e, 4);
 
