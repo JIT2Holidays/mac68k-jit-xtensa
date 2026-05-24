@@ -354,8 +354,16 @@ static void emit_helper_step(xt_emit *e, u32 helper_lit_off, u32 entry_off,
     xt_mov(e, R_ARG, R_CPU);
     emit_l32r_at(e, R_HELP, helper_lit_off, entry_off + e->len);
     xt_callx0(e, R_HELP);
-    emit_sr_reload(e);
-    if (!is_last_op) emit_cache_reload(e, rc);
+    /* M6.166 — extend the is_last_op optimization to emit_sr_reload. After
+     * emit_sr_flush (above), g_sr_dirty is compile-time false, so the
+     * block epilogue's emit_sr_flush is a no-op — cpu->sr retains
+     * whatever the helper wrote. R_SR going stale at block exit is fine;
+     * the next block's prologue reloads from cpu->sr. Saves 3 LX7 per
+     * last-op helper-step call. */
+    if (!is_last_op) {
+        emit_sr_reload(e);
+        emit_cache_reload(e, rc);
+    }
     sext_memo_invalidate();
 }
 
