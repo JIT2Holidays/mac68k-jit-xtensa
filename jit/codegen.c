@@ -2398,6 +2398,120 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + jmm_pos + 2] = (u8)(jw_mm >> 16);
 
             inline_ops++; done = true;
+        } else if (top == 0x2 && ((w >> 6) & 7) == 5 && mode == 3) {
+            /* MOVE.L (An)+,(d16,Am) — bench-hot 0x2F5F (MOVE.L (SP)+,(d16,SP))
+             * at 1000 hits/20 M cyc on the M6.77 corrected path (M6.80).
+             *
+             * Same shape as M6.76's MOVE.L (An)+,(Am)+ but with a
+             * `(d16,Am)` destination instead of `(Am)+`. The 68k semantic
+             * decodes src then dst: src ea_decode captures An_orig and
+             * post-increments An; dst ea_decode captures the now-incremented
+             * An (when src_an == dst_am) and adds d16.
+             *
+             *   Same An  (e.g. 0x2F5F):  write at  An_orig + 4 + d16
+             *   Different An:            write at  dst_Am + d16
+             *
+             * Source admits RAM-or-ROM (M6.76 literals); destination is
+             * RAM-only (the m68k_step helper covers ROM/MMIO writes, which
+             * are typically no-ops anyway). */
+            int dst_am = (w >> 9) & 7;
+            int src_an = w & 7;
+            u16 ext = mac_read16(cpu->mem, op_pc[i] + 2);
+            i32 d16 = (i16)ext;
+            bool same_an = (src_an == dst_am);
+
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(src_an), 8);    /* a8 = src An (= An_orig) */
+
+            /* Compute dst-addr base in a15.
+             *   same_an    → a15 = a8 + 4  (the post-incr An_new)
+             *   different  → a15 = dst_Am  (unchanged) */
+            if (same_an) {
+                xt_addi(&e, 15, 8, 4);
+            } else {
+                emit_read_g(&e, &rc, G_A(dst_am), 15);
+            }
+            /* Add d16 to a15 → final dst addr. */
+            if (d16 >= -128 && d16 <= 127) {
+                xt_addi(&e, 15, 15, d16);
+            } else {
+                emit_load_imm(&e, 11, 12, (u32)d16);
+                xt_add (&e, 15, 15, 11);
+            }
+
+            /* Source bounds (RAM-or-ROM): a12 == 0 iff src ok. */
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_l32r_at(&e, 9, lit_off[LITERAL_ROM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 11, 8, 9);
+            emit_l32r_at(&e, 9, lit_off[LITERAL_ROM_BASE],
+                         entry_off + e.len);
+            xt_xor  (&e, 11, 11, 9);
+            xt_and  (&e, 12, 10, 11);
+
+            /* Dest bounds (RAM-only) folded into a12. */
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 9, 15, 9);
+            xt_or   (&e, 12, 12, 9);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_mAd = 4, op_cyc_mAd = 8;
+            xt_beqz (&e, 12, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_mAd, op_cyc_mAd)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_mAd, op_cyc_mAd);
+            u32 jmAd_pos = e.len;
+            xt_j    (&e, 4);
+
+            /* === Fast path === */
+            /* Pick src host base via a10 (M6.76 trick). */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_beqz (&e, 10, 6);
+            emit_l32r_at(&e, 9, lit_off[ADDR_ROM_HOST_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);
+            /* Read 4 BE bytes → a10 (.L). */
+            xt_l8ui (&e, 11, 9, 0);
+            xt_l8ui (&e, 12, 9, 1);
+            xt_slli (&e, 10, 11, 24);
+            xt_slli (&e, 12, 12, 16);
+            xt_or   (&e, 10, 10, 12);
+            xt_l8ui (&e, 11, 9, 2);
+            xt_l8ui (&e, 12, 9, 3);
+            xt_slli (&e, 11, 11, 8);
+            xt_or   (&e, 10, 10, 11);
+            xt_or   (&e, 10, 10, 12);
+
+            /* Post-increment src An (commit). */
+            xt_addi (&e, 8, 8, 4);
+            emit_write_g(&e, &rc, G_A(src_an), 8);
+
+            /* Dest host ptr: always RAM (dst bounds enforced above). */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 15);
+
+            /* Write 4 BE bytes from a10. */
+            xt_extui(&e, 11, 10, 24, 7); xt_s8i(&e, 11, 9, 0);
+            xt_extui(&e, 11, 10, 16, 7); xt_s8i(&e, 11, 9, 1);
+            xt_extui(&e, 11, 10,  8, 7); xt_s8i(&e, 11, 9, 2);
+            xt_extui(&e, 11, 10,  0, 7); xt_s8i(&e, 11, 9, 3);
+
+            /* MOVE-family flags from the .L value. */
+            if (!flags_dead[i]) emit_logic_flags(&e, 10);
+
+            emit_advance(&e, op_pc_mAd, op_cyc_mAd);
+
+            u32 mAd_here = e.len;
+            i32 jo_mAd = (i32)(mAd_here - jmAd_pos) - 4;
+            u32 jw_mAd = ((u32)((u32)jo_mAd & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jmAd_pos    ] = (u8)jw_mAd;
+            base[entry_off + jmAd_pos + 1] = (u8)(jw_mAd >> 8);
+            base[entry_off + jmAd_pos + 2] = (u8)(jw_mAd >> 16);
+
+            inline_ops++; done = true;
         } else if (top == 0x2 && ((w >> 6) & 7) == 0 && mode == 5) {
             /* MOVE.L (d16,An),Dn — bench-warm 0x202F+ at ~1000 helpers in
              * 20M cyc (M6.73). Stack-frame .L read pattern. EA = An +
@@ -3635,6 +3749,87 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             }
             emit_advance(&e, 2, 8);   /* m68k_step base 4 + handler 4 = 8 */
             inline_ops++; done = true;
+        } else if ((top == 0xD || top == 0x9) && szf == 1
+                   && !((w >> 8) & 1) && mode == 5) {
+            /* ADD.W / SUB.W (d16,An),Dn — bench-warm 0xD06D (ADD.W
+             * (d16,A5),D0) at 515 hits/20 M cyc (M6.80). Sibling of the
+             * ADD.W Dm,Dn arm above but the source is a .W memory read
+             * via (d16,An). Same "shift to high 16" flag trick to get
+             * size-correct N/Z/V/C/X from the 32-bit subtract/add.
+             * Source can be ROM, so use the M6.76 unified bounds + base
+             * selector. Length 4, 8 cycles. */
+            bool is_sub = (top == 0x9);
+            int dn = (w >> 9) & 7;
+            int src_an = w & 7;
+            u16 ext = mac_read16(cpu->mem, op_pc[i] + 2);
+            i32 d16 = (i16)ext;
+
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(src_an), 8);
+            if (d16 >= -128 && d16 <= 127) {
+                xt_addi(&e, 8, 8, d16);
+            } else {
+                emit_load_imm(&e, 11, 12, (u32)d16);
+                xt_add (&e, 8, 8, 11);
+            }
+            /* Unified RAM-or-ROM source bounds (M6.76). */
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_l32r_at(&e, 9, lit_off[LITERAL_ROM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 11, 8, 9);
+            emit_l32r_at(&e, 9, lit_off[LITERAL_ROM_BASE],
+                         entry_off + e.len);
+            xt_xor  (&e, 11, 11, 9);
+            xt_and  (&e, 12, 10, 11);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_awd = 4, op_cyc_awd = 8;
+            xt_beqz (&e, 12, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_awd, op_cyc_awd)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_awd, op_cyc_awd);
+            u32 jawd_pos = e.len;
+            xt_j    (&e, 4);
+            /* Fast path: pick base via a10. */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_beqz (&e, 10, 6);
+            emit_l32r_at(&e, 9, lit_off[ADDR_ROM_HOST_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);
+            /* Read .W → a11. */
+            xt_l8ui (&e, 11, 9, 0);
+            xt_l8ui (&e, 12, 9, 1);
+            xt_slli (&e, 11, 11, 8);
+            xt_or   (&e, 11, 11, 12);
+            /* s = mem.W shifted to high 16 → a8. */
+            xt_slli (&e, 8, 11, 16);
+            /* d = Dn.W shifted to high 16 → a9; also keep full Dn in a11
+             * for the high-16 preserve. */
+            emit_read_g(&e, &rc, G_D(dn), 11);
+            xt_slli (&e, 9, 11, 16);
+            /* r = d ± s → a10. */
+            if (is_sub) xt_sub(&e, 10, 9, 8);
+            else        xt_add(&e, 10, 9, 8);
+            /* Write back: Dn[31:16] preserved, Dn[15:0] = bits 16..31 of r. */
+            xt_srli (&e, 11, 11, 16);
+            xt_slli (&e, 11, 11, 16);
+            xt_extui(&e, 12, 10, 16, 15);
+            xt_or   (&e, 11, 11, 12);
+            emit_write_g(&e, &rc, G_D(dn), 11);
+            if (!flags_dead[i]) {
+                emit_addsub_flags_long(&e, is_sub, false);
+            }
+            emit_advance(&e, op_pc_awd, op_cyc_awd);
+
+            u32 here_awd = e.len;
+            i32 jo_awd = (i32)(here_awd - jawd_pos) - 4;
+            u32 jw_awd = ((u32)((u32)jo_awd & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jawd_pos    ] = (u8)jw_awd;
+            base[entry_off + jawd_pos + 1] = (u8)(jw_awd >> 8);
+            base[entry_off + jawd_pos + 2] = (u8)(jw_awd >> 16);
+
+            inline_ops++; done = true;
         } else if (top == 0x4 && ((w >> 8) & 0xF) == 0xA && szf == 2 && mode == 0) {
             /* TST.L Dn — bench-warm 0x4A80/0x4A81 (~4 K). N/Z from Dn,
              * V=C=0, X preserved. */
@@ -3756,6 +3951,84 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             u32 imm = mac_read16(cpu->mem, op_pc[i] + 2);
             int size = (szf == 0) ? 1 : 2;
             emit_immarith_bw_dn(&e, w & 7, imm, size, (w >> 9) & 7, &rc);
+            inline_ops++; done = true;
+        } else if (top == 0x0 && !((w >> 8) & 1) && ((w >> 9) & 7) == 6
+                   && szf == 1 && mode == 5) {
+            /* CMPI.W #imm16, (d16,An) — bench-warm 0x0C6D (CMPI.W #imm,
+             * (d16,A5)) at 515 hits/20 M cyc (M6.80).
+             *
+             * Read .W from An+sext_d16, sign-extend to high 16 of a32-bit
+             * reg, subtract from sign-extended imm (also at high 16),
+             * derive CMP flags from the .L-style subtract result (the
+             * "shift to high 16" trick — same as CMP.W (d16,An),Dn at
+             * line ~3023 — keeps the 32-bit emit_addsub_flags_long output
+             * size-correct for the .W case).
+             *
+             * Length 6 (op + imm + d16), cycles 8. Source can be ROM, so
+             * use the unified RAM/ROM bounds. CMP doesn't write, doesn't
+             * touch X (so keep_x=true). */
+            int src_an = w & 7;
+            u16 imm     = mac_read16(cpu->mem, op_pc[i] + 2);
+            u16 ext_d16 = mac_read16(cpu->mem, op_pc[i] + 4);
+            i32 d16 = (i16)ext_d16;
+            i32 imm32 = (i32)(i16)imm;
+
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(src_an), 8);
+            if (d16 >= -128 && d16 <= 127) {
+                xt_addi(&e, 8, 8, d16);
+            } else {
+                emit_load_imm(&e, 11, 12, (u32)d16);
+                xt_add (&e, 8, 8, 11);
+            }
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_l32r_at(&e, 9, lit_off[LITERAL_ROM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 11, 8, 9);
+            emit_l32r_at(&e, 9, lit_off[LITERAL_ROM_BASE],
+                         entry_off + e.len);
+            xt_xor  (&e, 11, 11, 9);
+            xt_and  (&e, 12, 10, 11);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_ci = 6, op_cyc_ci = 8;
+            xt_beqz (&e, 12, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_ci, op_cyc_ci)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_ci, op_cyc_ci);
+            u32 jci_pos = e.len;
+            xt_j    (&e, 4);
+            /* Fast path: pick base via a10. */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_beqz (&e, 10, 6);
+            emit_l32r_at(&e, 9, lit_off[ADDR_ROM_HOST_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);
+            /* Read .W (2 BE bytes) → a11. */
+            xt_l8ui (&e, 11, 9, 0);
+            xt_l8ui (&e, 12, 9, 1);
+            xt_slli (&e, 11, 11, 8);
+            xt_or   (&e, 11, 11, 12);
+            /* Shift mem.W to high 16 (= d for the SUB) → a9. */
+            xt_slli (&e, 9, 11, 16);
+            /* imm.W shifted to high 16 → a8 (= s for the SUB). */
+            emit_load_imm(&e, 8, 11, (u32)imm32);
+            xt_slli (&e, 8, 8, 16);
+            /* r = d - s → a10. */
+            xt_sub  (&e, 10, 9, 8);
+            if (!flags_dead[i]) {
+                emit_addsub_flags_long_masked(&e, true, true, 8, 9, 10, flags_needed[i]);
+            }
+            emit_advance(&e, op_pc_ci, op_cyc_ci);
+
+            u32 here_ci = e.len;
+            i32 jo_ci = (i32)(here_ci - jci_pos) - 4;
+            u32 jw_ci = ((u32)((u32)jo_ci & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jci_pos    ] = (u8)jw_ci;
+            base[entry_off + jci_pos + 1] = (u8)(jw_ci >> 8);
+            base[entry_off + jci_pos + 2] = (u8)(jw_ci >> 16);
+
             inline_ops++; done = true;
         } else if (top == 0x0 && !((w >> 8) & 1) && ((w >> 9) & 7) == 4
                    && szf == 0 && mode == 5) {

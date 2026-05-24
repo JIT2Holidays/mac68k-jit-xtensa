@@ -1,11 +1,11 @@
 # Status
 
-## Where things stand right now (post-M6.79)
+## Where things stand right now (post-M6.80)
 
 | Engine | lx7 / cyc | × interp baseline |
 |--------|----------:|------------------:|
-| **Bench** (Speedometer frozen snapshot, 20 M cycles, PC=`0x03DF58`) | **1.289** | **5.01 ×** ✅ |
-| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.439** | **4.49 ×** |
+| **Bench** (Speedometer frozen snapshot, 20 M cycles, PC=`0x03DF58`) | **1.288** | **5.02 ×** ✅ |
+| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.438** | **4.49 ×** |
 | **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.779** | **3.31 ×** |
 
 **Important note — M6.77 reset.** The bench numbers in this table
@@ -1276,6 +1276,72 @@ The 20 M helper drop of 3004 matches the predicted savings
 baseline`** (6.462 / 1.289). The clean 5× line is crossed on the
 honest M6.77-corrected execution path — the first commit since
 M6.31/M6.51 where the 5×-interp headline is real.
+
+ctest: **7 / 7** pass.
+
+**M6.80 — three (d16,An)-mode arms: MOVE.L (An)+,(d16,Am) + CMPI.W
+#imm16,(d16,An) + ADD.W (d16,An),Dn.** 2030 combined bench helpers
+predicted; 2117 measured. Bench 5.02 × interp.
+
+Three inlines, all sharing the (d16,An) address-compute shape and
+the M6.76 RAM-or-ROM source bounds (each one's source can be ROM —
+bench reads ROM tables, stack frames in RAM low globals, etc.):
+
+* **`0x2F5F` MOVE.L (An)+,(d16,Am).** 1000 hits. Sibling of M6.76's
+  MOVE.L (An)+,(Am)+ but the dst uses `(d16,An)` mode instead of
+  `(An)+`. The same-An case (e.g. `(SP)+ → (d16,SP)`, which is the
+  hot one) needs the dst-addr base = src An's POST-incr value, so
+  the inline uses a one-op compile-time `xt_addi a15, a8, 4` when
+  `src_an == dst_am` is known at compile time, otherwise reads dst
+  An separately.
+
+* **`0x0C6D` CMPI.W #imm16,(d16,An).** 515 hits. Read .W from
+  An+sext_d16, shift to high 16 (the same flag-correctness trick
+  CMP.W (d16,An),Dn uses), subtract from imm.W also at high 16,
+  derive CMP flags via `emit_addsub_flags_long_masked(is_sub=true,
+  keep_x=true, ...)`. Length 6 (op + imm + d16).
+
+* **`0xD06D` ADD.W (d16,An),Dn.** 515 hits (and the `0x9` sibling
+  SUB.W (d16,An),Dn covered by the same arm). Sibling of the
+  ADD.W Dm,Dn arm at line ~3730 but src is a `.W` memory read.
+  Preserves Dn[31:16] and replaces Dn[15:0] with the sum's low 16,
+  via the same shift-to-high-16 / extract pattern. Length 4.
+
+**Triple-diff workflow ran clean** with the post-M6.75 SOP — all
+three opcodes decoded bit-by-bit from binary FIRST:
+
+* ctest: 7/7
+* `--diff-jit-trace`: only the documented M6.66 cycle-11898 divergence
+* Boot @ 300 K / 5 M deterministic: byte-identical to M6.79
+
+**Perf:**
+
+| Workload | M6.79 | **M6.80** | Δ |
+|----------|------:|----------:|--:|
+| Bench @ 5 M cyc   | 10 810 h, 1.457 lx7/cyc | **10 100 h, 1.455 lx7/cyc** | **−710 h, −0.1 %** |
+| Bench @ 20 M cyc  | 14 191 h, 1.289 lx7/cyc | **12 074 h, 1.288 lx7/cyc** | **−2 117 h, −0.08 %** |
+| Bench @ 100 M cyc | 328 615 h, 1.439 lx7/cyc | **321 031 h, 1.438 lx7/cyc** | **−7 584 h, −0.07 %** |
+| Boot @ 100 M cyc  | 1.779 | 1.779 | unchanged |
+
+The 20 M helper drop of 2117 matches the predicted savings (2030
+target, +87 incidental from rare variants of the new arms not
+counted in the histogram top-20).
+
+**Bench is now `1.288 lx7/cyc` at 20 M cyc = `5.017 × interp`
+(6.462 / 1.288).**
+
+The metric is now firmly in the diminishing-returns regime — each
+remaining bench helper class is ≤ 515 hits/20 M cyc, and the per-call
+inline savings of ~30-50 lx7 translate to sub-0.1 % bench moves. The
+next significant lever is one of:
+
+* **Adding the Xtensa MULL encoder + sim decode** to true-inline
+  MULS.W variants (combined 2002 bench helpers — `0xC0FC`
+  `MULS.W #imm16,D0` + `0xC1ED` `MULS.W (d16,A5),D0`).
+* **Per-block prologue/epilogue trimming**: bench has 241 K chain
+  transitions in 20 M cyc with only 3.3 % matching prev->cache_sig
+  (vs boot's 99.7 %). Reducing chain-transition cost by even a few
+  ops would yield millions of lx7.
 
 ctest: **7 / 7** pass.
 
