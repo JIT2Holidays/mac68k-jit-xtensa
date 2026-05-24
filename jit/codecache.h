@@ -30,9 +30,10 @@
    all three (M6.63 — comparing eviction policies). */
 
 enum {
-    CC_MODE_BUMP = 0,
-    CC_MODE_LRU  = 1,
-    CC_MODE_FIFO = 2,
+    CC_MODE_BUMP   = 0,
+    CC_MODE_LRU    = 1,
+    CC_MODE_FIFO   = 2,
+    CC_MODE_RANDOM = 3,   /* free-list allocator, random victim selection */
 };
 
 /* Coldness mode (1): evict one victim, return bytes returned via

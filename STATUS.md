@@ -607,6 +607,44 @@ boot-perf regression.
 Reproduce: `scripts/evict_sweep.sh > scripts/evict_sweep.csv` then
 `python3 scripts/evict_sweep_plot.py`.
 
+**M6.63 follow-up — "LRU vs FIFO equivalence" was a metric artifact.**
+User flagged it as suspicious; investigation confirmed and explained.
+`xt_instrs` and `helpers` (the components of `real_lx7_per_cyc`) are
+**bit-identical** between LRU and FIFO at every arena size — same
+exact integers to the last digit. That's because the metric counts
+JIT-emitted-and-executed work, which is *deterministic* given the
+guest code: eviction policy changes *which blocks live where* and
+*how many recompiles fire*, but not *which opcodes execute*. Fallback
+to interp on alloc-miss is the same path for both.
+
+Added wall-clock (`elapsed_us`, 3-run averaged) to the sweep. Now
+the policies separate clearly:
+
+| Arena | bump wall-ms | LRU wall-ms | FIFO wall-ms |
+|------:|-------------:|------------:|-------------:|
+| 16 KB | **710**       | 838         | 842          |
+| 64 KB | **710**       | 892         | 845          |
+| 1 MB  | 770          | 892         | 845          |
+
+At 16–64 KB **bump is faster in wall-clock** even though its
+lx7/cyc is 35 % worse (2.34 vs 1.74). Why: LRU does an O(N_blocks)
+victim scan per eviction (102 K evictions × thousands of blocks =
+quadratic), and bump's "wipe-everything reset" is structurally
+cheaper per call. FIFO is between them — drops O(overlap) per call,
+no scan.
+
+**Right interpretation:**
+* `real_lx7_per_cyc` is the **JIT-execution-cost** metric.
+  LRU/FIFO win when working set > arena (less wasted JIT work).
+* Wall-clock includes **allocator-overhead**. LRU's O(N) scan
+  dominates when block count is high.
+* For ESP32, the relevant cost is JIT execution (real LX7 cycles)
+  + allocator overhead (real cycles spent on hash walks). Need a
+  better LRU implementation (sampled or doubly-linked-list O(1))
+  to make LRU competitive in wall-clock at large block counts.
+* **FIFO is the pragmatic pick**: same lx7/cyc benefit as LRU,
+  cheaper allocator overhead, no O(N) scan.
+
 **Cross-block register caching.** The other unimplemented item.
 M6.10's regcache caches D/A regs *within* a block (loaded at
 prologue, flushed at epilogue). Extending across blocks would

@@ -871,14 +871,15 @@ int main(int argc, char **argv) {
     if (use_jit) {
         fprintf(stderr,
             "[host] blocks=%llu/%llu inline_ops=%llu helper_ops=%llu "
-            "chain=%llu/%llu resets=%llu\n",
+            "chain=%llu/%llu resets=%llu smc_inv=%llu\n",
             (unsigned long long)disp.blocks_compiled,
             (unsigned long long)disp.blocks_executed,
             (unsigned long long)disp.inline_ops_total,
             (unsigned long long)disp.helper_ops_total,
             (unsigned long long)disp.chain_hits,
             (unsigned long long)disp.chain_misses,
-            (unsigned long long)disp.arena_resets);
+            (unsigned long long)disp.arena_resets,
+            (unsigned long long)disp.smc_invalidations);
         fprintf(stderr, "[host] interp_fallbacks=%llu  chain_cache_matches=%llu/%llu\n",
             (unsigned long long)disp.interp_fallbacks,
             (unsigned long long)disp.chain_cache_matches,
