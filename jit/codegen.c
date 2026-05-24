@@ -3004,14 +3004,16 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             /* Custom MMIO helper bridge — replaces m68k_step for VIA reads.
              * M6.127 — m68k_jit_move_w_postinc_to_dn modifies Dn and An. */
             g_helper_touched_mask = (u16)((1u << G_D(dn)) | (1u << G_A(an)));
+            /* M6.164 — helper ignores jit_arg1 (uses cpu->a[an] directly
+             * via the packed jit_arg2). Skip the s32i jit_arg1 setup. */
+            g_helper_arg_mask = 2u;
             u32 wp_bridge_size = emit_jit_fast_helper_size(&rc);
             xt_beqz (&e, 10, (i32)(6u + wp_bridge_size));
-            /* a8 still has An (the addr). Use it for jit_arg1 (helper ignores
-             * it and uses jit_arg2's packed dn|an<<4 instead). */
             emit_jit_fast_helper(&e, 8, dn | (an << 4),
                                  lit_off[HELPER_JIT_MOVE_W_POSTINC_TO_DN],
                                  entry_off, &rc);
             g_helper_touched_mask = 0xFFFFu;
+            g_helper_arg_mask = 3u;
             (void)op_pc_wp; (void)op_cyc_wp;
             u32 jwp_pos = e.len;
             xt_j    (&e, 4);
@@ -3296,12 +3298,15 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
              * dn|an<<4 to know which regs to touch (reads cpu->a[an], not
              * the a8 we pre-loaded). Cycles owned by JIT's emit_advance. */
             g_helper_touched_mask = (u16)((1u << G_D(dn)) | (1u << G_A(an)));
+            /* M6.164 — helper ignores jit_arg1 (uses cpu->a[an] directly). */
+            g_helper_arg_mask = 2u;
             u32 lL_bridge_size = emit_jit_fast_helper_size(&rc);
             xt_beqz (&e, 10, (i32)(6u + lL_bridge_size));
             emit_jit_fast_helper(&e, 8, dn | (an << 4),
                                  lit_off[HELPER_JIT_MOVE_L_POSTINC_TO_DN_MMIO],
                                  entry_off, &rc);
             g_helper_touched_mask = 0xFFFFu;
+            g_helper_arg_mask = 3u;
             (void)op_pc_lL; (void)op_cyc_lL;
             u32 jlL_pos = e.len;
             xt_j    (&e, 4);
@@ -3555,6 +3560,9 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
              * dst_an (bits 4-6), src_is_an (bit 8). Helper reads src reg,
              * writes 4 BE bytes at cpu->a[an], post-increments An by 4. */
             g_helper_touched_mask = (u16)(1u << G_A(an));
+            /* M6.164 — helper ignores jit_arg1 (reads cpu->a[an] + src reg
+             * directly using packed jit_arg2). Skip arg1 setup. */
+            g_helper_arg_mask = 2u;
             u32 lp_bridge_size = emit_jit_fast_helper_size(&rc);
             xt_beqz (&e, 10, (i32)(6u + lp_bridge_size));
             i32 packed_arg2 = dm | (an << 4) | ((mode == 1) ? (1 << 8) : 0);
@@ -3562,6 +3570,7 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                                  lit_off[HELPER_JIT_MOVE_L_DN_TO_ANPI_MMIO],
                                  entry_off, &rc);
             g_helper_touched_mask = 0xFFFFu;
+            g_helper_arg_mask = 3u;
             (void)op_pc_lp; (void)op_cyc_lp; (void)g_src;
             u32 jlp_pos = e.len;
             xt_j    (&e, 4);
