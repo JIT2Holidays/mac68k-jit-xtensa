@@ -2030,6 +2030,20 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
         } else if (w == 0x4E71) {          /* NOP */
             emit_advance(&e, 2, 4);
             inline_ops++; done = true;
+        } else if ((w & 0xFFF8) == 0x4ED0) {
+            /* M6.128 — JMP (An). Block terminator. Common in subroutine
+             * dispatch tables that load An then JMP through it.
+             *
+             * Length 2; cycles 12 (m68k_step base 4 + handler 8). No SP
+             * modification (just sets cpu->pc = An). No bounds check —
+             * the dispatcher handles the target lookup. */
+            int an = w & 7;
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(an), 8);
+            xt_s32i(&e, 8, R_CPU, OFF_PC);
+            emit_advance(&e, 0, 12);   /* m68k_step base 4 + handler 8 */
+            sext_memo_invalidate();
+            inline_ops++; done = true;
         } else if (w == 0x4EF9) {
             /* JMP (xxx).L — absolute long jump. Block terminator.
              * Target is a compile-time constant; load via the literal pool
@@ -2234,6 +2248,61 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + jjsra_pos    ] = (u8)jw_jsra;
             base[entry_off + jjsra_pos + 1] = (u8)(jw_jsra >> 8);
             base[entry_off + jjsra_pos + 2] = (u8)(jw_jsra >> 16);
+
+            sext_memo_invalidate();
+            inline_ops++; done = true;
+        } else if ((w & 0xFFF8) == 0x4E90) {
+            /* M6.128 — JSR (An). Block terminator. Boot 0x4E90 at 780
+             * helpers / 100 M cyc (= JSR through A0; common in subroutine
+             * dispatch tables that load An first then JSR).
+             *
+             * Sibling of JSR (d16,An) but the target is just An — no d16
+             * to add. Length 2 (no ext bytes); cycles 20 (m68k_step base
+             * 4 + handler 16). Target = An. Return PC = source_pc + 2. */
+            int src_an = w & 7;
+
+            emit_advance_flush(&e);          /* cpu->pc = source_pc */
+
+            /* Compute target = An → a15 (stashed before cache_flush). */
+            emit_read_g(&e, &rc, G_A(src_an), 15);
+
+            /* Push return PC: same shape as JSR (d16,An). */
+            emit_read_g(&e, &rc, G_A(7), 8);
+            xt_addi(&e, 8, 8, -4);            /* a8 = new SP */
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_jran = 0;
+            i32 op_cyc_jran = 20;            /* base 4 + handler 16 */
+            g_helper_touched_mask = (u16)(1u << G_A(7));
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_jran, op_cyc_jran)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_jran, op_cyc_jran);
+            g_helper_touched_mask = 0xFFFFu;
+            u32 jjran_pos = e.len;
+            xt_j    (&e, 4);
+            /* Fast path: write return_pc (= cpu->pc + 2 since JSR (An)
+             * is 2 bytes) to mem[new SP], commit new SP, cpu->pc = An. */
+            xt_l32i (&e, 10, R_CPU, OFF_PC);
+            xt_addi (&e, 10, 10, 2);          /* a10 = return_pc */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);
+            xt_extui(&e, 11, 10, 24, 7); xt_s8i(&e, 11, 9, 0);
+            xt_extui(&e, 11, 10, 16, 7); xt_s8i(&e, 11, 9, 1);
+            xt_extui(&e, 11, 10,  8, 7); xt_s8i(&e, 11, 9, 2);
+            xt_extui(&e, 11, 10,  0, 7); xt_s8i(&e, 11, 9, 3);
+            emit_write_g(&e, &rc, G_A(7), 8);
+            xt_s32i(&e, 15, R_CPU, OFF_PC);
+            emit_advance(&e, op_pc_jran, op_cyc_jran);
+
+            u32 here_jran = e.len;
+            i32 jo_jran = (i32)(here_jran - jjran_pos) - 4;
+            u32 jw_jran = ((u32)((u32)jo_jran & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jjran_pos    ] = (u8)jw_jran;
+            base[entry_off + jjran_pos + 1] = (u8)(jw_jran >> 8);
+            base[entry_off + jjran_pos + 2] = (u8)(jw_jran >> 16);
 
             sext_memo_invalidate();
             inline_ops++; done = true;
