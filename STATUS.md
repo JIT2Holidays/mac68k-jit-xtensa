@@ -1,11 +1,11 @@
 # Status
 
-## Where things stand right now (post-M6.78)
+## Where things stand right now (post-M6.79)
 
 | Engine | lx7 / cyc | × interp baseline |
 |--------|----------:|------------------:|
-| **Bench** (Speedometer frozen snapshot, 20 M cycles, PC=`0x03DF58`) | **1.296** | **4.99 ×** ✅ |
-| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.442** | **4.48 ×** |
+| **Bench** (Speedometer frozen snapshot, 20 M cycles, PC=`0x03DF58`) | **1.289** | **5.01 ×** ✅ |
+| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.439** | **4.49 ×** |
 | **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.779** | **3.31 ×** |
 
 **Important note — M6.77 reset.** The bench numbers in this table
@@ -1215,6 +1215,67 @@ The 20 M helper drop of 3571 matches the predicted savings exactly
 (2563 + 1008). Bench `1.296` at 20 M cyc lands at **4.99 × interp
 baseline** (6.462 / 1.296) — just under the clean 5× line on the
 *correct* execution path.
+
+ctest: **7 / 7** pass.
+
+**M6.79 — JSR (d16,An) + ADDA.L (d16,An),Am inline — bench 5.01 × interp.**
+
+Two opcodes, **3003 combined bench helpers/20 M cyc**:
+
+* **`0x4EAD` etc. (mask `0xFFF8` matching `0x4EA8`) — JSR (d16,An).**
+  1003 hits. Block terminator. Sibling of M6.78's JSR (d16,PC) but
+  the target is computed at runtime from `An` (not a compile-time
+  constant), so we stash the result in `a15` BEFORE the bounds check
+  and write it to `cpu->pc` after the fast path's stack push. `a15`
+  survives `emit_cache_flush` (which only touches cache slots
+  `a4..a7`) and the helper bridge's `callx0` doesn't get a chance to
+  clobber it because the runtime never reads `a15` along the
+  helper-path branch (the helper bridge `j over`s the fast block).
+  20 cycles (base 4 + handler 16), length 4.
+
+* **`0xD1EE` ADDA.L (d16,A6),A0 (mask `0xF1F8` matching `0xD0E8` —
+  `top == 0xD && szf == 3 && (w>>8)&1 && mode == 5`).** 2000 hits.
+  **Was mis-decoded in the M6.78 follow-up notes as "ADD.L
+  D0,(d16,A6)" — re-deriving the bit fields per the SOP showed it's
+  actually opmode 111 = ADDA.L** (Am destination, not a RMW with
+  flags). That makes the emit much simpler: load .L from `An + d16`,
+  add to dst Am, **no flag emit at all** (ADDA never touches CCR).
+  Direct sibling of M6.75's MOVEA.L (d16,An),Am but adding instead
+  of replacing. Source can be in ROM (bench's pointer tables at
+  PC ≈ `0x408???`), so the M6.76 unified RAM-or-ROM bounds + base
+  selector apply directly. 12 cycles (base 4 + handler 8 — the
+  ADDA path adds 8, vs the plain MOVE/MOVEA path's 4), length 4.
+
+**Triple-diff workflow ran clean** with the post-M6.75 SOP — both
+emits decoded bit-by-bit from binary FIRST. The ADDA mis-decode in
+the M6.78 notes wasn't a shipping bug (no commit reached emission
+based on the wrong decode), but it was almost one: had I implemented
+"ADD.L Dn,(d16,An)" as initially imagined it would have emitted a
+full-RMW with set-CCR-flags inline for an op that actually clobbers
+nothing — wrong semantics, wrong cycle count, and almost certainly a
+bench-path divergence post-cycle-11898 that the deterministic-boot
+window wouldn't have caught.
+
+* ctest: 7/7
+* `--diff-jit-trace`: only the documented M6.66 cycle-11898 divergence
+* Boot @ 300 K / 5 M deterministic: byte-identical to M6.78
+
+**Perf:**
+
+| Workload | M6.78 | **M6.79** | Δ |
+|----------|------:|----------:|--:|
+| Bench @ 5 M cyc   | 12 314 h, 1.470 lx7/cyc | **10 810 h, 1.457 lx7/cyc** | **−1 504 h, −0.9 %** |
+| Bench @ 20 M cyc  | 17 195 h, 1.296 lx7/cyc | **14 191 h, 1.289 lx7/cyc** | **−3 004 h, −0.5 %** |
+| Bench @ 100 M cyc | 336 119 h, 1.442 lx7/cyc | **328 615 h, 1.439 lx7/cyc** | **−7 504 h, −0.2 %** |
+| Boot @ 100 M cyc  | 1.779                    | 1.779                       | unchanged |
+
+The 20 M helper drop of 3004 matches the predicted savings
+(1003 JSR + 2000 ADDA.L = 3003, off by 1 from natural variation).
+
+**Bench is now `1.289 lx7/cyc` at 20 M cyc = `5.013 × interp
+baseline`** (6.462 / 1.289). The clean 5× line is crossed on the
+honest M6.77-corrected execution path — the first commit since
+M6.31/M6.51 where the 5×-interp headline is real.
 
 ctest: **7 / 7** pass.
 

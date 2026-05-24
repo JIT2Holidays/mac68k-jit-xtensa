@@ -1750,6 +1750,71 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
 
             sext_memo_invalidate();
             inline_ops++; done = true;
+        } else if ((w & 0xFFF8) == 0x4EA8) {
+            /* JSR (d16,An) — push return address, jump to An + sext_d16.
+             * Block terminator. Bench-warm at 1003 hits/20M cyc (M6.79).
+             *
+             * Sibling of M6.78's JSR (d16,PC) but the target is computed
+             * at runtime from An (it's not a compile-time constant), so
+             * we stash it in a15 BEFORE the bounds check (a15 survives
+             * emit_cache_flush and the helper bridge because cache slots
+             * are a4..a7 and the bridge clobbers a8..a13 + R_HELP=a13 +
+             * a2 but not a15 — and the fast path uses a15 immediately
+             * after the beqz takes, so the runtime never reads a15 along
+             * the helper-path branch). */
+            int src_an = w & 7;
+            u16 ext = mac_read16(cpu->mem, op_pc[i] + 2);
+            i32 d16 = (i16)ext;
+
+            emit_advance_flush(&e);          /* cpu->pc = source_pc */
+
+            /* Compute target = source_An + sext_d16 → a15. */
+            emit_read_g(&e, &rc, G_A(src_an), 15);
+            if (d16 >= -128 && d16 <= 127) {
+                xt_addi(&e, 15, 15, d16);
+            } else {
+                emit_load_imm(&e, 11, 12, (u32)d16);
+                xt_add (&e, 15, 15, 11);
+            }
+
+            /* Push return PC: same shape as JSR (d16,PC). */
+            emit_read_g(&e, &rc, G_A(7), 8);
+            xt_addi(&e, 8, 8, -4);            /* a8 = new SP */
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_jsra = 0;
+            i32 op_cyc_jsra = 20;            /* base 4 + handler 16 */
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_jsra, op_cyc_jsra)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_jsra, op_cyc_jsra);
+            u32 jjsra_pos = e.len;
+            xt_j    (&e, 4);
+            /* Fast path: write return_pc to mem[new SP], then commit new
+             * SP and set cpu->pc = target (in a15). */
+            xt_l32i (&e, 10, R_CPU, OFF_PC);
+            xt_addi (&e, 10, 10, 4);          /* a10 = return_pc */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);
+            xt_extui(&e, 11, 10, 24, 7); xt_s8i(&e, 11, 9, 0);
+            xt_extui(&e, 11, 10, 16, 7); xt_s8i(&e, 11, 9, 1);
+            xt_extui(&e, 11, 10,  8, 7); xt_s8i(&e, 11, 9, 2);
+            xt_extui(&e, 11, 10,  0, 7); xt_s8i(&e, 11, 9, 3);
+            emit_write_g(&e, &rc, G_A(7), 8);
+            xt_s32i(&e, 15, R_CPU, OFF_PC);
+            emit_advance(&e, op_pc_jsra, op_cyc_jsra);
+
+            u32 here_jsra = e.len;
+            i32 jo_jsra = (i32)(here_jsra - jjsra_pos) - 4;
+            u32 jw_jsra = ((u32)((u32)jo_jsra & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jjsra_pos    ] = (u8)jw_jsra;
+            base[entry_off + jjsra_pos + 1] = (u8)(jw_jsra >> 8);
+            base[entry_off + jjsra_pos + 2] = (u8)(jw_jsra >> 16);
+
+            sext_memo_invalidate();
+            inline_ops++; done = true;
         } else if (top == 0xD && szf == 2 && !((w >> 8) & 1) && mode == 0) {
             /* ADD.L Dm,Dn */
             emit_add_l_dd(&e, (w >> 9) & 7, w & 7, flags_dead[i], &rc);
@@ -2439,6 +2504,83 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + jmAd_pos    ] = (u8)jw_mAd;
             base[entry_off + jmAd_pos + 1] = (u8)(jw_mAd >> 8);
             base[entry_off + jmAd_pos + 2] = (u8)(jw_mAd >> 16);
+
+            inline_ops++; done = true;
+        } else if (top == 0xD && szf == 3 && ((w >> 8) & 1) && mode == 5) {
+            /* ADDA.L (d16,An),Am — bench-hot 0xD1EE (ADDA.L (d16,A6),A0)
+             * at 2000 hits/20 M cyc on the M6.77 corrected path (M6.79).
+             * Mis-labelled as "ADD.L Dn,<ea>" in earlier STATUS notes;
+             * the bit-field decode confirms it's actually ADDA.L (opmode
+             * 111 = bits 8-6 = 111). Sibling of M6.75 MOVEA.L (d16,An),Am
+             * — same address compute and .L read, but adds the loaded
+             * .L to the destination An instead of replacing it. ADDA
+             * never touches CCR. Source can be in ROM (bench's pointer
+             * tables at PC ≈ 0x408???), so use the M6.76 unified
+             * RAM-or-ROM bounds check + base selector.
+             *
+             * Length 4 (opword + d16), 12 cycles (interp base 4 +
+             * handler 8 — note the ADDA path adds 8, vs the plain
+             * MOVE/MOVEA path's 4). */
+            int dst_am = (w >> 9) & 7;
+            int src_an = w & 7;
+            u16 ext = mac_read16(cpu->mem, op_pc[i] + 2);
+            i32 d16 = (i16)ext;
+
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(src_an), 8);
+            if (d16 >= -128 && d16 <= 127) {
+                xt_addi(&e, 8, 8, d16);
+            } else {
+                emit_load_imm(&e, 11, 12, (u32)d16);
+                xt_add (&e, 8, 8, 11);
+            }
+            /* Unified RAM-or-ROM bounds (M6.76 shape). */
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_l32r_at(&e, 9, lit_off[LITERAL_ROM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 11, 8, 9);
+            emit_l32r_at(&e, 9, lit_off[LITERAL_ROM_BASE],
+                         entry_off + e.len);
+            xt_xor  (&e, 11, 11, 9);
+            xt_and  (&e, 12, 10, 11);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_aAd = 4, op_cyc_aAd = 12;
+            xt_beqz (&e, 12, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_aAd, op_cyc_aAd)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_aAd, op_cyc_aAd);
+            u32 jaAd_pos = e.len;
+            xt_j    (&e, 4);
+            /* Fast path. Pick base via a10: a10==0 → RAM, else ROM. */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_beqz (&e, 10, 6);
+            emit_l32r_at(&e, 9, lit_off[ADDR_ROM_HOST_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);
+            xt_l8ui (&e, 11, 9, 0);
+            xt_l8ui (&e, 12, 9, 1);
+            xt_slli (&e, 10, 11, 24);
+            xt_slli (&e, 12, 12, 16);
+            xt_or   (&e, 10, 10, 12);
+            xt_l8ui (&e, 11, 9, 2);
+            xt_l8ui (&e, 12, 9, 3);
+            xt_slli (&e, 11, 11, 8);
+            xt_or   (&e, 10, 10, 11);
+            xt_or   (&e, 10, 10, 12);            /* a10 = source .L */
+            /* Add to dst An (full 32-bit, no flags). */
+            emit_read_g(&e, &rc, G_A(dst_am), 11);
+            xt_add  (&e, 11, 11, 10);
+            emit_write_g(&e, &rc, G_A(dst_am), 11);
+            emit_advance(&e, op_pc_aAd, op_cyc_aAd);
+
+            u32 here_aAd = e.len;
+            i32 jo_aAd = (i32)(here_aAd - jaAd_pos) - 4;
+            u32 jw_aAd = ((u32)((u32)jo_aAd & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jaAd_pos    ] = (u8)jw_aAd;
+            base[entry_off + jaAd_pos + 1] = (u8)(jw_aAd >> 8);
+            base[entry_off + jaAd_pos + 2] = (u8)(jw_aAd >> 16);
 
             inline_ops++; done = true;
         } else if (top == 0x2 && ((w >> 6) & 7) == 5 && (mode == 0 || mode == 1)) {
