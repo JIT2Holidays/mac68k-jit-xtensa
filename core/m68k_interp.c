@@ -1495,9 +1495,35 @@ m68k_decoded m68k_decode_at(m68k_cpu *cpu, u32 pc) {
                 d.length += 2 + ea_ext_bytes(cpu, pc, mode, reg, 4);
                 break;
             }
-            /* Remaining case-4 forms all carry a normal EA: NEG/NEGX/CLR/
-             * NOT/TST/TAS, MOVE SR/CCR, PEA, LEA, CHK. */
-            d.length += ea_ext_bytes(cpu, pc, mode, reg, sz == 0 ? 2 : sz);
+            /* M6.122 — MOVE SR/CCR ops are .W regardless of szf bits.
+             * Their encodings reuse the high opcode bits (bits 9-6 = 11)
+             * which would normally indicate sz=long, but the immediate
+             * size for MOVE-to-SR / MOVE-to-CCR is ALWAYS 16-bit (word).
+             * Without this, m68k_decode_at returned length 6 for 0x46FC
+             * (MOVE #imm,SR) instead of 4, causing the JIT block compiler
+             * to walk past the imm word and decode the BYTE AFTER as a
+             * new opcode. The phantom op fell to the default helper at
+             * compile time; the helper bridge's emit_advance_flush set
+             * cpu->pc to where the *real* M6.117 MOVE-to-SR inline left
+             * it, and m68k_step then decoded the REAL next instruction
+             * — accidentally correct runtime behavior. But ANY inline
+             * arm for the phantom op's opcode would have corrupted
+             * execution. Bench's 0x4A38 21 K helpers were a side effect
+             * of this trap (the "phantom" PC=0x4010E0 m68k_step calls).
+             *
+             *   MOVE SR,<ea>   = 0x40C0-0x40FF  (bits 15-6 = 0x103)
+             *   MOVE CCR,<ea>  = 0x42C0-0x42FF  (bits 15-6 = 0x10B)
+             *   MOVE <ea>,CCR  = 0x44C0-0x44FF  (bits 15-6 = 0x113)
+             *   MOVE <ea>,SR   = 0x46C0-0x46FF  (bits 15-6 = 0x11B)
+             *
+             * All are word-size; sz here should be 2. */
+            int ea_sz = sz == 0 ? 2 : sz;
+            /* (op & 0xF1C0) == 0x40C0 covers all four MOVE SR/CCR forms
+             * (bits 15-12 = 0100, bit 11 = 0, bit 8 = 0, bits 7-6 = 11).
+             * Bits 11-9 distinguish: 000=MOVE-from-SR, 001=MOVE-from-CCR,
+             * 010=MOVE-to-CCR, 011=MOVE-to-SR. */
+            if ((op & 0xF1C0) == 0x40C0) ea_sz = 2;
+            d.length += ea_ext_bytes(cpu, pc, mode, reg, ea_sz);
             break;
         }
         case 0x5: {

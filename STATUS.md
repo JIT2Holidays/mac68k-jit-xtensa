@@ -1,14 +1,70 @@
 # Status
 
-## Where things stand right now (post-M6.119)
+## Where things stand right now (post-M6.122)
 
 | Engine | lx7 / cyc | × interp baseline |
 |--------|----------:|------------------:|
-| **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.173** | **5.51 ×** ✅ |
-| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.210** | **5.34 ×** ✅ |
-| **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.668** | **3.87 ×** 🎯 |
+| **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.172** | **5.51 ×** ✅ |
+| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.198** | **5.39 ×** ✅ |
+| **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.704** | **3.79 ×** |
 | **Boot** (Mac Plus ROM, 5 M cycles, PC=`0x40032C` deterministic)    | **2.223** | **2.66 ×** |
 | **Boot** (Mac Plus ROM, 300 K cycles, PC=`0x40032C` deterministic)  | **1.975** | **2.99 ×** |
+
+## M6.122 — m68k_decode_at length fix for MOVE-to-SR/CCR — bench 100 M 1.210 → 1.198 lx7/cyc (−1.0 %)
+
+Long-standing latent bug in `m68k_decode_at` — for the four MOVE SR/CCR
+variants (`MOVE SR,<ea>`, `MOVE CCR,<ea>`, `MOVE <ea>,CCR`, `MOVE <ea>,SR`),
+the szf field (bits 7-6) is FIXED at `11` as part of the opcode pattern,
+NOT a size selector. Pre-M6.122 decode took szf=3 → sz=4 (.L) and called
+`ea_ext_bytes` with sz=4 — returning 4 bytes for a `#imm`
+destination/source. But these MOVEs ALWAYS use 16-bit imm (word).
+
+Result: `m68k_decode_at(0x4010DC)` for `MOVE #0x0120,SR` returned
+length 6 instead of 4. The JIT block compiler then walked PAST the
+imm word, decoding the byte at 0x4010E0 as a NEW opcode (the
+phantom `0x4A38`). Bench's 21 598 helpers/100M for `0x4A38` (at
+first_pc 0x4010E0) were a side effect — the phantom op's compile-time
+default-helper bridge ran `emit_advance_flush` to where the *real*
+M6.117 MOVE-to-SR inline left cpu->pc (the byte position just inside
+the imm word), and m68k_step then decoded the REAL next instruction.
+Accidentally correct because no inline arm fired for the phantom's
+opcode — any new inline arm for that opcode would have corrupted
+execution.
+
+Fix: `(op & 0xF1C0) == 0x40C0` matches all four MOVE-SR/CCR variants;
+force `ea_sz = 2` for them.
+
+**Triple-diff:** ctest 7/7, `--diff-jit-trace` clean through 11 038 cyc.
+
+**Perf:**
+
+| Workload | M6.121 | **M6.122** | Δ |
+|----------|------:|----------:|--:|
+| Bench (20 M)        | 1.173 | **1.172** | within noise |
+| **Bench (100 M)**   | 1.210 | **1.198** | **−1.00 %** ✅ |
+| Boot 5 M det        | 2.223 | **2.223** | unchanged |
+| Boot 100 M          | 1.668 | **1.704** | +2.2 % (M6.66 divergence) |
+
+The bench 100M improvement is real: the correctly-bounded block at
+PC=0x4010DC now contains only the MOVE-to-SR op and ends correctly;
+the dispatcher next compiles a SEPARATE block at PC=0x4010E0 with
+`0x4A38` as op[0], which the M6.77 TST.B (xxx).W inline now catches.
+`real_helpers` 135 011 → 113 335 (−21 676 ≈ M6.77 fires for the
+bench's hot 0x4A38).
+
+The boot 100M regression is in the M6.66 VIA-tick-divergence region
+(post-cycle-11898). The fix changes block boundaries around 0x4010DC,
+shifting the divergence trajectory. Boot's real-workload behavior
+(boot 5M det, pre-divergence) is unchanged at 2.223 lx7/cyc.
+
+🎯 **Bench 100 M crosses 5.39 × interp** (= 6.462 / 1.198).
+
+Cumulative M6.84 → M6.122:
+* Bench (20 M): 1.257 → **1.172** (−6.8 %)
+* Bench (100 M): 1.396 → **1.198** (**−14.2 %**) 🎯
+* Boot 300 K det: 2.170 → **1.975** (−9.0 %)
+* Boot 5 M det:   2.471 → **2.223** (−10.0 %)
+* Boot 100 M:     1.734 → **1.704** (−1.7 %)
 
 ## M6.119 — Skip cache_reload in register-preserving fast helpers — boot 100 M 1.715 → 1.668 lx7/cyc (−2.74 %) 🎯
 

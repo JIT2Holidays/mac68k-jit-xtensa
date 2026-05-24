@@ -6470,14 +6470,7 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
         }
 
         if (!done) {
-            /* Helper fallback: m68k_step(cpu). a3 survives the call.
-             *
-             * M6.121 — at LAST op (i == n_ops-1), skip post-helper
-             * cache_reload (no inline op afterward uses cache; the
-             * epilogue's cache_flush sees dirty=0 from the bridge's
-             * cache_flush and writes nothing back). This default
-             * fallback path has NO fast path with cache writes — unlike
-             * the inline-arm conditional bridges — so the skip is safe. */
+            /* Helper fallback: m68k_step(cpu). a3 survives the call. */
             emit_helper_step(&e, lit_off[HELPER_M68K_STEP], entry_off, &rc,
                              /*is_last_op=*/i + 1 == n_ops);
             helper_ops++;
