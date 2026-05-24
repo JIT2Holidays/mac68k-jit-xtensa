@@ -7,6 +7,15 @@ last remaining 21 K-hit un-inlined opcode on the post-cycle-11898 path).
 Pattern is the stays-in-supervisor `MOVE #0x2700,SR` (disable interrupts
 while in kernel).
 
+**Bug-fix sub-step:** the first commit used `xt_beqz` for the privilege
+check, which inverted the condition (beqz jumps when a8 == 0). In
+boot/bench (always S=1) the beqz fell through to the slow path every
+time, so 0x46fc still hit m68k_step on every dispatch — the apparent
+host gain came from the compile-time `helper_ops` decreasing (the inline
+arm is classified as inline) while the runtime cost stayed the same.
+Fixed to `xt_bnez` so the fast path actually runs for S=1; real_helpers
+dropped from 161 727 → 140 129 (= −21 598, the 0x46fc count).
+
 **Inline arm shape:**
 
 * **Compile-time gate**: only inline when imm has S bit (0x2000) set.

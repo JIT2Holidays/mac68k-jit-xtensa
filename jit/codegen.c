@@ -6317,12 +6317,23 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                 emit_advance_flush(&e);
                 emit_cache_flush(&e, &rc);
 
-                /* a8 = current SR.S bit (0 or 1). */
-                xt_extui(&e, 8, R_SR, 13, 1);
+                /* a8 = current SR.S bit (0 or 1). msksize=0 ⇒ width=1
+                 * (extracts bit 13 only). The earlier version used
+                 * msksize=1 (width=2) which still functioned because
+                 * bit 14 is reserved/0 on 68000, but msksize=0 is the
+                 * precise extraction. */
+                xt_extui(&e, 8, R_SR, 13, 0);
 
+                /* xt_bnez (not beqz) — JUMP to fast path when S=1
+                 * (supervisor, no trap needed). The earlier beqz had
+                 * the condition inverted: it jumped to fast path when
+                 * S=0 (user) — which would have written SR bypassing
+                 * the privilege trap. Boot/bench is always S=1 so the
+                 * beqz fell through to the helper bridge every time,
+                 * making the fast path effectively unreachable. */
                 i32 op_pc_sr = 4, op_cyc_sr = 4;
                 u32 sr_bridge_size = helper_step_after_flush_undo_size(&rc, op_pc_sr, op_cyc_sr);
-                xt_beqz(&e, 8, (i32)(6u + sr_bridge_size));
+                xt_bnez(&e, 8, (i32)(6u + sr_bridge_size));
 
                 /* Slow path: user mode → privilege-violation trap. */
                 emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
