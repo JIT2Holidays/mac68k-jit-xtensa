@@ -104,12 +104,12 @@ hot-code regions (0x40032C ROM init, 0x401F6E post-System-load, and
 0x41E0E6 Speedometer ALU) so a JIT regression in any of them surfaces
 on `ctest` instead of slipping through to a boot/bench run.
 
-## Where things stand right now (post-M6.158)
+## Where things stand right now (post-M6.162)
 
 | Engine | lx7 / cyc | real_lx7 / cyc | × interp baseline (host) |
 |--------|----------:|---------------:|-------------------------:|
 | **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.162** | **1.163** | **5.56 ×** ✅ |
-| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.182** | **1.182** | **5.47 ×** ✅ |
+| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.180** | **1.180** | **5.48 ×** ✅ |
 | **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.658** | **1.658** | **3.89 ×** |
 | **Boot** (Mac Plus ROM, 5 M cycles, PC=`0x40032C` deterministic)    | **2.196** | **2.196** | **2.94 ×** |
 
