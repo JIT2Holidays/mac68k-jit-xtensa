@@ -101,7 +101,8 @@ static void server_apply_packet(mac_mem *m, u8 type, const u8 *p, u32 len) {
  * way — to reproduce the Control Panel rendering bug deterministically.
  * Enabled with the MAC68K_CPDEBUG env var. */
 
-typedef struct { u64 cyc; int x, y, btn; } script_ev;
+/* kind: 0 = mouse (x,y,btn used); 1 = key (x=keycode, btn=down). */
+typedef struct { u64 cyc; int kind; int x, y, btn; } script_ev;
 
 /* Write-watch: while armed, tallies which PC writes into the two
  * corrupted framebuffer bands of the Control Panel. */
@@ -189,12 +190,12 @@ static int scripted_debug_run(mac_mem *m, m68k_cpu *cpu) {
                                            : 98;
     u64 boot = 900000000ull;
     script_ev script[] = {
-        { boot,               14, 10, 0 },
-        { boot +  20000000,   14, 10, 1 },   /* press — menu drops      */
-        { boot +  60000000,   30, 40, 1 },   /* drag down into the menu */
-        { boot + 100000000,   40, item_y, 1},/* onto Control Panel      */
-        { boot + 150000000,   40, item_y, 1},
-        { boot + 170000000,   40, item_y, 0},/* release — open it       */
+        { boot,               0, 14, 10, 0 },
+        { boot +  20000000,   0, 14, 10, 1 },  /* press — menu drops      */
+        { boot +  60000000,   0, 30, 40, 1 },  /* drag down into the menu */
+        { boot + 100000000,   0, 40, item_y, 1},/* onto Control Panel     */
+        { boot + 150000000,   0, 40, item_y, 1},
+        { boot + 170000000,   0, 40, item_y, 0},/* release — open it      */
     };
     int nev = (int)(sizeof(script) / sizeof(script[0])), next = 0;
     u64 end = boot + 600000000ull, last_dump = 0;
@@ -296,9 +297,19 @@ static int scripted_run_file(mac_mem *m, m68k_cpu *cpu, const char *spath) {
         while (*p == ' ' || *p == '\t') p++;
         if (*p == '#' || *p == '\n' || *p == '\0') continue;
         unsigned long long c; int x, y, b;
-        if (sscanf(p, "%llu %d %d %d", &c, &x, &y, &b) == 4) {
-            script[nev].cyc = c; script[nev].x = x;
-            script[nev].y = y;   script[nev].btn = b;
+        if (*p == 'k') {
+            /* Keyboard event: "k <cycle> <mac_keycode> <down>".
+             * keycode accepts decimal, octal, or 0x-hex via %i. */
+            int keycode, down;
+            if (sscanf(p + 1, "%llu %i %i", &c, &keycode, &down) == 3) {
+                script[nev].cyc = c; script[nev].kind = 1;
+                script[nev].x = keycode; script[nev].y = 0;
+                script[nev].btn = down;
+                nev++;
+            }
+        } else if (sscanf(p, "%llu %d %d %d", &c, &x, &y, &b) == 4) {
+            script[nev].cyc = c; script[nev].kind = 0;
+            script[nev].x = x; script[nev].y = y; script[nev].btn = b;
             nev++;
         }
     }
@@ -327,11 +338,18 @@ static int scripted_run_file(mac_mem *m, m68k_cpu *cpu, const char *spath) {
         m68k_run_until(cpu, cpu->cycles + 50000);   /* fine event timing */
         service_hd_insert(m, cpu);
         while (next < nev && cpu->cycles >= script[next].cyc) {
-            mac_set_mouse(m, script[next].x, script[next].y,
-                          script[next].btn != 0);
-            fprintf(stderr, "[script] ev%d cyc=%llu mouse=(%d,%d) btn=%d\n",
-                    next, (unsigned long long)cpu->cycles, script[next].x,
-                    script[next].y, script[next].btn);
+            if (script[next].kind == 1) {
+                mac_key_event(m, script[next].x, script[next].btn != 0);
+                fprintf(stderr, "[script] ev%d cyc=%llu key=0x%02X down=%d\n",
+                        next, (unsigned long long)cpu->cycles,
+                        script[next].x, script[next].btn);
+            } else {
+                mac_set_mouse(m, script[next].x, script[next].y,
+                              script[next].btn != 0);
+                fprintf(stderr, "[script] ev%d cyc=%llu mouse=(%d,%d) btn=%d\n",
+                        next, (unsigned long long)cpu->cycles, script[next].x,
+                        script[next].y, script[next].btn);
+            }
             next++;
         }
         if (cpu->cycles - last_dump >= frame_every) {

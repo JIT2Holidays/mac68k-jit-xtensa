@@ -351,7 +351,49 @@ coverage, two more InfiniteHD6 apps worth adding as `*.snap` workloads:
 Setup pattern follows `speedo-bench.snap`: boot Mac → drive 2 auto-
 mounts at cycle 1e9 → `MAC68K_MOUSESCRIPT` event file launches the
 app → `MAC68K_SNAP` freezes mid-workload. Each is ~30-event mouse
-script + ~5 min scripted run + one snapshot. Not done this session.
+script + ~5 min scripted run + one snapshot.
+
+**Attempted in a later session and ran into a coordinate-and-timing
+wall.** What works:
+* Headless boot to desktop with Infinite HD auto-mounted.
+* Apple-menu drop (single click on `(12, 10)` — clean).
+* File-menu drop (single click on `(46, 8)` — clean).
+* Single-click selection of Infinite HD icon at `(444, 170)` (icon
+  shows the inverted-highlight state).
+* Frame-dump every-N-cycles for visual inspection (sips converts
+  the BMPs to PNG for review).
+
+What fails:
+* Double-click to open the icon — across timings from 64 ms span to
+  6 ms span and from y=153 to y=170, the icon never opens. Single
+  click always selects but the OS doesn't register the pair as a
+  double-click in scripted mode. Possibly an interaction with the
+  emulator's mouse-state update mechanism (`mac_set_mouse` only
+  re-writes MTemp when position changes — at same-(x,y) clicks the
+  cursor's CrsrNew flag stays clear).
+* Cmd-O via the keyboard-event extension (see below) — the key
+  events DO reach `find_key_event` and the M0110 wire bytes get
+  shifted out, but the Finder doesn't fire the Open action.
+  Possibly a focus / selection-cleared race when keys arrive too
+  soon after the click.
+* Mouse drag from menubar to "Open" item — menu drops, "Open"
+  highlights, but release doesn't open the (presumably
+  deselected-by-menu) icon.
+
+What was added during the attempt (kept):
+* `port/host/main.c`: scripted-run format now accepts keyboard
+  events as `k <cycle> <keycode> <down>` (decimal/hex via `%i`).
+  The existing 4-token `<cycle> <x> <y> <btn>` mouse events still
+  work. Useful for any future scripting attempt regardless of how
+  the open-icon problem is solved.
+
+Suggested next steps if pursuing this further:
+* Use the SDL GUI interactively (`mac_gui`) to manually open the
+  app to the right state, then take a snapshot via the snapshot-
+  hook (extend `mac_gui` to dump a snapshot on a hotkey).
+* Investigate `mac_set_mouse`'s `LM_CrsrNew` interaction with
+  same-position clicks — the OS may need CrsrNew to be raised
+  even on no-position-change for double-click registration.
 
 Alternative real-software pair if synthetic benchmarks aren't the
 goal: **Dark Castle** (VIA-timer-driven sound + raster bit-banging
