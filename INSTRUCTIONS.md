@@ -1,6 +1,6 @@
 # 68000 Instruction Coverage in the JIT
 
-State at **M6.157**. This document inventories every 68000 instruction
+State at **M6.161**. This document inventories every 68000 instruction
 class the JIT recognises in `jit/codegen.c` and the translation strategy
 used. The Mac Plus is plain MC68000 — no 68010/020+ extensions (BFEXTU,
 MOVES, divs.l etc.) — so the table below is the complete ISA target.
@@ -98,6 +98,7 @@ m68k_step rows are mostly rare-fire system / exception ops.
 | `ADDA.W #imm,An` | .W | imm.W → An | ✅ | M5.3 | bench-hot 0xD0FC |
 | `ADDA.L Dn/An,Am` | .L | reg → Am | ✅ | M6.152 | sibling of M6.104 |
 | `ADDI #imm,EA` | .B / .W / .L | imm + EA | ✅ | M5.2 | |
+| `ADDQ.B #imm,Dn` | .B | imm + Dn | ✅ | M6.160 | shift-to-high-8 trick; lean flags-dead path |
 | `ADDQ.W #imm,Dn` | .W | imm + Dn | ✅ | M5.6 | |
 | `ADDQ.L #imm,Dn` | .L | imm + Dn | ✅ | M5.2 | |
 | `ADDX.L Dm,Dn` | .L | reg-reg | ✅ | M6.142 | X-flag consumer |
@@ -106,11 +107,14 @@ m68k_step rows are mostly rare-fire system / exception ops.
 | `SUBA.W #imm,An` | .W | imm.W → An | ✅ | M5.3 | |
 | `SUBA.L Dn/Am,An` | .L | reg → An | ✅ | M6.157 | sibling of M6.152 ADDA.L |
 | `SUBI #imm,EA` | .B / .W / .L | | ✅ | M5.2 | |
+| `SUBQ.B #imm,Dn` | .B | | ✅ | M6.160 | bench 0x5205, boot 0x5801 |
 | `SUBQ.W #imm,Dn` | .W | | ✅ | M5.6 | |
 | `SUBQ.L #imm,Dn` | .L | | ✅ | M5.2 | |
 | `SUBX.L Dm,Dn` | .L | reg-reg | ✅ | M6.142 | X-flag consumer |
-| `MULU.W Dm,Dn` | .W → .L | reg-reg | ✅ | M5.5 | |
-| `MULS.W Dm,Dn` | .W → .L | reg-reg | ✅ | M5.5 | |
+| `MULU.W Dm,Dn` | .W → .L | reg-reg | ✅ | M6.159 | sibling of M6.81's #imm16 and (d16,An) arms |
+| `MULS.W Dm,Dn` | .W → .L | reg-reg | ✅ | M6.159 | |
+| `MULU.W / MULS.W #imm16,Dn` | .W → .L | imm | ✅ | M6.81 | |
+| `MULU.W / MULS.W (d16,An),Dn` | .W → .L | (d16,An) | ✅ | M6.81 | |
 | `DIVU.W / DIVS.W` | — | — | 🐢 | — | exception semantics (zero-div) — slow path is safe |
 | `NEG Dn` | .B / .W / .L | reg | ✅ | early | |
 | `NEGX.L Dn` | .L | reg | ✅ | M6.115 | X-flag consumer (X-form fix) |
@@ -134,7 +138,7 @@ m68k_step rows are mostly rare-fire system / exception ops.
 | `ANDI/ORI/EORI to-CCR/SR` | — | — | 🐢 | — | privileged for SR; CCR rare |
 | `ORI.B #imm,(d16,An)` | .B | imm → MMIO | ⚡ | M6.31 | `m68k_jit_ori_b_mmio` |
 | `CLR Dn` | .B / .W / .L | reg | ✅ | M6.139 | |
-| `CLR (An)+ / (xxx)` | .L / .W | mem | ⚡ / 🐢 | M6.130 | `(An)+` form covered |
+| `CLR (An)+ / (xxx)` | .L / .W | mem | ⚡ / 🐢 | M6.130 / M6.161 | `(An)+` form covered; M6.161 swaps slow path to `m68k_jit_clr_w_anpi_mmio` |
 | `TST Dn` | .B / .W / .L | reg | ✅ | M6.101 / M6.138 | M6.95 / M6.325 fusion with Bcc.S |
 | `TST (An)` | .B | mem | 🐢 | — | **M6.148 attempt reverted** (bridge trajectory shift) |
 | `TST (xxx).W` | .B / .W / .L | abs | 🪝 | M6.131 | helper narrowed mask |
