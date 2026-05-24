@@ -55,6 +55,40 @@ ROX). Bit 8 = 0 = RIGHT direction. The LEFT-direction ROXL.B fires in
 boot 100M (0xE3xx at 1 688 hits) and was NOT inlined — preserving the
 trajectory.
 
+### M6.148 finding — sibling-symmetry isn't enough for bridge arms
+
+M6.148 attempted TST.B (An) / TST.B (d16,An) inline as a perfect
+structural sibling of M6.91 MOVE.B (An)/(d16,An):
+
+* Same bounds-check (M6.76 unified RAM-or-ROM byte bounds)
+* Same emit_jit_fast_helper bridge (new m68k_jit_tst_b_mmio helper)
+* Same touched_mask narrowing (0u for flag-only)
+* Same fast-path shape (l8ui + emit_logic_flags)
+
+Bench had 184 hits at these opcodes. Boot 100M's helper-histo
+showed just 4 fires (TST.B (A0)/(A1) at real-code PCs).
+
+**Result: boot 100M regressed +32 %** (1.665 → 2.206), helpers
+exploded 182 K → 1.16 M (+979 K). Same scale of regression as
+M6.145 OR.W bridge-only. Reverted.
+
+**Refined trajectory-safety rule** (saved to
+`memory/bridge-only-arms-trajectory-shift.md`): the empirically-
+validated safe categories for new arms are:
+
+| Category | Examples | Risk |
+|----------|----------|------|
+| Pure register-op, no bridge | M6.141 Scc, M6.142 ADDX.L, M6.143 ROXR, M6.146 LSL | ✅ |
+| Slow-path bridge conversion (existing arm, swap helper) | M6.144 MOVE.L (An),Dn | ✅ |
+| Compile-time fusion only (no new emit) | M6.95 TST.L+Bcc, M6.147 MOVE.L+Bcc | ✅ |
+| Cross-block analysis extension | M6.140 JMP/BRA.W | ✅ |
+| **NEW arm with bounds-check + bridge** | M6.145 OR.W, M6.148 TST.B (An) | **❌** |
+
+The mechanism: introducing bridge code (cache_flush + bridge) into
+NEW blocks changes block size, cache_sig, and chain prediction. Even
+when the runtime helper-histo shows few fires, the COMPILED block
+layout differs → cascade through the M6.66 chaos.
+
 ### Post-M6.144 saturation analysis
 
 Bench 100M's helper-histo top entries post-M6.144 are now all NEW
