@@ -4348,10 +4348,14 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             xt_and  (&e, 10, 8, 9);
             emit_cache_flush(&e, &rc);   /* before conditional helper */
             i32 op_pc_cmpa = 4, op_cyc_cmpa = 10;
+            /* M6.129 — CMPA.W (d16,An),An modifies only CCR (CMP is
+             * flag-only — doesn't write to the dst An). */
+            g_helper_touched_mask = 0u;
             xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_cmpa, op_cyc_cmpa)));
 
             emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
                                               entry_off, &rc, op_pc_cmpa, op_cyc_cmpa);
+            g_helper_touched_mask = 0xFFFFu;
 
             u32 jcmpa_pos = e.len;
             xt_j(&e, 4);
@@ -4427,11 +4431,14 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             xt_and  (&e, 10, 8, 9);
             emit_cache_flush(&e, &rc);   /* before conditional helper */
             i32 op_pc_cwd = 4, op_cyc_cwd = 8;
+            /* M6.129 — CMP.W (d16,An),Dn modifies only CCR. */
+            g_helper_touched_mask = 0u;
             u32 helper_skip = helper_step_after_flush_undo_size(&rc, op_pc_cwd, op_cyc_cwd);
             u32 helper_bcc_tail_size = fuse ? fused_helper_bcc_tail_size(fuse_cc) : 0;
             xt_beqz (&e, 10, (i32)(6u + helper_skip + helper_bcc_tail_size));
             emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
                                               entry_off, &rc, op_pc_cwd, op_cyc_cwd);
+            g_helper_touched_mask = 0xFFFFu;
             if (fuse) {
                 /* Helper-path Bcc tail. The bridge already reloaded R_SR
                  * (CMP wrote it), so emit_cond reads CMP's flags. The
@@ -4519,12 +4526,16 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             xt_and  (&e, 10, 8, 9);
             emit_cache_flush(&e, &rc);   /* before conditional helper */
             i32 op_pc_cw = 2, op_cyc_cw = 8;
+            /* M6.129 — CMP.W (An),Dn modifies only CCR (CMP is flag-only).
+             * No D/A reg touched by helper. */
+            g_helper_touched_mask = 0u;
             u32 helper_skip_cw = helper_step_after_flush_undo_size(&rc, op_pc_cw, op_cyc_cw);
             u32 helper_bcc_tail_cw = fuse ? fused_helper_bcc_tail_size(fuse_cc) : 0;
             xt_beqz (&e, 10, (i32)(6u + helper_skip_cw + helper_bcc_tail_cw));
             /* helper */
             emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
                                               entry_off, &rc, op_pc_cw, op_cyc_cw);
+            g_helper_touched_mask = 0xFFFFu;
             if (fuse) {
                 u32 before = e.len;
                 emit_cond(&e, fuse_cc);
@@ -6187,9 +6198,13 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             xt_and  (&e, 12, 10, 11);
             emit_cache_flush(&e, &rc);
             i32 op_pc_ci = 6, op_cyc_ci = 8;
+            /* M6.129 — CMPI.W #imm,(d16,An) modifies only CCR (CMP is
+             * flag-only). No D/A reg touched by helper. */
+            g_helper_touched_mask = 0u;
             xt_beqz (&e, 12, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_ci, op_cyc_ci)));
             emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
                                               entry_off, &rc, op_pc_ci, op_cyc_ci);
+            g_helper_touched_mask = 0xFFFFu;
             u32 jci_pos = e.len;
             xt_j    (&e, 4);
             /* Fast path: pick base via a10. */
