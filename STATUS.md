@@ -1491,6 +1491,65 @@ blocks pick different reg *sets*, not just different orderings).
 
 ctest: **7 / 7** pass.
 
+**M6.83 — SWAP Dn + BSR.S inline; CMP.W (An),Dn MMIO-trap reverted.**
+
+Small iteration adding two clean inlines plus a hard-earned lesson:
+
+* `(w & 0xFFF8) == 0x4840` **SWAP Dn** — bench-warm 0x4840+ at 246
+  hits/20 M cyc. Swap the high and low .W halves: `result = (v
+  << 16) | (v >> 16)`. Uses `xt_extui` (sa=16 / msksize=16) for the
+  high→low half since `xt_srli`'s shift count is capped at 15.
+  MOVE-family CCR, length 2, 4 cycles.
+* `top == 0x6 && cc == 1 && disp ∈ -127..-1 ∪ 1..127` **BSR.S disp8**
+  at 193 hits. Block terminator; sibling of M6.78 JSR (d16,PC) but
+  with 8-bit displacement. Target = `source_pc + 2 + sext8(disp8)`,
+  stashed in `LITERAL_BCC_PC` by an extended block-setup pre-pass
+  that now treats `cc ∈ {0, 1}` as BRA-like (vs the old code which
+  treated cc=1 as fall-through-like for the literal). Return PC =
+  `cpu->pc + 2` computed at runtime. 22 cycles, length 2.
+
+**CMP.W (An),Dn arm — landed and immediately reverted.** Added
+the mode=2 sibling of CMP.W (d16,An),Dn using the M6.76 unified
+RAM/ROM bounds. ctest passed, `diff_jit_trace` showed only the
+documented M6.66 divergence. But the **bench `lx7_per_cyc` jumped
+from 1.259 to 1.390** (+10.4 %) — investigated by bisect (disabling
+each new arm). The hot 0xB692 is CMP.W (A2),D3 in the bench's
+ROM-resident polling loop, where A2 almost always points to MMIO
+(VIA-register polling). Every call paid the unified-bounds setup
+ops AND then fell through to the helper bridge anyway, NET cost
++~8 LX7 ops per call. The helper count even dropped in the
+histogram, but the bench post-cycle-11898 path took a slightly
+different code shape (VIA-tick path dependence) so the count
+comparison was misleading.
+
+Recorded in `memory/inline-when-ea-points-mmio.md`: when an opcode's
+EA is most often MMIO, inline-with-bounds-check is a NET LOSS even
+when ctest and diff_jit_trace pass. Always check `lx7_per_cyc` and
+total `xt_instrs` after landing a new inline; if those go up while
+helpers go down, you've hit this trap.
+
+**Triple-diff workflow:**
+
+* ctest: 7/7
+* `--diff-jit-trace`: only the documented M6.66 cycle-11898 divergence
+* Boot @ 300 K / 5 M deterministic: byte-identical to M6.82 (1192 /
+  25240 helpers, same lx7 cost)
+
+**Perf:**
+
+| Workload | M6.82 | **M6.83** | Δ |
+|----------|------:|----------:|--:|
+| Bench @ 20 M cyc | 10 065 h, 1.259 lx7/cyc | **9 443 h, 1.258 lx7/cyc** | −622 h, ~0 % lx7 |
+| Boot @ 300 K / 5 M det | unchanged | unchanged | byte-identical |
+| Boot @ 100 M | 1.735 | 1.735 | unchanged |
+
+622 helpers eliminated (matches the SWAP 246 + BSR.S 193 + in-family
+variants prediction). The lx7_per_cyc savings is negligible (~0.1 %)
+because both SWAP and BSR.S have small total runtime call counts
+relative to bench's 25 M-lx7 cost.
+
+ctest: **7 / 7** pass.
+
 Alternative real-software pair if synthetic benchmarks aren't the
 goal: **Dark Castle** (VIA-timer-driven sound + raster bit-banging
 — tests M3's "good enough to pace 60 Hz VBL, not instruction-cycle-

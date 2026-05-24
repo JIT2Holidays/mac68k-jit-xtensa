@@ -1301,8 +1301,9 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             i32 disp = (i8)(last_op & 0xFF);
             if (disp != 0 && disp != -1) {  /* not .W/.L variants (handled by helper) */
                 u32 pc_const;
-                if (cc == 0) {
-                    /* BRA.S: literal is the taken target. */
+                if (cc == 0 || cc == 1) {
+                    /* BRA.S / BSR.S — both unconditional, literal is the
+                     * taken target. (M6.83 added BSR.S to this branch.) */
                     pc_const = op_pc[n_ops - 1] + 2 + (u32)disp;
                 } else {
                     /* Bcc.S: literal is the fall-through PC. */
@@ -3651,6 +3652,67 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
              * dispatcher is skipped.) */
             emit_branch(&e, op_pc[i], w);
             inline_ops++; done = true;
+        } else if (top == 0x6 && (((w>>8)&0xF) == 1)
+                   && (w & 0xFF) != 0x00 && (w & 0xFF) != 0xFF) {
+            /* BSR.S disp8 — bench-warm 0x61D2 at 193 hits/20 M cyc (M6.83).
+             * Block terminator. Sibling of M6.78's JSR (d16,PC) but with
+             * 8-bit displacement (length 2). The target is
+             * `source_pc + 2 + sext8(disp8)` — compile-time constant,
+             * stashed in LITERAL_BCC_PC by the block-setup pre-pass
+             * (extended to handle cc=1 this iteration). Return PC =
+             * source_pc + 2 (computed at runtime as cpu->pc + 2 since
+             * emit_advance_flush just landed cpu->pc on source_pc).
+             *
+             * 22 cycles (interp base 4 + handler 18). */
+            i32 disp = (i8)(w & 0xFF);
+            u32 target_pc = op_pc[i] + 2 + (u32)disp;
+
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(7), 8);
+            xt_addi(&e, 8, 8, -4);                /* a8 = new SP */
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_bsr = 0;        /* m68k_step sets cpu->pc directly */
+            i32 op_cyc_bsr = 22;
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_bsr, op_cyc_bsr)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_bsr, op_cyc_bsr);
+            u32 jbsr_pos = e.len;
+            xt_j    (&e, 4);
+            /* Fast path: write return_pc (= cpu->pc + 2) as 4 BE bytes
+             * to [ram_base + new SP], commit new SP, set cpu->pc =
+             * target. */
+            xt_l32i (&e, 10, R_CPU, OFF_PC);
+            xt_addi (&e, 10, 10, 2);              /* a10 = return_pc */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);
+            xt_extui(&e, 11, 10, 24, 7); xt_s8i(&e, 11, 9, 0);
+            xt_extui(&e, 11, 10, 16, 7); xt_s8i(&e, 11, 9, 1);
+            xt_extui(&e, 11, 10,  8, 7); xt_s8i(&e, 11, 9, 2);
+            xt_extui(&e, 11, 10,  0, 7); xt_s8i(&e, 11, 9, 3);
+            emit_write_g(&e, &rc, G_A(7), 8);
+            /* Set cpu->pc = target. LITERAL_BCC_PC holds it. */
+            if (g_pc_lit_valid && target_pc == g_pc_lit_val) {
+                emit_l32r_at(&e, 10, g_pc_lit_off,
+                             g_pc_lit_entry_off + e.len);
+            } else {
+                emit_load_imm32(&e, 10, 11, target_pc);
+            }
+            xt_s32i(&e, 10, R_CPU, OFF_PC);
+            emit_advance(&e, op_pc_bsr, op_cyc_bsr);
+
+            u32 here_bsr = e.len;
+            i32 jo_bsr = (i32)(here_bsr - jbsr_pos) - 4;
+            u32 jw_bsr = ((u32)((u32)jo_bsr & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jbsr_pos    ] = (u8)jw_bsr;
+            base[entry_off + jbsr_pos + 1] = (u8)(jw_bsr >> 8);
+            base[entry_off + jbsr_pos + 2] = (u8)(jw_bsr >> 16);
+
+            sext_memo_invalidate();
+            inline_ops++; done = true;
         } else if (top == 0x5 && szf == 3 && mode == 1
                    && (((w >> 8) & 0xF) == 1 || ((w >> 8) & 0xF) == 6)) {
             /* DBF / DBNE Dn, disp16 — boot's two big DBcc helpers.
@@ -3843,6 +3905,25 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
              * V=C=0, X preserved. */
             int dn = w & 7;
             emit_read_g(&e, &rc, G_D(dn), 8);
+            if (!flags_dead[i]) emit_logic_flags(&e, 8);
+            emit_advance(&e, 2, 4);
+            inline_ops++; done = true;
+        } else if ((w & 0xFFF8) == 0x4840) {
+            /* SWAP Dn — bench-warm 0x4840+ at ~246 hits/20 M cyc (M6.83).
+             * Swap the high and low .W halves of Dn: result = (v >> 16) |
+             * (v << 16). MOVE-family CCR (N from bit 31, Z if result==0,
+             * V=C=0, X preserved). Length 2, 4 cycles (interp returns
+             * after set_flags_logic — no `cycles +=` after the base 4).
+             *
+             * Uses `xt_extui` for both halves since `xt_srli`'s shift
+             * count is capped at 15 — we'd otherwise need two shifts to
+             * land bit-16-and-above in the low 16. */
+            int dn = w & 7;
+            emit_read_g(&e, &rc, G_D(dn), 8);
+            xt_extui(&e, 9, 8, 16, 15);             /* a9 = v[31:16] in low 16 */
+            xt_slli (&e, 10, 8, 16);                /* a10 = v[15:0] in high 16 */
+            xt_or   (&e, 8, 10, 9);                  /* a8 = swapped */
+            emit_write_g(&e, &rc, G_D(dn), 8);
             if (!flags_dead[i]) emit_logic_flags(&e, 8);
             emit_advance(&e, 2, 4);
             inline_ops++; done = true;
