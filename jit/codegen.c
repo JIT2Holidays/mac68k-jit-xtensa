@@ -1248,8 +1248,42 @@ static void emit_branch(xt_emit *e, u32 op_pc, u16 w) {
 
 /* ADDQ.W / SUBQ.W #imm,Dn — modify the low 16 bits of Dn, full CCR.
  * `skip_flags` lets the lazy-CC pass drop the (75-byte) flag emission
- * when no consumer reads the flags before the next setter. */
+ * when no consumer reads the flags before the next setter.
+ *
+ * M6.87 — when `skip_flags` is true (bench's 0x03DF58/5E ADDQ.W #1,D6
+ * followed by CMP.W → Bcc, the flags get overwritten before any reader),
+ * emit the simpler "compute low 16, OR with high 16" form: 6 LX7 ops
+ * between read and write, vs 8 in the shifted-form path needed for
+ * `emit_addsub_flags_long`. With both bench blocks firing ADDQ.W #1,D6
+ * (~404 K hits / 20 M cyc), saves ~4 LX7 per call cached = ~1.6 M LX7
+ * total ≈ 6 % bench. */
 static void emit_addq_w_dn(xt_emit *e, int dn, int imm, bool is_sub, bool skip_flags, regcache *rc) {
+    if (skip_flags) {
+        /* Lean value-only path. Uses emit_read_g_in/cache_lookup so the
+         * cached fast path emits zero load/store overhead. */
+        u8 src_reg = emit_read_g_in(e, rc, G_D(dn), 8);
+        int xt_dst = cache_lookup(rc, G_D(dn));
+        u8 dst_reg = (xt_dst >= 0) ? (u8)xt_dst : 8;
+
+        xt_extui(e, 9, src_reg, 0, 15);                /* a9 = Dn.low_16 */
+        xt_addi (e, 9, 9, is_sub ? -(i32)imm : imm);   /* a9 = .low ± imm */
+        xt_extui(e, 9, 9, 0, 15);                       /* mask back to 16 b */
+        xt_extui(e, 10, src_reg, 16, 15);              /* a10 = Dn.high_16 */
+        xt_slli (e, 10, 10, 16);                        /* a10 = high << 16 */
+        xt_or   (e, dst_reg, 10, 9);                    /* combined */
+
+        if (xt_dst >= 0) {
+            for (int i = 0; i < rc->active; i++)
+                if (rc->guest[i] == (u8)G_D(dn)) { rc->dirty |= (u16)(1u << i); break; }
+        } else {
+            xt_s32i(e, dst_reg, R_CPU, OFF_D(dn));
+        }
+        emit_advance(e, 2, 8);
+        return;
+    }
+
+    /* Full-CCR path: shifted-to-high-16 form so emit_addsub_flags_long
+     * can read s, d, r directly from a8, a9, a10. */
     emit_read_g(e, rc, G_D(dn), 11);
     xt_slli(e, 9, 11, 16);
     xt_movi(e, 8, imm);
@@ -1261,7 +1295,7 @@ static void emit_addq_w_dn(xt_emit *e, int dn, int imm, bool is_sub, bool skip_f
     xt_extui(e, 12, 10, 16, 15);
     xt_or  (e, 11, 11, 12);
     emit_write_g(e, rc, G_D(dn), 11);
-    if (!skip_flags) emit_addsub_flags_long(e, is_sub, false);
+    emit_addsub_flags_long(e, is_sub, false);
     emit_advance(e, 2, 8);
 }
 

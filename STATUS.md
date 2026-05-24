@@ -1,5 +1,69 @@
 # Status
 
+## M6.87 — ADDQ.W skip-flags lean path (delivered)
+
+The `emit_addq_w_dn` emitter uses a shifted-to-high-16 form for its
+value computation so that `emit_addsub_flags_long` can read s/d/r
+directly. When the lazy-CC pass sets `flags_dead = true` (i.e., the
+next op overwrites all CCR), the flag emission is already skipped —
+but the *value* emission still pays for the unneeded shift form.
+
+M6.87 adds a lean alternative when `skip_flags = true`:
+
+```
+                   shifted-form       lean (skip_flags)
+                   (10 cached ops)    (6 cached ops)
+read Dn            xt_mov 11, slot    -- (emit_read_g_in)
+compute            xt_slli 9, 11, 16
+                   xt_movi 8, imm     xt_addi 9, slot, imm
+                   xt_slli 8, 8, 16   xt_extui 9, slot, 0, 15
+                   xt_add 10, 9, 8    xt_extui 9, 9, 0, 15
+                   xt_srli 11, 11, 16 xt_extui 10, slot, 16, 15
+                   xt_slli 11, 11, 16 xt_slli 10, 10, 16
+                   xt_extui 12, 10,
+                           16, 15
+                   xt_or  11, 11, 12  xt_or  slot, 10, 9
+write Dn           xt_mov slot, 11    -- (direct write to slot)
+```
+
+Saves 4 LX7 per `ADDQ.W / SUBQ.W #imm,Dn` when D-reg is cached and
+the flags are dead. Bench's 0x03DF58 and 0x03DF5E blocks both have
+`ADDQ.W #1,D6` followed by `CMP.W (d16,A5),D6` (next op = setter →
+flags dead).
+
+**Triple-diff workflow:**
+
+* ctest: 7/7
+* `--diff-jit-trace`: match through 11 038 cycles, 321 blocks — clean
+* Boot 300 K / 5 M det: same final PC, same helper count as M6.86;
+  tiny improvement from the rare boot-path ADDQ.W with skip_flags=true.
+
+**Perf:**
+
+| Workload | M6.86 | **M6.87** | Δ |
+|----------|------:|----------:|--:|
+| Bench @ 5 M cyc   | 1.371 lx7/cyc | **1.359 lx7/cyc** | **−0.9 %** lx7 |
+| Bench @ 20 M cyc  | 1.211 lx7/cyc | **1.198 lx7/cyc** | **−1.1 %** lx7 |
+| Bench @ 100 M cyc | 1.353 lx7/cyc | **1.340 lx7/cyc** | **−1.0 %** lx7 |
+| Boot @ 300 K det  | 2.159 lx7/cyc | **2.158 lx7/cyc** | within noise |
+| Boot @ 5 M det    | 12 352 738 lx7 | **12 341 858 lx7** | −10 880 lx7 |
+| Boot @ 100 M cyc  | 1.734 | **1.734** | unchanged |
+
+**Cumulative M6.84 → M6.87:**
+
+| Workload | M6.84 | M6.87 | Δ |
+|----------|------:|------:|--:|
+| Bench @ 20 M cyc  | 1.257 | **1.198** | **−4.7 %** lx7 |
+| Bench @ 100 M cyc | 1.396 | **1.340** | **−4.0 %** lx7 |
+
+**Bench is now 1.198 lx7/cyc @ 20 M cyc = 5.39 × interp baseline.**
+
+The actual measured saving (~268 K LX7 / 20 M cyc) is less than the
+naive estimate (~1.6 M from 405 K × 4) — looking at the chain stats
+(241 K chain transitions / ~4 per loop iter ≈ 60 K full iterations
+in 20 M cyc), the actual ADDQ.W execution count is ~60-67 K per site,
+not the M6.41-era 405 K. The savings rate matches that scale.
+
 ## M6.86 — LEA + ADDA fusion (delivered)
 
 Bench's 0x03DF4E-50 (the LEA-sibling of the 0x03DF40 MOVEA pair) was
@@ -158,15 +222,15 @@ them each iteration.
    intermediate register writeback. See M6.85 below for the first
    fusion lever in this class.
 
-## Where things stand right now (post-M6.86)
+## Where things stand right now (post-M6.87)
 
 | Engine | lx7 / cyc | × interp baseline |
 |--------|----------:|------------------:|
-| **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.211** | **5.34 ×** ✅ |
-| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.353** | **4.78 ×** |
+| **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.198** | **5.39 ×** ✅ |
+| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.340** | **4.82 ×** |
 | **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.734** | **3.40 ×** |
-| **Boot** (Mac Plus ROM, 5 M cycles, PC=`0x40032C` deterministic)    | **2.471** | **2.39 ×** |
-| **Boot** (Mac Plus ROM, 300 K cycles, PC=`0x40032C` deterministic)  | **2.159** | **2.73 ×** |
+| **Boot** (Mac Plus ROM, 5 M cycles, PC=`0x40032C` deterministic)    | **2.468** | **2.39 ×** |
+| **Boot** (Mac Plus ROM, 300 K cycles, PC=`0x40032C` deterministic)  | **2.158** | **2.73 ×** |
 
 **Important note — M6.77 reset.** The bench numbers in this table
 are the **first correct measurements** of the milestone in many
