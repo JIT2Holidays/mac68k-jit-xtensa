@@ -1,5 +1,52 @@
 # Status
 
+## M6.117 — MOVE #imm16,SR — bench 100 M crosses 5.33 × interp 🎯
+
+Privileged op that bench's hot loop hits 21 598 times / 100 M cyc (the
+last remaining 21 K-hit un-inlined opcode on the post-cycle-11898 path).
+Pattern is the stays-in-supervisor `MOVE #0x2700,SR` (disable interrupts
+while in kernel).
+
+**Inline arm shape:**
+
+* **Compile-time gate**: only inline when imm has S bit (0x2000) set.
+  If imm.S = 0, would need a S→U transition with SP swap; defer to
+  helper. Boot/bench's hot 0x46fc all have imm.S = 1.
+* **Runtime gate**: check current SR.S = 1. If user mode, helper takes
+  the privilege-violation trap.
+* **Fast path**: `R_SR = imm` via emit_load_imm (1-3 ops).
+
+Length 4 (op + imm.W); cycles 4 (m68k_step base 4, handler 0).
+
+**Triple-diff workflow:**
+
+* ctest: 7/7
+* `--diff-jit-trace`: clean through 11 038 cycles
+* Boot 5 M det / 100 M: same lx7/cyc (boot helpers 185 089 → 184 693
+  = −396, matching boot's 398-hit 0x46fc count — boot's MOVE #imm,SR
+  are also imm.S = 1, so they inline too)
+* Bench (20 M): unchanged (0x46fc absent from this window)
+* Bench (100 M): 74 960 → **53 362** helpers (**−21 598**, exactly the
+  0x46fc hit count)
+
+**Perf:**
+
+| Workload | M6.116 | **M6.117** | Δ |
+|----------|------:|----------:|--:|
+| Bench (20 M)      | 1.176 | **1.176** | unchanged |
+| **Bench (100 M)** | 1.223 | **1.212** | **−0.90 %** ✅ |
+| Boot 5 M det      | 2.223 | **2.223** | unchanged |
+| Boot 100 M        | 1.715 | **1.715** | unchanged |
+
+🎯 **Bench 100 M crosses 5.33 × interp** (= 6.462 / 1.212).
+
+Cumulative M6.84 → M6.117:
+* Bench (20 M): 1.257 → **1.176** (−6.4 %)
+* Bench (100 M): 1.396 → **1.212** (**−13.2 %**) 🎯
+* Boot 300 K det: 2.170 → **1.975** (−9.0 %)
+* Boot 5 M det:   2.471 → **2.223** (−10.0 %)
+* Boot 100 M:     1.734 → **1.715** (−1.1 %)
+
 ## M6.116 — classify_op cleanup: LINK/UNLK/PEA/MOVE-USP are flag-neutral (0u)
 
 Several top=0x4 opcodes don't touch CCR but were classified as SET|CONS

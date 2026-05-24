@@ -6289,6 +6289,66 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             }
             emit_advance(&e, 2, 10 + 2 * imm);
             inline_ops++; done = true;
+        } else if (w == 0x46FC) {
+            /* M6.117 — MOVE #imm16,SR. Privileged op. Bench-hot 21 598 hits
+             * / 100 M cyc — the last remaining 21K-hit un-inlined opcode
+             * on the post-cycle-11898 path.
+             *
+             * Length 4 (op + imm.W). Cycles 4 (m68k_step base 4, handler 0
+             * for the MOVE-to-SR path in m68k_interp.c line 951-958).
+             *
+             * Correctness gates:
+             *   1. Compile-time: only inline when imm has S bit (0x2000)
+             *      set. If imm.S=0, we'd need a S→U transition with SP
+             *      swap; defer to helper. Boot/bench's hot 0x46fc all
+             *      have imm.S=1 (stays-in-supervisor pattern: disable
+             *      interrupts via SR.I write while in kernel).
+             *   2. Runtime: check current SR.S=1. If user mode, helper
+             *      must run to take the privilege-violation trap. Since
+             *      our compile-time imm.S=1, supervisor→supervisor has
+             *      no SP swap — just write SR = imm.
+             *
+             * Fast path: SR = imm (1-3 ops). Plus the privilege check
+             * (~3 ops). Helper bridge for the slow path (when user mode).
+             *
+             * Saves ~59 LX7 per fast-path hit vs 64-LX7 helper. */
+            u16 imm = mac_read16(cpu->mem, op_pc[i] + 2);
+            if (imm & 0x2000) {       /* imm.S = 1 → stay supervisor */
+                emit_advance_flush(&e);
+                emit_cache_flush(&e, &rc);
+
+                /* a8 = current SR.S bit (0 or 1). */
+                xt_extui(&e, 8, R_SR, 13, 1);
+
+                i32 op_pc_sr = 4, op_cyc_sr = 4;
+                u32 sr_bridge_size = helper_step_after_flush_undo_size(&rc, op_pc_sr, op_cyc_sr);
+                xt_beqz(&e, 8, (i32)(6u + sr_bridge_size));
+
+                /* Slow path: user mode → privilege-violation trap. */
+                emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                                  entry_off, &rc, op_pc_sr, op_cyc_sr);
+                u32 jsr_pos = e.len;
+                xt_j(&e, 4);
+
+                /* Fast path: R_SR = imm. Use emit_load_imm because imm
+                 * may exceed xt_movi's -2048..2047 range (e.g. imm=0x2700
+                 * which is a typical "supervisor, disable interrupts"
+                 * value). */
+                emit_load_imm(&e, R_SR, 9, (u32)imm);
+                g_sr_dirty = true;
+                sext_memo_invalidate();
+                emit_advance(&e, op_pc_sr, op_cyc_sr);
+
+                u32 here_sr = e.len;
+                i32 jo_sr = (i32)(here_sr - jsr_pos) - 4;
+                u32 jw_sr = ((u32)((u32)jo_sr & 0x3FFFFu) << 6) | 0x06u;
+                base[entry_off + jsr_pos    ] = (u8)jw_sr;
+                base[entry_off + jsr_pos + 1] = (u8)(jw_sr >> 8);
+                base[entry_off + jsr_pos + 2] = (u8)(jw_sr >> 16);
+
+                inline_ops++; done = true;
+            }
+            /* else (imm.S=0): fall through to helper. */
         }
 
         if (!done) {
