@@ -384,6 +384,14 @@ divergence chaotic region (see `memory/m6.66-trajectory-traps.md`), so
 new inline arms shift the trajectory more than they shave LX7. The path
 forward is structural, not piecemeal. Three items, biggest-win-first:
 
+**Progress summary (post-M6.162):**
+
+| Item | State | Notes |
+|------|-------|-------|
+| 1. Full register caching | mostly done | Cache miss rate already < 1 %. Widening is low-ceiling. The "trampoline-preserves-a4..a7" sub-item remains as a possible follow-up. |
+| 2. Lazy-CC classifier | partial (M6.158 + M6.162) | Per-helper SR + arg masks delivered. MOVE-family X-bit refactor remains. |
+| 3. Native ESP32 chaining | infrastructure ready | Host-unmeasurable. Awaiting on-device benchmark. |
+
 ### 1. Full register caching of hot D/A regs across a block
 
 **Empirical update (post-M6.139): cache miss rate is already < 1 %.**
@@ -438,22 +446,42 @@ at block-compile time. Hits eliminate `l32i`/`s32i`; misses fall back to
 
 ### 2. Comprehensive lazy CCs with a classifier modelling helper CCR usage
 
+**Partial delivery: M6.158 + M6.162** — see the per-helper masks at
+the top of `jit/codegen.c`:
+
+* `g_helper_sr_mask` (M6.158): clear bits to skip
+  `emit_sr_flush` / `emit_sr_reload` around helpers that don't read /
+  write `cpu->sr`. 7 helpers verified clean (RTS / BSR / 4 × MOVEM).
+  Win: boot 100M `lx7/cyc` -0.30 %, -525K LX7.
+* `g_helper_arg_mask` (M6.162): clear bits to skip the
+  `s32i jit_arg1` / `movi+s32i jit_arg2` setup when the helper ignores
+  those args. RTS uses mask=0u, BSR mask=1u, CLR.W (An)+ mask=2u.
+  Win: bench 100M `lx7/cyc` 1.182 → 1.180 (-0.17 %, -153K LX7).
+* Memory note `memory/per-helper-sr-mask.md` records the verified-clean
+  helper list and the rule for extending it.
+
+**Remaining work on Item 2:**
+
+* The MOVE-family fast helpers all call `m68k_set_ccr` which is a
+  read-modify-write on `cpu->sr` (preserves T/S/IPL high byte), so
+  they need mask=3u. **Possible refinement**: change MOVE helpers
+  to take the X bit via `jit_arg2` (instead of reading from
+  `cpu->sr`) — then helper can write `cpu->sr` directly without RMW
+  and use mask=2u (skip flush). Estimated 3 LX7 / fire saved.
+* `classify_op` could be extended with per-flag (X/N/Z/V/C) masks so
+  flag-aware fusion patterns (e.g. ADDQ + Bcc.NE) can elide the V/C
+  computation when the next op only consumes Z/N. Out of scope for
+  Item 2 proper; would fall under a future "lazy-flag-bit" item.
+
+Original problem statement (preserved for context):
 `classify_op` already partitions opcodes into SET-only vs SET+CONS for
-the lazy-CC path, but helper-fall-back ops are conservatively treated
-as "consumes + sets everything" — every helper-bridged op forces a
-`emit_sr_flush` and the subsequent inline-arm CC computation can't
-assume any flag is preloaded. A per-op-helper CCR mask (which bits
-*this specific* helper actually reads / writes) would let the JIT:
-
-* skip `emit_sr_flush` before helpers that don't read SR
-* skip the slow-path post-helper `emit_sr_reload` if the helper writes
-  no CCR bits
-* allow the inline emit *after* a helper to keep using preloaded NZVC
-  from a prior inline op if the helper didn't touch them
-
-This wants per-opcode CCR-write/read tables in `m68k_decode_at`'s
-neighbourhood (or a small static table indexed by the 7-bit opcode
-category).
+the lazy-CC path, but helper-fall-back ops were originally treated
+as "consumes + sets everything" — every helper-bridged op forced a
+`emit_sr_flush` and the subsequent inline-arm CC computation couldn't
+assume any flag is preloaded. The M6.158 / M6.162 per-helper masks
+implemented this for the fast-helper path; the `m68k_step` default
+bridge still flushes unconditionally because `m68k_step` can do
+anything.
 
 ### 3. Native block chaining on the ESP32 target
 
