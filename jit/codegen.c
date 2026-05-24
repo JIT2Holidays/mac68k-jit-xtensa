@@ -4740,7 +4740,13 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
              * Speedometer runs a memset-zero loop body that hammers this.
              * Same shape as MOVE.W Dn,(An) but the value is a hard-coded 0,
              * with a 2-byte post-increment on An, and a CLR-specific flag
-             * emit (Z=1, N=V=C=0, X preserved). */
+             * emit (Z=1, N=V=C=0, X preserved).
+             *
+             * M6.161 — slow path now uses the m68k_jit_clr_w_anpi_mmio fast
+             * helper instead of m68k_step. Boot 100M's 0x4258 fires 309
+             * times in real-code path pc=0x4087be (ROM trap dispatcher),
+             * all targeting MMIO. The fast helper skips m68k_step's decode
+             * and doesn't increment cpu->instrs. */
             int an = w & 7;
 
             emit_advance_flush(&e);                  /* before An read */
@@ -4750,14 +4756,20 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             xt_and  (&e, 10, 8, 9);
             emit_cache_flush(&e, &rc);   /* before conditional helper */
             i32 op_pc_clr = 2, op_cyc_clr = 8;
-            /* M6.130 — CLR.W (An)+ modifies only An (post-incr) and CCR. */
+            /* M6.130 — CLR.W (An)+ modifies only An (post-incr) and CCR.
+             * M6.161 — fast helper writes CCR via m68k_set_ccr (RMW on
+             * cpu->sr to preserve X), so we leave g_helper_sr_mask=3u
+             * (default) — flush+reload still needed. */
             g_helper_touched_mask = (u16)(1u << G_A(an));
-            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_clr, op_cyc_clr)));
+            u32 clr_bridge_size = emit_jit_fast_helper_size(&rc);
+            xt_beqz (&e, 10, (i32)(6u + clr_bridge_size));
 
-            /* Helper. */
-            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
-                                              entry_off, &rc, op_pc_clr, op_cyc_clr);
+            /* Fast helper bridge. jit_arg2 = an; jit_arg1 unused. */
+            emit_jit_fast_helper(&e, 8, an,
+                                 lit_off[HELPER_JIT_CLR_W_ANPI_MMIO],
+                                 entry_off, &rc);
             g_helper_touched_mask = 0xFFFFu;
+            (void)op_pc_clr; (void)op_cyc_clr;
             u32 jclr_pos = e.len;
             xt_j    (&e, 4);
 

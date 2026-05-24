@@ -717,6 +717,24 @@ void m68k_jit_move_l_an_to_dn_mmio(m68k_cpu *cpu) {
     m68k_set_ccr(cpu, ccr);
 }
 
+/* M6.161 — CLR.W (An)+ MMIO fast helper. Slow-path conversion of
+ * M6.130's CLR.W (An)+ inline arm (which previously bridged to
+ * m68k_step for the MMIO case). Boot 100M's 0x4258 fires 309 times
+ * (real-code pc=0x4087be in ROM trap dispatcher) — the highest-fire
+ * remaining boot helper that's a slow-path conversion candidate.
+ *
+ * Args: jit_arg2 = an (0..7). jit_arg1 unused.
+ * Semantics: mem.W[An] = 0, An += 2, CCR = X-preserved | Z. */
+void m68k_jit_clr_w_anpi_mmio(m68k_cpu *cpu) {
+    int an = (int)(cpu->jit_arg2 & 7);
+    u32 addr = cpu->a[an];
+    mac_write16(cpu->mem, addr, 0);
+    cpu->a[an] = addr + 2;
+    u8 ccr = m68k_get_ccr(cpu) & CCR_X;
+    ccr |= CCR_Z;
+    m68k_set_ccr(cpu, ccr);
+}
+
 /* M6.137 — F-line trap fast helper. Bench-hot 0xFFFF at 21 808 hits /
  * 100 M cyc (the bench's M6.66-equivalent divergence zone fetches
  * 0xFFFF from unmapped memory, which top-nibble F decodes to line-F).
