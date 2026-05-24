@@ -440,6 +440,43 @@ indicator, not a clean optimization target.** The bench number
 (1.279, the curated Speedometer snapshot) is the cleaner signal —
 it runs the same opcodes regardless of VIA timing.
 
+**M6.61 — measured chain-cache match rate to validate cross-block reg caching.**
+Added `u32 cache_sig` field to m68k_block packing `(rc.active,
+rc.guest[0..3])` as a 32-bit signature. Added
+`disp.chain_cache_matches` counter incremented when a chain hit's
+prev/next blocks have equal cache_sig. Measurements:
+
+| Workload | chain_hits | chain_cache_matches | rate |
+|----------|-----------:|--------------------:|-----:|
+| Bench    | 707 780    | 9 603               | 1.36 % |
+| Boot     | 965 437    | 962 547             | **99.70 %** |
+
+So cross-block register caching is genuinely high-gain on boot (99.7 %
+of chained transitions share cache config — code from contiguous ROM
+regions naturally has identical hot-D/A register pressure) but
+near-useless on bench (Speedometer's tight loops vary register usage
+each block). The disparity confirms the user's #1 high-gain item is
+specifically a *boot* win.
+
+**Implementation strategy (planned, not done):**
+
+The chain epilogue (ESP32) currently does `l32i a11,
+predicted_next->entry_addr; jx a11`. Replace with `l32i a11,
+current_block->predicted_next_entry; jx a11` — same op count, but
+`predicted_next_entry` is precomputed by the dispatcher at chain-
+establish time to be either `next->entry_addr` (full prologue) or
+`next->body_addr` (skip prologue entirely).
+
+`body_addr` = address of first instruction *after* the prologue —
+points inside the existing block, no code duplication needed. Compat
+check at predict time: `cache_sig matches AND (next->sr_loaded ==
+false || prev->sr_loaded == true)`. Need a `u8 sr_loaded` flag on
+m68k_block.
+
+Expected ESP32 gain on boot: 962 K × ~5 ops (cpu_base + jit_ret_pc
+save + sr_reload + cache_load) ≈ 4.8 M ops out of 159 M = **~3 %
+boot win**. Host metric unchanged (chain epilogue ESP32-only).
+
 **Cross-block register caching.** The other unimplemented item.
 M6.10's regcache caches D/A regs *within* a block (loaded at
 prologue, flushed at epilogue). Extending across blocks would

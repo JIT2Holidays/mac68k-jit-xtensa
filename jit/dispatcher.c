@@ -395,6 +395,7 @@ void m68k_dispatcher_run_until(m68k_dispatcher *d, u64 until) {
         if (prev && prev->predicted_next && prev->predicted_next_pc == pc) {
             b = prev->predicted_next;
             d->chain_hits++;
+            if (prev->cache_sig == b->cache_sig) d->chain_cache_matches++;
         } else {
             /* get_block may trigger an arena reset (free_all_blocks)
              * which leaves `prev` dangling. Snapshot the reset counter

@@ -75,6 +75,13 @@ typedef struct m68k_block {
     struct m68k_block *predicted_next;
     u32                predicted_next_pc;
 
+    /* Cache configuration signature: packs (active, guest[0..3]) so two
+     * blocks with identical cache layouts compare equal. Used to gate the
+     * cross-block-cache optimization: when prev->cache_sig == next->cache_sig
+     * the chained successor can skip its prologue cache reload (the values
+     * are still in a4..a7 from prev's execution). 0xFFFF marks "no sig". */
+    u32                cache_sig;
+
     struct m68k_block *hash_next;   /* bucket chain */
 } m68k_block;
 

@@ -3091,6 +3091,16 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
     b->helper_ops = helper_ops;
     b->predicted_next = NULL;
     b->predicted_next_pc = 0xFFFFFFFFu;
+    /* Pack the rc into a u32: low nibble = active count, then 4 nibbles
+     * giving the guest reg (0..15) for slots 0..3 (slot is unused → 0xF). */
+    {
+        u32 sig = (u32)rc.active & 0xFu;
+        for (int s = 0; s < 4; s++) {
+            u32 g = (s < rc.active) ? (rc.guest[s] & 0xFu) : 0xFu;
+            sig |= g << (4 + s * 4);
+        }
+        b->cache_sig = sig;
+    }
     b->hash_next = NULL;
     return b;
 }

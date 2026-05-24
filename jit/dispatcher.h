@@ -39,6 +39,7 @@ typedef struct m68k_dispatcher {
     u64 inline_ops_total;
     u64 chain_hits;
     u64 chain_misses;
+    u64 chain_cache_matches;  /* of chain_hits, how many had prev->cache_sig == next->cache_sig */
     u64 interp_fallbacks;   /* ops run via m68k_step when compile failed */
     u64 arena_resets;
     u64 smc_invalidations;
