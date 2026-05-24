@@ -285,8 +285,63 @@ static void service_hd_insert(mac_mem *m, m68k_cpu *cpu) {
     free(d);
 }
 
+/* Trap-tracing hook installable per env. Logs every line-A Toolbox
+ * trap word + PC + cycle within a [MAC68K_TRACE_FROM, MAC68K_TRACE_TO]
+ * cycle window. Used to diagnose the M6.67 app-launch wall — see if
+ * _Launch (0xA9F2) fires after a Cmd-O on a selected app. */
+static u64 g_trace_from, g_trace_to;
+static u32 g_trace_count;
+static u32 g_trace_max = 200;     /* hard cap to keep log size sane */
+static void trace_trap_hook(m68k_cpu *cpu, u16 trap) {
+    if (cpu->cycles < g_trace_from || cpu->cycles > g_trace_to) return;
+    if (g_trace_count >= g_trace_max) return;
+    g_trace_count++;
+    const char *name = "?";
+    /* A small table of the launch-relevant traps. Most others get '?'. */
+    switch (trap & 0xFBFF) {     /* mask out auto-pop bit */
+        case 0xA9F2: name = "_Launch"; break;
+        case 0xA9F4: name = "_ExitToShell"; break;
+        case 0xA9F0: name = "_LoadSeg"; break;
+        case 0xA9F1: name = "_UnloadSeg"; break;
+        case 0xA9C8: name = "_SysBeep"; break;
+        case 0xA9C0: name = "_FInitQueue"; break;
+        case 0xA970: name = "_GetNextEvent"; break;
+        case 0xA971: name = "_WaitNextEvent"; break;
+        case 0xA978: name = "_KeyTrans"; break;
+        case 0xA93D: name = "_MenuKey"; break;
+        case 0xA938: name = "_MenuSelect"; break;
+        case 0xA94D: name = "_HiliteMenu"; break;
+        case 0xA9D9: name = "_OpenDeskAcc"; break;
+        case 0xA9D0: name = "_FlushVol"; break;
+        case 0xA9A0: name = "_GetResource"; break;
+        case 0xA9A1: name = "_Get1Resource"; break;
+        case 0xA800: name = "_OpenRF"; break;
+        case 0xA260: name = "_FSDispatch"; break;
+        case 0xA1AD: name = "_Gestalt"; break;
+        case 0xA9DC: name = "_SystemTask"; break;
+        case 0xA8E0: name = "_OpenSelection"; break;
+        case 0xA13D: name = "_LaunchControlPanel"; break;
+        case 0xA88F: name = "_OSDispatch"; break;
+    }
+    fprintf(stderr, "[trap] cyc=%llu pc=%06X trap=%04X %s a0=%08X a7=%08X d0=%08X\n",
+            (unsigned long long)cpu->cycles, cpu->pc, trap, name,
+            cpu->a[0], cpu->a[7], cpu->d[0]);
+}
+
 static int scripted_run_file(mac_mem *m, m68k_cpu *cpu, const char *spath) {
     m->serial_sink = NULL;
+    /* M6.X — trap-tracing: enable if MAC68K_TRACE_FROM / _TO are set. */
+    if (getenv("MAC68K_TRACE_FROM") && getenv("MAC68K_TRACE_TO")) {
+        g_trace_from = strtoull(getenv("MAC68K_TRACE_FROM"), NULL, 0);
+        g_trace_to   = strtoull(getenv("MAC68K_TRACE_TO"),   NULL, 0);
+        g_trace_count = 0;
+        if (getenv("MAC68K_TRACE_MAX"))
+            g_trace_max = (u32)strtoul(getenv("MAC68K_TRACE_MAX"), NULL, 0);
+        m68k_trap_hook = trace_trap_hook;
+        fprintf(stderr, "[trap] tracing %llu..%llu (max %u entries)\n",
+                (unsigned long long)g_trace_from, (unsigned long long)g_trace_to,
+                g_trace_max);
+    }
     static script_ev script[256];
     int nev = 0;
     FILE *sf = fopen(spath, "r");
