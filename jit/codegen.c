@@ -355,6 +355,12 @@ static void emit_jit_fast_helper(xt_emit *e, u8 a8_arg1_reg, i32 imm2,
                                  u32 helper_lit_off, u32 entry_off,
                                  regcache *rc) {
     sext_memo_invalidate();
+    /* M6.69 — same compile-time-leak class as M6.68. This helper is
+     * called from the slow-path branch of a beqz/bnez; its emit_sr_flush
+     * is inside that branch but clears g_sr_dirty in the compile-time
+     * state. Snapshot + restore so the fast-path case (where the s16i
+     * never runs) still has the epilogue flush R_SR. */
+    bool was_sr_dirty = g_sr_dirty;
     emit_sr_flush(e);
     xt_s32i(e, a8_arg1_reg, R_CPU, OFF_JIT_ARG1);
     xt_movi(e, 9, imm2);
@@ -364,6 +370,7 @@ static void emit_jit_fast_helper(xt_emit *e, u8 a8_arg1_reg, i32 imm2,
     xt_callx0(e, R_HELP);
     emit_sr_reload(e);
     emit_cache_reload(e, rc);
+    if (was_sr_dirty) g_sr_dirty = true;
 }
 
 /* Size of an emit_load_imm(list) + emit_jit_fast_helper sequence —
