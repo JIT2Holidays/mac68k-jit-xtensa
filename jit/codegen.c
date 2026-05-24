@@ -7153,6 +7153,67 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                  * falling through. M6.131 reset at iter start cleans up. */
                 g_helper_touched_mask = 0u;
             }
+        } else if (top == 0x4 && ((w >> 8) & 0xF) == 0xA && szf == 1
+                   && mode == 5) {
+            /* M6.177 — TST.W (d16,An). thinkc8-folder-open bench's
+             * 0x4A6D at PC=0x3E5760 ~25K hits/100 M. Absent from boot
+             * 100 M and speedo. Sibling of M6.169 TST.B (d16,An) —
+             * same EA shape, same custom-helper MMIO bridge — just
+             * .W instead of .B.
+             *
+             * Length 4 (op + d16), cycles 4 (interp returns early
+             * without +4 for TST). Reads 2 BE bytes from EA, sets
+             * N=bit15, Z=(.W==0), V=C=0, X kept.
+             *
+             * For now use the DEFAULT m68k_step helper for MMIO
+             * (g_helper_touched_mask=0u — flag-only). Adding a
+             * dedicated m68k_jit_tst_w_mmio is M6.178+ work if the
+             * MMIO arm becomes hot. */
+            int an = w & 7;
+            i16 d16 = (i16)mac_read16(cpu->mem, op_pc[i] + 2);
+
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(an), 8);
+            if (d16 >= -128 && d16 <= 127) {
+                xt_addi(&e, 8, 8, d16);
+            } else {
+                emit_load_imm32(&e, 11, 12, (u32)(i32)d16);
+                xt_add(&e, 8, 8, 11);
+            }
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and(&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_tw = 4, op_cyc_tw = 4;
+            g_helper_touched_mask = 0u;
+            xt_beqz(&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_tw, op_cyc_tw)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_tw, op_cyc_tw);
+            g_helper_touched_mask = 0xFFFFu;
+            u32 jtw_pos = e.len;
+            xt_j(&e, 4);
+            /* Fast path: read 2 BE bytes → .W, shift to bit 31, set flags. */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);
+            xt_l8ui (&e, 11, 9, 0);
+            xt_l8ui (&e, 12, 9, 1);
+            xt_slli (&e, 10, 11, 8);
+            xt_or   (&e, 10, 10, 12);              /* a10 = .W (zero-ext) */
+            if (!flags_dead[i]) {
+                xt_slli (&e, 8, 10, 16);            /* .W sign bit to bit 31 */
+                emit_logic_flags(&e, 8);
+            }
+            sext_memo_invalidate();
+            emit_advance(&e, op_pc_tw, op_cyc_tw);
+            u32 here_tw = e.len;
+            i32 jo_tw = (i32)(here_tw - jtw_pos) - 4;
+            u32 jw_tw = ((u32)((u32)jo_tw & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jtw_pos    ] = (u8)jw_tw;
+            base[entry_off + jtw_pos + 1] = (u8)(jw_tw >> 8);
+            base[entry_off + jtw_pos + 2] = (u8)(jw_tw >> 16);
+
+            inline_ops++; done = true;
         } else if (top == 0x4 && ((w >> 8) & 0xF) == 0xA && szf == 0
                    && mode == 5) {
             /* M6.169 — TST.B (d16,An). thinkc8-folder-open bench's
