@@ -1,5 +1,26 @@
 # Status
 
+## M6.116 — classify_op cleanup: LINK/UNLK/PEA/MOVE-USP are flag-neutral (0u)
+
+Several top=0x4 opcodes don't touch CCR but were classified as SET|CONS
+by the default branch. Marking them as 0u (flag-transparent) lets the
+lazy-CC analysis "see through" them — when a hypothetical `MOVE.W ;
+LINK ; <SET-class>` block appears, the MOVE's flag emit is correctly
+marked dead.
+
+Reclassified to 0u:
+* **LINK An,#d16** (0x4E50-0x4E57) — subroutine stack-frame setup
+* **UNLK An**       (0x4E58-0x4E5F) — subroutine stack-frame teardown
+* **PEA <ea>**      (0x4840-0x487F, mode 2..7) — push ea onto SP
+* **MOVE An,USP / USP,An** (0x4E60-0x4E6F) — privileged An↔USP
+
+Also moved STOP (0x4E72) and RTD (0x4E74) into the existing CONS bucket
+alongside RTS/RTE/RTR/JMP/JSR — control flow that preserves CCR for the
+caller / fall-through to read.
+
+**Perf:** ±0 LX7 (these ops aren't preceded by hot inline flag-setters
+in our workloads). Correctness improvement only.
+
 ## M6.115 — classify_op safety: ROXR/ROXL/ABCD/SBCD consume X (SET|CONS)
 
 Safety follow-up to M6.114. Previously top=0x8/0xC/0xE all returned

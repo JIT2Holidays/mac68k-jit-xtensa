@@ -1433,9 +1433,11 @@ static u32 classify_op(u16 w) {
     case 0x4: {
         /* LEA: 0100 ddd 111 mmm rrr. No flags. */
         if (op6 == 7) return 0u;
-        /* JMP/JSR/RTS/RTE/RTR/NOP/STOP — control flow, treat as consumer-only
-         * for our purposes (they keep the CCR you set just before). */
+        /* JMP/JSR/RTS/RTE/RTR/NOP/STOP/RTD — control flow, treat as
+         * consumer-only for our purposes (they keep the CCR you set
+         * just before, for the caller / fall-through to read). */
         if (w == 0x4E75 || w == 0x4E71 || w == 0x4E73 || w == 0x4E77 ||
+            w == 0x4E72 ||                            /* STOP #imm16 */
             (w & 0xFFC0) == 0x4EC0 || (w & 0xFFC0) == 0x4E80) {
             return CONS;
         }
@@ -1458,6 +1460,25 @@ static u32 classify_op(u16 w) {
         if ((w & 0xFB80) == 0x4880 && ((w >> 3) & 7) >= 2) {
             return 0u;
         }
+        /* M6.116 — CCR-neutral subroutine plumbing. Each falls to m68k_step
+         * (no inline arm), but none reads or writes CCR — so classify as
+         * transparent (0u) lets prior-op flag emits be marked dead when
+         * the next SET-class consumer is past this op.
+         *
+         *   LINK An,#d16  (0x4E50-0x4E57) — subroutine stack-frame setup
+         *   UNLK An       (0x4E58-0x4E5F) — subroutine stack-frame teardown
+         *   PEA <ea>      (0x4840-0x487F, mode 2..7) — push ea onto SP
+         *   MOVE USP      (0x4E60-0x4E6F) — privileged An↔USP move
+         *   RTD #d16      (0x4E74)        — return + adjust SP
+         *
+         * Conservative on a few: SWAP/EXT (mode 0) overlaps PEA's hi mask,
+         * so check mode > 1 explicitly. */
+        if ((w & 0xFFF8) == 0x4E50) return 0u;   /* LINK An,#d16 */
+        if ((w & 0xFFF8) == 0x4E58) return 0u;   /* UNLK An */
+        if ((w & 0xFFC0) == 0x4840 && ((w >> 3) & 7) > 1) return 0u; /* PEA */
+        if ((w & 0xFFF0) == 0x4E60) return 0u;   /* MOVE An,USP / USP,An */
+        /* RTD #d16 — like RTS, control flow that preserves CCR for caller. */
+        if (w == 0x4E74) return CONS;
         return SET | CONS;
     }
     case 0x5:                              /* ADDQ/SUBQ/Scc/DBcc */
