@@ -2481,9 +2481,62 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                 inline_ops++; done = true;
             }
         } else if (top == 0x2 && mode == 0 && ((w >> 6) & 7) == 0) {
-            /* MOVE.L Dm,Dn */
-            emit_move_l_dd(&e, (w >> 9) & 7, w & 7, flags_dead[i], &rc);
-            inline_ops++; done = true;
+            /* MOVE.L Dm,Dn — with M6.147 Bcc.S fusion sibling of M6.95
+             * TST.L+Bcc. MOVE.L Dm,Dn sets N from bit 31 of Dn (=Dm), Z
+             * from (Dn == 0), V=C=0, X preserved. Pass Dn (= shifted by
+             * 0) as s=d=r to emit_cmp_cond_fused: with s==d, the V term
+             * (s^d)&(d^r) collapses to 0, leaving N=bit31(r) and
+             * Z=(r==0) — exactly MOVE.L's CCR convention. */
+            int dn = (w >> 9) & 7;
+            int dm = w & 7;
+            bool fuse = false;
+            int fuse_cc = 0;
+            i32 fuse_disp = 0;
+            u32 fuse_ft = 0;
+            if (i + 1 < n_ops) {
+                u16 nw = op_word[i + 1];
+                if ((nw >> 12) == 0x6) {
+                    int cc = (nw >> 8) & 0xF;
+                    i32 disp = (i8)(nw & 0xFF);
+                    if ((cc == 6 || cc == 7 || cc == 13 || cc == 15) && disp != 0 && disp != -1) {
+                        fuse = true;
+                        fuse_cc = cc;
+                        fuse_disp = disp;
+                        fuse_ft = op_pc[i + 1] + 2;
+                    }
+                }
+            }
+
+            if (fuse) {
+                /* emit_bcc_branchless_tail overwrites cpu->pc directly
+                 * (single s32i, no l32i+add) — flush g_pc_acc first. */
+                emit_advance_flush(&e);
+                /* Perform the MOVE: read Dm into Dn's cache slot (or
+                 * scratch + s32i if Dn isn't cached). */
+                int xt_dst = cache_lookup(&rc, G_D(dn));
+                u8 dst = (xt_dst >= 0) ? (u8)xt_dst : 9;   /* a9, NOT a8
+                                                            * — emit_cmp_cond_fused
+                                                            * writes cond into a8 */
+                emit_read_g(&e, &rc, G_D(dm), dst);
+                if (xt_dst >= 0) {
+                    for (int s = 0; s < rc.active; s++)
+                        if (rc.guest[s] == (u8)G_D(dn)) { rc.dirty |= (u16)(1u << s); break; }
+                } else {
+                    xt_s32i(&e, dst, R_CPU, OFF_D(dn));
+                }
+                emit_cmp_cond_fused(&e, fuse_cc, dst, dst, dst);
+                /* MOVE.L base 4 + Bcc.S base 12 = 16 cycles folded
+                 * (matches M6.95 TST.L+Bcc, since MOVE.L Dn cycles == 4
+                 * same as TST.L Dn in m68k_interp). */
+                emit_bcc_branchless_tail(&e, fuse_ft, fuse_disp, 16);
+                g_pc_acc = 0;
+                g_cyc_acc = 0;
+                i++;   /* skip absorbed Bcc.S */
+                inline_ops++; done = true;
+            } else {
+                emit_move_l_dd(&e, dn, dm, flags_dead[i], &rc);
+                inline_ops++; done = true;
+            }
         } else if (top == 0x2 && ((w >> 6) & 7) == 1 && mode <= 1) {
             /* M6.85 — Peek for fusion: MOVEA.L <Dm|Am>,Am followed by
              * ADDA.W <Dx|Ax>,Am (same Am). If the op after the ADDA is
