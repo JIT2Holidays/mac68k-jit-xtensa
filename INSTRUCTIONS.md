@@ -1,6 +1,6 @@
 # 68000 Instruction Coverage in the JIT
 
-State at **M6.153**. This document inventories every 68000 instruction
+State at **M6.157**. This document inventories every 68000 instruction
 class the JIT recognises in `jit/codegen.c` and the translation strategy
 used. The Mac Plus is plain MC68000 — no 68010/020+ extensions (BFEXTU,
 MOVES, divs.l etc.) — so the table below is the complete ISA target.
@@ -104,7 +104,7 @@ m68k_step rows are mostly rare-fire system / exception ops.
 | `SUB Dm,Dn` | .B / .W / .L | reg-reg | ✅ | M5.1 / M6.112 | |
 | `SUB (An),Dn` etc. | .W / .L | bridge | 🪝 | M5.8 | |
 | `SUBA.W #imm,An` | .W | imm.W → An | ✅ | M5.3 | |
-| `SUBA.L Dn/Am,An` | .L | reg → An | 🐢 | — | **sibling of M6.152 — not yet inlined** |
+| `SUBA.L Dn/Am,An` | .L | reg → An | ✅ | M6.157 | sibling of M6.152 ADDA.L |
 | `SUBI #imm,EA` | .B / .W / .L | | ✅ | M5.2 | |
 | `SUBQ.W #imm,Dn` | .W | | ✅ | M5.6 | |
 | `SUBQ.L #imm,Dn` | .L | | ✅ | M5.2 | |
@@ -129,7 +129,7 @@ m68k_step rows are mostly rare-fire system / exception ops.
 | `OR (xxx).W,Dn` | .L | abs.W → Dn | ⚡ | M6.111 | |
 | `EOR Dn,Dm` | .B / .W / .L | reg-reg | ✅ | M5.1 / M6.100 | |
 | `EOR Dn,(An)` etc. | — | reg→mem | 🐢 | — | M6.145 attempt reverted |
-| `NOT Dn` | .B / .W / .L | reg | 🐢 | — | bench-hot 0x4641 (36 fires) — sibling candidate |
+| `NOT Dn` | .B / .W / .L | reg | ✅ | M6.156 | bench 0x4641 NOT.W D1 (36 fires); sibling of M6.139 CLR |
 | `ANDI/ORI/EORI #imm,Dn` | .B/.W/.L | imm → Dn | ✅ | M5.2 | |
 | `ANDI/ORI/EORI to-CCR/SR` | — | — | 🐢 | — | privileged for SR; CCR rare |
 | `ORI.B #imm,(d16,An)` | .B | imm → MMIO | ⚡ | M6.31 | `m68k_jit_ori_b_mmio` |
@@ -165,7 +165,7 @@ and bit 5 selects immediate vs Dm-source count.
 |----------|:---------:|:-----:|:-----:|----------:|-------|
 | `ASR #imm,Dn` | right | .B / .W / .L | ✅ | M6.97-99 | |
 | `ASL #imm,Dn` | left | .B / .W | ✅ | M6.151 | V flag via top-bits XOR self-test |
-| `ASL.L #imm,Dn` | left | .L | 🐢 | — | **boot-hot 0xE181 (120 fires) — sibling of M6.151** |
+| `ASL.L #imm,Dn` | left | .L | ✅ | M6.155 | sibling of M6.151; in-place 32-bit |
 | `LSR #imm,Dn` | right | .B / .W / .L | ✅ | M6.97-99 | |
 | `LSL #imm,Dn` | left | .B / .W / .L | ✅ | M6.146 | |
 | `ROR #imm,Dn` | right | .B / .W / .L | ✅ | M6.150 | |
@@ -260,10 +260,15 @@ Sorted by likely win, accounting for trajectory-safety
 
 | Candidate | Boot 100M fires | Bench fires | Why |
 |-----------|----------------:|-------------:|-----|
-| `ASL.L #imm,Dn` | 120 (`0xE181`) | small | Sibling of M6.151 ASL.B/W and M6.146 LSL.L |
-| `SUBA.L Dn/Am,An` | small | tiny | Sibling of M6.152 ADDA.L |
-| `NOT Dn` | tiny | 36 (`0x4641`) | Pure register-op |
-| ~~`BSET / BCLR / BCHG #imm,Dn`~~ | ~~390~~ | — | ✅ Landed as M6.154 (-434 boot 100M helpers) |
+| ~~`BSET / BCLR / BCHG #imm,Dn`~~ | ~~390~~ | — | ✅ M6.154 (-434 boot 100M helpers) |
+| ~~`ASL.L #imm,Dn`~~ | ~~120~~ | — | ✅ M6.155 (-124 boot 100M helpers) |
+| ~~`NOT Dn`~~ | — | ~~36~~ | ✅ M6.156 (-66 bench helpers) |
+| ~~`SUBA.L Dn/Am,An`~~ | — | — | ✅ M6.157 (-11 bench, -6 boot helpers) |
+
+**The pure-register-op shopping list is empty.** Remaining opportunities
+are in the harder categories: dynamic-Dm shift count (`0xEAA8 LSR.L
+D5,D0` 190 bench fires), multi-step fusion, and the structural items
+(per-helper CCR mask). See the "Structural items" subsection.
 
 ### Compile-time fusion (safe — emits no new runtime code)
 

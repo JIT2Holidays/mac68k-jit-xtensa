@@ -2623,6 +2623,46 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             }
             emit_advance(&e, 2, 12);
             inline_ops++; done = true;
+        } else if (top == 0x9 && szf == 3 && ((w >> 8) & 1) && mode <= 1) {
+            /* M6.157 — SUBA.L <Dm|Am>,An — full 32-bit subtract from An,
+             * no sign-extension. Sibling of M6.152 ADDA.L (top=0xD).
+             * Pure register-op, no bridge.
+             *
+             * Boot 100M shows zero fires of the SUBA.L family in the
+             * top-20 histo, so this is a "trajectory-strictly-absent"
+             * extension — same safety category as M6.156 NOT (also
+             * absent from boot 100M). The lift on real workloads will
+             * be tiny but the arm is structurally free now that ADDA.L
+             * is in place.
+             *
+             * Semantics: An -= src.L (no sign-extension, full 32-bit).
+             * Cycles: 12 (same as ADDA.L per m68k_interp's flat-8 SUBA
+             * handler + base 4). No CCR effect. */
+            int an = (w >> 9) & 7;
+            int src_reg_id = w & 7;
+            int g_src = (mode == 1) ? G_A(src_reg_id) : G_D(src_reg_id);
+
+            int xt_dst = cache_lookup(&rc, G_A(an));
+            if (xt_dst >= 0) {
+                u8 src_xt;
+                int xt_src = cache_lookup(&rc, g_src);
+                if (xt_src >= 0) {
+                    src_xt = (u8)xt_src;
+                } else {
+                    emit_read_g(&e, &rc, g_src, 8);
+                    src_xt = 8;
+                }
+                xt_sub(&e, (u8)xt_dst, (u8)xt_dst, src_xt);
+                for (int s = 0; s < rc.active; s++)
+                    if (rc.guest[s] == (u8)G_A(an)) { rc.dirty |= (u16)(1u << s); break; }
+            } else {
+                emit_read_g(&e, &rc, g_src, 8);
+                emit_read_g(&e, &rc, G_A(an), 9);
+                xt_sub(&e, 10, 9, 8);
+                xt_s32i(&e, 10, R_CPU, OFF_A(an));
+            }
+            emit_advance(&e, 2, 12);
+            inline_ops++; done = true;
         } else if ((top == 0xD || top == 0x9) && szf == 3 && !((w >> 8) & 1)
                    && mode == 7 && (w & 7) == 4) {
             /* ADDA.W / SUBA.W #imm16,An — boot-hot 0xD0FC.  mode 7/4 = #imm. */
