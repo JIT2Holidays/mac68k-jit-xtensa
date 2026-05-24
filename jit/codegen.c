@@ -2487,6 +2487,105 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + jlan_pos + 2] = (u8)(jw_lan >> 16);
 
             inline_ops++; done = true;
+        } else if (top == 0x2 && ((w >> 6) & 7) == 0 && mode == 7 && (w & 7) == 0) {
+            /* M6.108 — MOVE.L (xxx).W,Dn — bench-hot 0x2438 at 21 K helpers /
+             * 100 M cyc (in the bench's post-cycle-11898 path). The .W
+             * absolute address is a signed 16-bit ext word, so its 24-bit
+             * range is [0, 0x7FFF] (low RAM globals) or [0xFF8000,
+             * 0xFFFFFE] (high MMIO). Sibling of M6.77's TST.B (xxx).W —
+             * static RAM check at compile time, helper bridge for MMIO.
+             *
+             * For Mac Plus init code, low-RAM globals at 0x000xxx are
+             * heavily used; bench's 100 M path hits these via this
+             * encoding. Length 4 (op + abs.W ext), cycles 8. */
+            int dn = (w >> 9) & 7;
+            u16 ext = mac_read16(cpu->mem, op_pc[i] + 2);
+            u32 abs_addr = (u32)(i32)(i16)ext;
+            abs_addr &= 0xFFFFFFu;
+
+            u32 ram_size = cpu->mem ? cpu->mem->ram_size : 0;
+            bool overlay = cpu->mem ? cpu->mem->overlay : true;
+            bool ram_pow2 = ram_size > 0 && (ram_size & (ram_size - 1)) == 0;
+            bool addr_in_ram = !overlay && ram_pow2
+                               && abs_addr < ram_size
+                               && (abs_addr & 1) == 0;  /* .L needs even */
+
+            if (addr_in_ram) {
+                emit_advance_flush(&e);
+                emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                             entry_off + e.len);
+                if ((i32)abs_addr >= -128 && (i32)abs_addr <= 127) {
+                    xt_addi(&e, 9, 9, (i32)abs_addr);
+                } else if ((i32)abs_addr >= -2048 && (i32)abs_addr <= 2047) {
+                    xt_movi(&e, 10, (i32)abs_addr);
+                    xt_add (&e, 9, 9, 10);
+                } else {
+                    emit_load_imm(&e, 10, 11, abs_addr);
+                    xt_add (&e, 9, 9, 10);
+                }
+                /* Read 4 BE bytes into a10 (.L value). */
+                xt_l8ui (&e, 11, 9, 0);
+                xt_l8ui (&e, 12, 9, 1);
+                xt_slli (&e, 10, 11, 24);
+                xt_slli (&e, 12, 12, 16);
+                xt_or   (&e, 10, 10, 12);
+                xt_l8ui (&e, 11, 9, 2);
+                xt_l8ui (&e, 12, 9, 3);
+                xt_slli (&e, 11, 11, 8);
+                xt_or   (&e, 10, 10, 11);
+                xt_or   (&e, 10, 10, 12);          /* a10 = .L */
+                emit_write_g(&e, &rc, G_D(dn), 10);
+                if (!flags_dead[i]) emit_logic_flags(&e, 10);
+                emit_advance(&e, 4, 8);
+                inline_ops++; done = true;
+            }
+            /* else: fall through to helper. */
+        } else if (top == 0x2 && ((w >> 6) & 7) == 1 && mode == 7 && (w & 7) == 0) {
+            /* M6.108 — MOVEA.L (xxx).W,Am — sibling of MOVE.L (xxx).W,Dn
+             * but writes to An (MOVEA never touches CCR). Bench-warm
+             * 0x2078 (MOVEA.L (xxx).W,A0) appears at 84 helpers in 20 M cyc
+             * and likely more in the 100 M post-divergence path. */
+            int an = (w >> 9) & 7;
+            u16 ext = mac_read16(cpu->mem, op_pc[i] + 2);
+            u32 abs_addr = (u32)(i32)(i16)ext;
+            abs_addr &= 0xFFFFFFu;
+
+            u32 ram_size = cpu->mem ? cpu->mem->ram_size : 0;
+            bool overlay = cpu->mem ? cpu->mem->overlay : true;
+            bool ram_pow2 = ram_size > 0 && (ram_size & (ram_size - 1)) == 0;
+            bool addr_in_ram = !overlay && ram_pow2
+                               && abs_addr < ram_size
+                               && (abs_addr & 1) == 0;
+
+            if (addr_in_ram) {
+                emit_advance_flush(&e);
+                emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                             entry_off + e.len);
+                if ((i32)abs_addr >= -128 && (i32)abs_addr <= 127) {
+                    xt_addi(&e, 9, 9, (i32)abs_addr);
+                } else if ((i32)abs_addr >= -2048 && (i32)abs_addr <= 2047) {
+                    xt_movi(&e, 10, (i32)abs_addr);
+                    xt_add (&e, 9, 9, 10);
+                } else {
+                    emit_load_imm(&e, 10, 11, abs_addr);
+                    xt_add (&e, 9, 9, 10);
+                }
+                xt_l8ui (&e, 11, 9, 0);
+                xt_l8ui (&e, 12, 9, 1);
+                xt_slli (&e, 10, 11, 24);
+                xt_slli (&e, 12, 12, 16);
+                xt_or   (&e, 10, 10, 12);
+                xt_l8ui (&e, 11, 9, 2);
+                xt_l8ui (&e, 12, 9, 3);
+                xt_slli (&e, 11, 11, 8);
+                xt_or   (&e, 10, 10, 11);
+                xt_or   (&e, 10, 10, 12);
+                emit_write_g(&e, &rc, G_A(an), 10);
+                /* MOVEA — no flags. */
+                emit_advance(&e, 4, 8);
+                inline_ops++; done = true;
+            }
+            /* else: fall through to helper. */
         } else if (top == 0x2 && ((w >> 6) & 7) == 1 && mode == 2) {
             /* M6.103 — MOVEA.L (An),Am — boot-warm 0x2050 (MOVEA.L (A0),A0)
              * at 390 helpers / 100 M cyc. Sibling of M6.101's

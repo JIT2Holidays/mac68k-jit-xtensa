@@ -1,5 +1,57 @@
 # Status
 
+## M6.108 — MOVE.L / MOVEA.L (xxx).W → Dn/An — bench 100 M crosses 5.08 × interp
+
+The (xxx).W absolute-addressing source mode reads a signed 16-bit
+address from the ext word, sign-extended to 24-bit RAM space. Range
+is [0, 0x7FFF] (low-RAM Mac globals) or [0xFF8000, 0xFFFFFE] (high MMIO).
+For the RAM half, the static address is compile-time known and we can
+inline the .L read directly — same pattern as M6.77's TST.B (xxx).W.
+
+Two new arms:
+
+* **MOVE.L (xxx).W,Dn** — bench-hot 0x2438 at 21 K helpers / 100 M cyc
+  on the bench's post-cycle-11898 path
+* **MOVEA.L (xxx).W,Am** — sibling, no flags
+
+Both use the M6.77 compile-time RAM check: if the abs address fits in
+RAM (`abs_addr < ram_size` and 2-aligned), emit the inline 4-byte read.
+Else fall through to the helper bridge.
+
+Bench's post-M6.66-divergence code path uses low-RAM globals heavily
+through these absolute-address forms (Mac OS variables at 0x000xxx).
+Each helper saved is ~50 LX7 (helper-bridge cost minus inline emit),
+times 21 K = ~1.1 M LX7 / 100 M cyc.
+
+**Triple-diff workflow:**
+
+* ctest: 7/7
+* `--diff-jit-trace`: clean through 11 038 cycles
+* Boot 5 M det: 139 helpers unchanged
+* Boot 100 M: 185 612 → 185 126 (−486, mostly low-RAM globals)
+  no cycle drift
+* Bench (20 M): 6 828 → 6 705 (−123)
+* Bench (100 M): 204 807 → 183 084 (**−21 723**)
+
+**Perf:**
+
+| Workload | M6.107 | **M6.108** | Δ |
+|----------|------:|----------:|--:|
+| Bench (20 M)     | 1.177 lx7/cyc | **1.177** | unchanged |
+| **Bench (100 M)** | 1.281 lx7/cyc | **1.271 lx7/cyc** | **−0.78 %** lx7 |
+| Boot @ 100 M cyc | 1.716 lx7/cyc | **1.716** | within noise |
+
+🎯 **Bench 100 M crosses 5.08 × interp** — third consecutive
+100-M-bench-improvement in this iteration (after M6.105 BSR.W
+crossing 5.00 × and M6.107 LEA (d16,PC) crossing 5.04 ×).
+
+Cumulative M6.84 → M6.108:
+* Bench (20 M): 1.257 → **1.177** (−6.4 %)
+* Bench (100 M): 1.396 → **1.271** (−9.0 %)
+* Boot 300 K det: 2.170 → **1.975** (−9.0 %)
+* Boot 5 M det:   2.471 → **2.236** (−9.5 %)
+* Boot 100 M:     1.734 → **1.716** (−1.0 %)
+
 ## M6.107 — LEA (d16,PC),An inline — bench 100 M crosses 5.04 × interp
 
 The existing LEA arm covered srcmode 2/5/6/7-0/7-1 but not mode 7/2
@@ -1077,12 +1129,12 @@ them each iteration.
    intermediate register writeback. See M6.85 below for the first
    fusion lever in this class.
 
-## Where things stand right now (post-M6.107)
+## Where things stand right now (post-M6.108)
 
 | Engine | lx7 / cyc | × interp baseline |
 |--------|----------:|------------------:|
 | **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.177** | **5.49 ×** ✅ |
-| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.281** | **5.04 ×** ✅ |
+| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.271** | **5.08 ×** ✅ |
 | **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.716** | **3.45 ×** |
 | **Boot** (Mac Plus ROM, 5 M cycles, PC=`0x40032C` deterministic)    | **2.236** | **2.64 ×** |
 | **Boot** (Mac Plus ROM, 300 K cycles, PC=`0x40032C` deterministic)  | **1.975** | **2.99 ×** |
