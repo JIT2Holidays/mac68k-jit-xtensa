@@ -4581,22 +4581,32 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             sext_memo_invalidate();
             inline_ops++; done = true;
         } else if (top == 0x5 && szf == 3 && mode == 1
-                   && (((w >> 8) & 0xF) == 1 || ((w >> 8) & 0xF) == 6)) {
-            /* DBF / DBNE Dn, disp16 — boot's two big DBcc helpers.
+                   && (((w >> 8) & 0xF) == 1 || ((w >> 8) & 0xF) == 6
+                       || ((w >> 8) & 0xF) == 7)) {
+            /* DBF / DBNE / DBEQ Dn, disp16 — bench/boot DBcc cases.
              *   DBF (cc=1):   always decrement+branch.
              *   DBNE (cc=6):  if Z==0 (NE true), fall through.
              *                 Else (Z==1), decrement+branch.
+             *   DBEQ (cc=7):  if Z==1 (EQ true), fall through.
+             *                 Else (Z==0), decrement+branch.
              *
              *   if !cond_true: Dn.W = Dn.W - 1;
              *                  pc = (Dn.W != -1) ? op_pc+2+disp16 : op_pc+4;
              *   else:          pc = op_pc + 4;
-             *   cycles += 14 (unconditional). */
+             *   cycles += 14 (unconditional).
+             *
+             * DBEQ added in M6.102: bench-warm 0x57CD (DBEQ D5,disp16) at
+             * 236 helpers / 20 M cyc. The "Z test direction" differs from
+             * DBNE — DBEQ exits when Z=1, DBNE exits when Z=0. Just flips
+             * a bnez↔beqz in the dec-skip and cond-compute logic. */
             int cc = (w >> 8) & 0xF;
             int dn = w & 7;
             i16 disp16 = (i16)mac_read16(cpu->mem, op_pc[i] + 2);
             u32 ft = op_pc[i] + 4;
             i32 disp_for_tail = (i32)disp16 - 2;
             bool is_dbne = (cc == 6);
+            bool is_dbeq = (cc == 7);
+            bool has_z_test = is_dbne || is_dbeq;
 
             i32 extra_cyc = g_cyc_acc;
             g_pc_acc = 0;
@@ -4610,25 +4620,36 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             xt_slli (&e, 10, 10, 16);
             xt_extui(&e, 12, 9, 0, 15);
             xt_or   (&e, 10, 10, 12);
-            /* 3. For DBNE only: if Z=0 (NE true), restore a10 = Dn_old to skip dec. */
-            if (is_dbne) {
+            /* 3. For DBNE/DBEQ: if exit-condition true, restore a10 = Dn_old
+             *    to skip the decrement.
+             *    DBNE exits on Z=0; DBEQ exits on Z=1. */
+            if (has_z_test) {
                 xt_extui(&e, 13, R_SR, 2, 0);   /* a13 = Z (0 or 1) */
-                xt_bnez (&e, 13, 6);            /* if Z != 0 (NE false), keep a10 */
-                xt_mov  (&e, 10, 11);           /* Z == 0 (NE true) → restore old */
+                if (is_dbne) {
+                    xt_bnez (&e, 13, 6);        /* Z != 0 (NE false): keep decremented */
+                } else {  /* DBEQ */
+                    xt_beqz (&e, 13, 6);        /* Z == 0 (EQ false): keep decremented */
+                }
+                xt_mov  (&e, 10, 11);           /* exit-true: restore old (no dec) */
             }
             /* 4. Write Dn from a10. */
             emit_write_g(&e, &rc, G_D(dn), 10);
             /* 5. Cond_branch compute:
              *    DBF: cond = (old_dn.W != 0) ? 1 : 0.
-             *    DBNE: cond = (Z=1) AND (old_dn.W != 0). */
+             *    DBNE: cond = (Z=1, i.e. NE false) AND (old_dn.W != 0).
+             *    DBEQ: cond = (Z=0, i.e. EQ false) AND (old_dn.W != 0). */
             xt_extui(&e, 12, 11, 0, 15);        /* a12 = old_dn.W */
-            if (is_dbne) {
+            if (has_z_test) {
                 /* a13 still holds Z from step 3. */
                 xt_movi(&e, 8, 0);              /* default cond = 0 */
-                xt_beqz(&e, 13, 12);            /* Z==0 → cond stays 0 (skip 3 ops) */
-                xt_movi(&e, 8, 1);              /* Z=1 → assume cond = 1 */
-                xt_bnez(&e, 12, 6);             /* not done → skip */
-                xt_movi(&e, 8, 0);              /* done → cond = 0 */
+                if (is_dbne) {
+                    xt_beqz(&e, 13, 12);        /* Z==0 → cond stays 0 */
+                } else {  /* DBEQ */
+                    xt_bnez(&e, 13, 12);        /* Z!=0 → cond stays 0 */
+                }
+                xt_movi(&e, 8, 1);              /* assume cond = 1 */
+                xt_bnez(&e, 12, 6);             /* old_dn.W != 0 → keep cond=1 */
+                xt_movi(&e, 8, 0);              /* old_dn.W == 0 → cond = 0 */
             } else {
                 xt_movi(&e, 8, 1);              /* default cond = 1 (not done) */
                 xt_bnez(&e, 12, 6);             /* if old_dn.W != 0, keep cond=1 */

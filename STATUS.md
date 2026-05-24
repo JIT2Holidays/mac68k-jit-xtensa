@@ -1,5 +1,53 @@
 # Status
 
+## M6.102 — DBEQ inline (bench 100 M −1.1 %)
+
+Extends the M6.38 DBcc inline (which previously handled cc=1 (DBF) and
+cc=6 (DBNE)) to also cover cc=7 (DBEQ). The difference is a single
+bnez↔beqz swap on the Z-bit test in the dec-skip and cond-compute
+logic:
+
+* DBNE exits the loop when Z=0 (NE true) → skip dec, cond=0
+* DBEQ exits the loop when Z=1 (EQ true) → skip dec, cond=0
+* DBF never exits → always dec+branch
+
+Bench has 0x57CD (DBEQ D5,disp16) at 236 helpers / 20 M cyc. At 100 M
+cyc, those scale up — and the inline-arm path also keeps the JIT chain
+hot (no helper round-trip), which compounds across the bench's longer
+post-cycle-11898 loop iterations.
+
+**Triple-diff workflow:**
+
+* ctest: 7/7
+* `--diff-jit-trace`: clean through 11 038 cycles
+* Boot 300 K / 5 M / 100 M det: byte-identical (no DBEQ on these paths)
+* Boot 100 M: 186 390 → 186 390 (unchanged — no DBEQ in boot's path)
+  — confirms no cycle-drift trap (the M6.101 lesson holds)
+* Bench (20 M): 7 702 → 7 462 (−240 compile-time helpers)
+* Bench (100 M): noteworthy lx7/cyc drop
+
+**Perf:**
+
+| Workload | M6.101 | **M6.102** | Δ |
+|----------|------:|----------:|--:|
+| Bench (20 M)     | 1.179 lx7/cyc | **1.179** | unchanged |
+| Bench (100 M)    | 1.328 lx7/cyc | **1.314 lx7/cyc** | **−1.1 %** lx7 |
+| Boot @ any       | unchanged | unchanged | — |
+
+The 20 M bench didn't move at lx7/cyc resolution because DBEQ's runtime
+hit count there is modest, and the saved helpers' LX7 (~50 each × 236)
+are below the 0.1 % threshold. At 100 M the bench's DBEQ count grows
+to ~1 200, and **more importantly the inline DBEQ keeps the JIT chain
+unbroken**: each helper-fallback would have returned to the dispatcher,
+re-prologued, and lost any cache_sig match. Inline → chain stays hot.
+
+Cumulative M6.84 → M6.102:
+* Bench (20 M): 1.257 → **1.179** (−6.2 %)
+* Bench (100 M): 1.396 → **1.314** (−5.9 %)
+* Boot 300 K det: 2.170 → **1.975** (−9.0 %)
+* Boot 5 M det:   2.471 → **2.236** (−9.5 %)
+* Boot 100 M:     1.734 → **1.717** (−0.98 %)
+
 ## M6.101 — MOVE.B Dm,Dn + TST.B Dn + MOVE.L (An),Dn inline (delivered)
 
 Three small bench-warm inline expansions captured by the helper-histo
@@ -802,12 +850,12 @@ them each iteration.
    intermediate register writeback. See M6.85 below for the first
    fusion lever in this class.
 
-## Where things stand right now (post-M6.101)
+## Where things stand right now (post-M6.102)
 
 | Engine | lx7 / cyc | × interp baseline |
 |--------|----------:|------------------:|
 | **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.179** | **5.48 ×** ✅ |
-| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.328** | **4.87 ×** |
+| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.314** | **4.92 ×** |
 | **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.717** | **3.44 ×** |
 | **Boot** (Mac Plus ROM, 5 M cycles, PC=`0x40032C` deterministic)    | **2.236** | **2.64 ×** |
 | **Boot** (Mac Plus ROM, 300 K cycles, PC=`0x40032C` deterministic)  | **1.975** | **2.99 ×** |
