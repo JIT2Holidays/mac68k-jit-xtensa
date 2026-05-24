@@ -2145,12 +2145,16 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             emit_cache_flush(&e, &rc);
             /* Helper modifies cpu->pc, cpu->sr, cpu->a[7], cpu->ssp/usp. */
             g_helper_touched_mask = (u16)(1u << G_A(7));
-            /* The fast helper takes no args — emit_jit_fast_helper writes
-             * jit_arg1/jit_arg2 anyway but the helper ignores them. */
+            /* M6.163 — m68k_jit_fline_trap takes no args (just calls
+             * m68k_exception(11)). Clear arg_mask to skip both
+             * jit_arg1 / jit_arg2 setup. Saves 9 LX7 per fire. Bench's
+             * 0xFFFF fires 21 808 times / 100M cyc — ~196 K LX7 saved. */
+            g_helper_arg_mask = 0u;
             emit_jit_fast_helper(&e, 8, 0,
                                  lit_off[HELPER_JIT_FLINE_TRAP],
                                  entry_off, &rc);
             g_helper_touched_mask = 0xFFFFu;
+            g_helper_arg_mask = 3u;
             /* pc_delta = 0: helper sets cpu->pc to vector 11 directly.
              * cyc_delta = 4: m68k_step base 4; m68k_exception adds 34. */
             emit_advance(&e, 0, 4);
