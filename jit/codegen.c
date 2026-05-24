@@ -3930,6 +3930,87 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + jdr_pos + 2] = (u8)(jw_dr >> 16);
 
             inline_ops++; done = true;
+        } else if (top == 0x3 && ((w >> 6) & 7) == 0 && mode == 5) {
+            /* M6.171 — MOVE.W (d16,An),Dn. thinkc8-folder-open bench's
+             * 0x302D/0x322D at PC=0x3E5700/0x3E5720 (Finder linked-list
+             * walk, same loop as M6.169 TST.B + M6.170 CMPA.L). ~50K
+             * helpers each = 100 K total. Both opcodes absent from
+             * speedo and boot 100 M — M6.142 trajectory-safe.
+             *
+             * Sibling of:
+             *   - M6.73 MOVE.L (d16,An),Dn (line above): same EA shape,
+             *     but reads 2 bytes instead of 4, partial Dn write.
+             *   - M6.109 MOVE.W (xxx).W,Dn (later): same .W-into-Dn
+             *     merge pattern, but with compile-time abs address.
+             *
+             * Length 4, cycles 8 (base 4 + handler 4). MOVE writes
+             * only Dn[15:0] preserving Dn[31:16]; MOVE-family flags
+             * (N from bit 15, Z from .W == 0, V=C=0, X kept). */
+            int dn = (w >> 9) & 7;
+            int an = w & 7;
+            u16 ext = mac_read16(cpu->mem, op_pc[i] + 2);
+            i32 d16 = (i16)ext;
+
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(an), 8);
+            if (d16 >= -128 && d16 <= 127) {
+                xt_addi(&e, 8, 8, d16);
+            } else {
+                emit_load_imm(&e, 11, 12, (u32)d16);
+                xt_add(&e, 8, 8, 11);
+            }
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_mwd = 4, op_cyc_mwd = 8;
+            /* MOVE.W (d16,An),Dn writes only Dn — set narrow mask. */
+            g_helper_touched_mask = (u16)(1u << G_D(dn));
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_mwd, op_cyc_mwd)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_mwd, op_cyc_mwd);
+            g_helper_touched_mask = 0xFFFFu;
+            u32 jmwd_pos = e.len;
+            xt_j    (&e, 4);
+            /* Fast path: read 2 BE bytes → .W in a10. */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);
+            xt_l8ui (&e, 11, 9, 0);
+            xt_l8ui (&e, 12, 9, 1);
+            xt_slli (&e, 10, 11, 8);
+            xt_or   (&e, 10, 10, 12);              /* a10 = .W (zero-ext) */
+
+            /* Merge into Dn[15:0] preserving Dn[31:16]. Cache-direct
+             * path when Dn is cached (sibling of M6.109). */
+            int dn_xt = cache_lookup(&rc, G_D(dn));
+            u8 dn_reg = (dn_xt >= 0) ? (u8)dn_xt : 11;
+            if (dn_xt < 0) emit_read_g(&e, &rc, G_D(dn), 11);
+            xt_srli(&e, dn_reg, dn_reg, 16);
+            xt_slli(&e, dn_reg, dn_reg, 16);
+            xt_or  (&e, dn_reg, dn_reg, 10);
+            if (dn_xt >= 0) {
+                for (int s = 0; s < rc.active; s++)
+                    if (rc.guest[s] == (u8)G_D(dn)) { rc.dirty |= (u16)(1u << s); break; }
+            } else {
+                emit_write_g(&e, &rc, G_D(dn), 11);
+            }
+            if (!flags_dead[i]) {
+                /* Shift .W to bit 31 so emit_logic_flags sees the .W
+                 * sign bit at bit 31 (matches .B/.W/.L convention). */
+                xt_slli(&e, 8, 10, 16);
+                emit_logic_flags(&e, 8);
+            }
+            emit_advance(&e, op_pc_mwd, op_cyc_mwd);
+
+            u32 here_mwd = e.len;
+            i32 jo_mwd = (i32)(here_mwd - jmwd_pos) - 4;
+            u32 jw_mwd = ((u32)((u32)jo_mwd & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jmwd_pos    ] = (u8)jw_mwd;
+            base[entry_off + jmwd_pos + 1] = (u8)(jw_mwd >> 8);
+            base[entry_off + jmwd_pos + 2] = (u8)(jw_mwd >> 16);
+
+            inline_ops++; done = true;
         } else if (top == 0x1 && ((w >> 6) & 7) == 0 && mode == 5) {
             /* M6.91 — MOVE.B (d16,An),Dn — boot-hot 0x10A8 (12 K helpers /
              * 100 M cyc, top entry in the boot helper-histo).
