@@ -2223,6 +2223,44 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             }
             emit_advance(&e, 4, 8);                 /* length 4 (op + imm16) */
             inline_ops++; done = true;
+        } else if (top == 0x1 && ((w >> 6) & 7) == 0 && mode == 0) {
+            /* M6.101 — MOVE.B Dm,Dn (register-to-register byte move).
+             * Bench-warm 0x1003 (MOVE.B D3,D0) at 192 helpers / 20 M cyc.
+             * Replace Dn[7:0] with Dm[7:0]; preserve Dn[31:8].
+             * MOVE-family flags from byte sign.
+             *
+             * Length 2, cycles 8 (m68k_step base 4 + MOVE handler `+= 4`).
+             * Initial emit had cycles=4 which caused massive JIT/interp
+             * cycle drift on boot 100M → 1.4 M extra bogus-PC helpers
+             * from the M6.66 divergence path running differently. The
+             * diff_jit_bench_lockstep at 11 K cycles passed because the
+             * drift hadn't accumulated enough yet; boot 100M caught it. */
+            int dn = (w >> 9) & 7;
+            int dm = w & 7;
+            u8 src_reg = emit_read_g_in(&e, &rc, G_D(dm), 9);
+            int dst_xt = cache_lookup(&rc, G_D(dn));
+            u8 dst_slot = (dst_xt >= 0) ? (u8)dst_xt : 9;
+            if (dst_xt < 0) emit_read_g(&e, &rc, G_D(dn), 9);
+
+            xt_extui(&e, 12, src_reg, 0, 7);           /* a12 = Dm.B */
+            xt_srli (&e, 11, dst_slot, 8);
+            xt_slli (&e, 11, 11, 8);                   /* a11 = Dn.high_24 << 8 */
+            u8 out_reg = (dst_xt >= 0) ? (u8)dst_xt : 9;
+            xt_or   (&e, out_reg, 11, 12);
+
+            if (dst_xt >= 0) {
+                for (int s = 0; s < rc.active; s++)
+                    if (rc.guest[s] == (u8)G_D(dn)) { rc.dirty |= (u16)(1u << s); break; }
+            } else {
+                emit_write_g(&e, &rc, G_D(dn), 9);
+            }
+            if (!flags_dead[i]) {
+                /* Shift byte to bit 31 for emit_logic_flags. */
+                xt_slli(&e, 8, 12, 24);
+                emit_logic_flags(&e, 8);
+            }
+            emit_advance(&e, 2, 8);
+            inline_ops++; done = true;
         } else if (top == 0x3 && ((w >> 6) & 7) == 1 && mode == 0) {
             /* MOVEA.W Dn,An — bench-warm 0x3040+ at ~1000 helpers in 20M
              * (M6.73). Sign-extend Dn's low .W to 32 and store in An;
@@ -2367,6 +2405,56 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + jwp_pos    ] = (u8)jwwp;
             base[entry_off + jwp_pos + 1] = (u8)(jwwp >> 8);
             base[entry_off + jwp_pos + 2] = (u8)(jwwp >> 16);
+
+            inline_ops++; done = true;
+        } else if (top == 0x2 && ((w >> 6) & 7) == 0 && mode == 2) {
+            /* M6.101 — MOVE.L (An),Dn — bench-warm 0x2014 (MOVE.L (A4),D0)
+             * at 157 helpers / 20 M cyc. Sibling of MOVE.L (An)+,Dn but
+             * without the post-increment. Length 2, cycles 8.
+             *
+             * Cycle count: m68k_step base 4 + handler 4 = 8 (matches
+             * MOVE-family). Initial mis-set to 4 would cause boot 100M
+             * drift past the M6.66 boundary — see
+             * memory/move-cycle-drift-gotcha.md. */
+            int dn = (w >> 9) & 7;
+            int an = w & 7;
+
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(an), 8);
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_lan = 2, op_cyc_lan = 8;
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_lan, op_cyc_lan)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_lan, op_cyc_lan);
+            u32 jlan_pos = e.len;
+            xt_j    (&e, 4);
+            /* Fast path: read 4 BE bytes into a10 (.L value). */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);
+            xt_l8ui (&e, 11, 9, 0);
+            xt_l8ui (&e, 12, 9, 1);
+            xt_slli (&e, 10, 11, 24);
+            xt_slli (&e, 12, 12, 16);
+            xt_or   (&e, 10, 10, 12);
+            xt_l8ui (&e, 11, 9, 2);
+            xt_l8ui (&e, 12, 9, 3);
+            xt_slli (&e, 11, 11, 8);
+            xt_or   (&e, 10, 10, 11);
+            xt_or   (&e, 10, 10, 12);                /* a10 = .L value */
+            emit_write_g(&e, &rc, G_D(dn), 10);
+            if (!flags_dead[i]) emit_logic_flags(&e, 10);
+            emit_advance(&e, op_pc_lan, op_cyc_lan);
+
+            u32 here_lan = e.len;
+            i32 jo_lan = (i32)(here_lan - jlan_pos) - 4;
+            u32 jw_lan = ((u32)((u32)jo_lan & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jlan_pos    ] = (u8)jw_lan;
+            base[entry_off + jlan_pos + 1] = (u8)(jw_lan >> 8);
+            base[entry_off + jlan_pos + 2] = (u8)(jw_lan >> 16);
 
             inline_ops++; done = true;
         } else if (top == 0x2 && ((w >> 6) & 7) == 0 && mode == 3) {
@@ -4678,6 +4766,19 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + jawd_pos + 1] = (u8)(jw_awd >> 8);
             base[entry_off + jawd_pos + 2] = (u8)(jw_awd >> 16);
 
+            inline_ops++; done = true;
+        } else if (top == 0x4 && ((w >> 8) & 0xF) == 0xA && szf == 0 && mode == 0) {
+            /* M6.101 — TST.B Dn — bench-warm 0x4A05 (TST.B D5) at 191
+             * helpers / 20 M cyc. N from bit 7, Z from byte == 0,
+             * V=C=0, X preserved. Length 2, 4 cycles. */
+            int dn = w & 7;
+            u8 dn_reg = emit_read_g_in(&e, &rc, G_D(dn), 9);
+            if (!flags_dead[i]) {
+                /* Shift Dn.B's bit 7 to bit 31 for emit_logic_flags. */
+                xt_slli(&e, 8, dn_reg, 24);
+                emit_logic_flags(&e, 8);
+            }
+            emit_advance(&e, 2, 4);
             inline_ops++; done = true;
         } else if (top == 0x4 && ((w >> 8) & 0xF) == 0xA && szf == 2 && mode == 0) {
             /* TST.L Dn — bench-warm 0x4A80/0x4A81 (~4 K). N/Z from Dn,

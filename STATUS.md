@@ -1,5 +1,53 @@
 # Status
 
+## M6.101 — MOVE.B Dm,Dn + TST.B Dn + MOVE.L (An),Dn inline (delivered)
+
+Three small bench-warm inline expansions captured by the helper-histo
+top after M6.100:
+
+* `MOVE.B Dm,Dn` — bench-warm 0x1003 (MOVE.B D3,D0) at 192 helpers
+* `TST.B Dn` — bench-warm 0x4A05 (TST.B D5) at 191 helpers
+* `MOVE.L (An),Dn` — bench-warm 0x2014 (MOVE.L (A4),D0) at 157 helpers
+  (sibling of M6.91's MOVE.L (An)+,Dn but without post-increment)
+
+**Mid-iteration bug: cycle-drift trap.** First wrote `MOVE.B Dm,Dn`
+with `emit_advance(2, 4)`. ctest passed, `--diff-jit-trace` at 11 038
+cycles was clean. But **boot 100 M regressed by 34 %** (1.717 → 2.304
+lx7/cyc), with helpers exploding from 186 499 → 1 432 452 (+1.25 M
+bogus-PC helpers). The 4-cycle drift per MOVE.B call vs interp's
+8-cycle accounting (base 4 + handler 4) accumulated past the M6.66
+VIA-tick boundary, causing the bogus-PC region to wander much longer.
+
+Fix: `emit_advance(2, 4)` → `emit_advance(2, 8)`. Lesson recorded in
+`memory/move-cycle-drift-gotcha.md`:
+1. MOVE-family default is 8 cyc, not 4.
+2. The 11 K diff_jit_bench_lockstep window can't catch cycle drift —
+   add boot 100 M run to the standard SOP after any new emit_advance.
+
+**Triple-diff workflow:**
+
+* ctest: 7/7
+* `--diff-jit-trace`: clean through 11 038 cycles
+* Boot 300 K det: 80 → 78 helpers (−2)
+* Boot 5 M det: 152 → 150 helpers (−2)
+* Boot 100 M: 186 499 → 186 390 (−109) — confirmed correct cycle accounting
+* Bench (20 M): 8 394 → 7 702 (**−692** compile-time helpers)
+
+**Perf:**
+
+| Workload | M6.100 | **M6.101** | Δ |
+|----------|------:|----------:|--:|
+| Bench (20 M)     | 1.181 lx7/cyc | **1.179 lx7/cyc** | **−0.17 %** lx7 |
+| Boot @ 100 M cyc | 1.717 lx7/cyc | **1.717 lx7/cyc** | unchanged |
+
+**Bench crossed 5.48 × interp** for the first time.
+
+Cumulative M6.84 → M6.101:
+* Bench (20 M): 1.257 → **1.179** (−6.2 %)
+* Boot 300 K det: 2.170 → **1.975** (−9.0 %)
+* Boot 5 M det:   2.471 → **2.236** (−9.5 %)
+* Boot 100 M:     1.734 → **1.717** (−0.98 %)
+
 ## M6.100 — AND.B/W + OR.B/W + EOR.B/W Dm,Dn inline (delivered)
 
 New `emit_logic_bw_dd_kind` helper covers all six op×size combinations
@@ -754,11 +802,11 @@ them each iteration.
    intermediate register writeback. See M6.85 below for the first
    fusion lever in this class.
 
-## Where things stand right now (post-M6.100)
+## Where things stand right now (post-M6.101)
 
 | Engine | lx7 / cyc | × interp baseline |
 |--------|----------:|------------------:|
-| **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.181** | **5.47 ×** ✅ |
+| **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.179** | **5.48 ×** ✅ |
 | **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.328** | **4.87 ×** |
 | **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.717** | **3.44 ×** |
 | **Boot** (Mac Plus ROM, 5 M cycles, PC=`0x40032C` deterministic)    | **2.236** | **2.64 ×** |
