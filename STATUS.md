@@ -1,5 +1,53 @@
 # Status
 
+## M6.100 — AND.B/W + OR.B/W + EOR.B/W Dm,Dn inline (delivered)
+
+New `emit_logic_bw_dd_kind` helper covers all six op×size combinations
+(.B and .W for OR/AND/EOR with register source/destination). Same
+shape as the existing `emit_logic_l_dd_kind` but with extract+merge
+to preserve the high bits of Dn above the size operated on.
+
+Dispatch arms added:
+* AND.B/W Dm,Dn — top=0xC, szf∈{0,1}, bit8=0, mode=0
+* OR.B/W  Dm,Dn — top=0x8, szf∈{0,1}, bit8=0, mode=0
+* EOR.B/W Dn,Dm — top=0xB, szf∈{0,1}, bit8=1, mode=0 (EOR only has
+  EA-dst form; for mode=0 the EA is Dm at bits 5-3/2-0)
+
+Boot's 0xC242 (AND.W D2,D1) at 525 helpers + .B variants get caught.
+
+Flag emit follows MOVE-family: shift result.size to bit 31 so
+emit_logic_flags reads bit (size-1) as N. V=C=0, X preserved.
+
+**Triple-diff workflow:**
+
+* ctest: 7/7
+* `--diff-jit-trace`: clean through 11 038 cycles
+* Boot 300 K det: 85 → 80 helpers (−5)
+* Boot 5 M det: 157 → 152 helpers (−5)
+* Boot 100 M: 188 525 → 186 499 (**−2 026**)
+* Bench (20M): 8 973 → 8 394 (**−579** helpers in non-hot blocks)
+
+**Perf:**
+
+| Workload | M6.99 | **M6.100** | Δ |
+|----------|------:|----------:|--:|
+| Bench (20 M)     | 1.182 lx7/cyc | **1.181** | −0.08 % |
+| Boot @ 300 K det | 1.976 lx7/cyc | **1.975** | −0.05 % |
+| Boot @ 5 M det   | 2.236 lx7/cyc | unchanged | — |
+| Boot @ 100 M cyc | 1.718 lx7/cyc | **1.717** | −0.06 % |
+
+Cumulative M6.84 → M6.100:
+* Bench (20 M): 1.257 → **1.181** (−6.0 %)
+* Boot 300 K det: 2.170 → **1.975** (−9.0 %)
+* Boot 5 M det:   2.471 → **2.236** (−9.5 %)
+* Boot 100 M:     1.734 → **1.717** (−0.98 %)
+
+The MOVE.B / MOVE.L / EXT / shift / AND-OR-EOR.B/W class is now
+largely complete for register-direct forms. The remaining boot
+helpers are dominated by MMIO-fallback cases (where the inline arm
+fires but the runtime EA hits MMIO) and the 174 K bogus-PC helpers
+from the M6.66 VIA-tick divergence (out of scope for inline work).
+
 ## M6.99 — EXT.W/EXT.L Dn + LSR.L/ASR.L #imm,Dn inline (delivered)
 
 Combined commit covering three new inline arms:
@@ -706,15 +754,15 @@ them each iteration.
    intermediate register writeback. See M6.85 below for the first
    fusion lever in this class.
 
-## Where things stand right now (post-M6.99)
+## Where things stand right now (post-M6.100)
 
 | Engine | lx7 / cyc | × interp baseline |
 |--------|----------:|------------------:|
-| **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.182** | **5.47 ×** ✅ |
+| **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.181** | **5.47 ×** ✅ |
 | **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.328** | **4.87 ×** |
-| **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.718** | **3.44 ×** |
+| **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.717** | **3.44 ×** |
 | **Boot** (Mac Plus ROM, 5 M cycles, PC=`0x40032C` deterministic)    | **2.236** | **2.64 ×** |
-| **Boot** (Mac Plus ROM, 300 K cycles, PC=`0x40032C` deterministic)  | **1.976** | **2.99 ×** |
+| **Boot** (Mac Plus ROM, 300 K cycles, PC=`0x40032C` deterministic)  | **1.975** | **2.99 ×** |
 
 **Important note — M6.77 reset.** The bench numbers in this table
 are the **first correct measurements** of the milestone in many

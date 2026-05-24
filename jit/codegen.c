@@ -973,6 +973,49 @@ static void emit_logic_l_dd_kind(xt_emit *e, int ra, int rb, int dst,
     if (!skip_flags) emit_logic_flags(e, 8);
     emit_advance(e, 2, 8);
 }
+
+/* M6.100 — AND.B/W / OR.B/W / EOR.B/W Dm,Dn register form:
+ *   d[dst].size = d[dst].size <op> d[src].size
+ *   d[dst]'s bits above size are preserved
+ *   N = bit (size-1) of result, Z = (result == 0), V=C=0, X preserved
+ * `kind`: 0 = OR, 1 = AND, 2 = EOR.
+ * `size_bits`: 8 (.B) or 16 (.W).
+ * Boot-warm 0xC242 (AND.W D2,D1) at 525 helpers / 100 M cyc + variants. */
+static void emit_logic_bw_dd_kind(xt_emit *e, int ra, int rb, int dst,
+                                  int kind, int size_bits,
+                                  bool skip_flags, regcache *rc) {
+    u8 src_reg = emit_read_g_in(e, rc, G_D(ra), 8);
+    int dst_xt = cache_lookup(rc, G_D(dst));
+    u8 dst_slot = (dst_xt >= 0) ? (u8)dst_xt : 9;
+    if (dst_xt < 0) emit_read_g(e, rc, G_D(dst), 9);
+
+    /* Extract size halves, combine, merge into dst. */
+    xt_extui(e, 10, src_reg, 0, size_bits - 1);
+    xt_extui(e, 11, dst_slot, 0, size_bits - 1);
+    if      (kind == 0) xt_or (e, 10, 10, 11);
+    else if (kind == 1) xt_and(e, 10, 10, 11);
+    else                xt_xor(e, 10, 10, 11);  /* a10 = result.size (low bits) */
+
+    /* Merge: clear low size_bits of dst, OR in result. */
+    xt_srli(e, 11, dst_slot, size_bits);
+    xt_slli(e, 11, 11, size_bits);
+    u8 out_reg = (dst_xt >= 0) ? (u8)dst_xt : 9;
+    xt_or  (e, out_reg, 11, 10);
+
+    if (dst_xt >= 0) {
+        for (int i = 0; i < rc->active; i++)
+            if (rc->guest[i] == (u8)G_D(dst)) { rc->dirty |= (u16)(1u << i); break; }
+    } else {
+        emit_write_g(e, rc, G_D(dst), 9);
+    }
+    if (!skip_flags) {
+        /* Shift result.size to bit 31 so emit_logic_flags reads bit
+         * (size-1) as N. */
+        xt_slli(e, 8, 10, 32 - size_bits);
+        emit_logic_flags(e, 8);
+    }
+    emit_advance(e, 2, 4 + (size_bits == 8 ? 4 : 4));  /* base 4 + handler 4 */
+}
 /* Back-compat shim — preserves callers that only need AND.L / EOR.L. */
 static void emit_logic_l_dd(xt_emit *e, int ra, int rb, int dst,
                             bool is_eor, regcache *rc) {
@@ -5021,6 +5064,27 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
         } else if (top == 0xB && szf == 2 && ((w >> 8) & 1) && mode == 0) {
             /* EOR.L Dn,Dm  (result -> Dm) */
             emit_logic_l_dd(&e, (w >> 9) & 7, w & 7, w & 7, true, &rc);
+            inline_ops++; done = true;
+        } else if (top == 0xC && (szf == 0 || szf == 1) && !((w >> 8) & 1) && mode == 0) {
+            /* M6.100 — AND.B / AND.W Dm,Dn (dst = Dn at bits 11-9).
+             * Boot-warm 0xC242 (AND.W D2,D1) at 525 helpers / 100 M cyc. */
+            int size_bits = (szf == 0) ? 8 : 16;
+            emit_logic_bw_dd_kind(&e, w & 7, (w >> 9) & 7, (w >> 9) & 7,
+                                  1, size_bits, flags_dead[i], &rc);
+            inline_ops++; done = true;
+        } else if (top == 0x8 && (szf == 0 || szf == 1) && !((w >> 8) & 1) && mode == 0) {
+            /* M6.100 — OR.B / OR.W Dm,Dn (dst = Dn at bits 11-9). */
+            int size_bits = (szf == 0) ? 8 : 16;
+            emit_logic_bw_dd_kind(&e, w & 7, (w >> 9) & 7, (w >> 9) & 7,
+                                  0, size_bits, flags_dead[i], &rc);
+            inline_ops++; done = true;
+        } else if (top == 0xB && (szf == 0 || szf == 1) && ((w >> 8) & 1) && mode == 0) {
+            /* M6.100 — EOR.B / EOR.W Dn,Dm (src = Dn at bits 11-9, dst =
+             * Dm at bits 5-3/2-0). EOR only has the EA-dst form; for
+             * mode=0 the EA is Dm. */
+            int size_bits = (szf == 0) ? 8 : 16;
+            emit_logic_bw_dd_kind(&e, (w >> 9) & 7, w & 7, w & 7,
+                                  2, size_bits, flags_dead[i], &rc);
             inline_ops++; done = true;
         } else if (top == 0x0 && !((w >> 8) & 1) && szf == 2 && mode == 0
                    && ((w >> 9) & 7) != 4 && ((w >> 9) & 7) != 7) {
