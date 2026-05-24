@@ -56,10 +56,20 @@ typedef struct m68k_dispatcher {
     u64 helper_calls;
 
     bool no_cache;          /* bench toggle: recompile every dispatch */
-    bool prefetch_static;   /* M6.71 — after each compile, also compile
-                             * the block's statically-known successor PCs
-                             * (BRA, Bcc, JMP .L, BSR, DBcc, fall-through).
-                             * Capped at 1 level deep to keep cost bounded. */
+
+    /* M6.71 / M6.72 — prefetch policy:
+     *  PREFETCH_NONE   — no speculative compilation (default).
+     *  PREFETCH_STATIC — after compile, also compile every statically-
+     *                    known successor (Bcc-both-branches included),
+     *                    depth 1. M6.71.
+     *  PREFETCH_CHAIN  — only follow *unambiguous* successors (BRA /
+     *                    BSR / JMP / fall-through, NOT Bcc / DBcc),
+     *                    but follow them to depth `prefetch_depth`.
+     *                    Reduces compile waste from cold conditional
+     *                    branches and amortises more cold-start cost
+     *                    on linear-chain code. M6.72. */
+    u8   prefetch_mode;
+    u8   prefetch_depth;    /* CHAIN-mode follow depth (default 2). */
 
     /* Self-modifying-code tracking. The guest OS loads code segments into
      * RAM and reuses that RAM, so a cached block can outlive the code it
@@ -79,9 +89,16 @@ bool m68k_dispatcher_init(m68k_dispatcher *d, m68k_cpu *cpu);
    M68K_JIT_ARENA_KB and CC_MODE_BUMP. */
 bool m68k_dispatcher_init_ex(m68k_dispatcher *d, m68k_cpu *cpu,
                              u32 arena_kb, u8 evict_mode);
-/* Enable / disable static-successor prefetch. Off by default. Cheap
- * to flip at runtime — only affects what get_block does post-compile. */
-void m68k_dispatcher_set_prefetch(m68k_dispatcher *d, bool on);
+/* Prefetch policy values for m68k_dispatcher_set_prefetch. */
+enum {
+    PREFETCH_NONE   = 0,
+    PREFETCH_STATIC = 1,
+    PREFETCH_CHAIN  = 2,
+};
+/* Set the prefetch policy + chain-follow depth (used by CHAIN only).
+ * Cheap to flip at runtime — only affects what get_block does
+ * post-compile. Passing `depth = 0` is treated as the default (2). */
+void m68k_dispatcher_set_prefetch(m68k_dispatcher *d, u8 mode, u8 depth);
 void m68k_dispatcher_shutdown(m68k_dispatcher *d);
 
 /* Run compiled blocks until cpu->cycles >= until or the CPU halts. */

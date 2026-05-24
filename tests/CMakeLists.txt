@@ -39,4 +39,13 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/roms/disks/speedo-bench.snap")
                      --load-snapshot ${CMAKE_SOURCE_DIR}/roms/disks/speedo-bench.snap
                      --max-cycles 11000
              WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+    # M6.72 — lockstep with the new chain prefetch policy. Confirms
+    # the deeper-but-selective walk doesn't perturb correctness.
+    add_test(NAME diff_jit_bench_lockstep_prefetch_chain
+             COMMAND $<TARGET_FILE:mac68k_host>
+                     --diff-jit-trace --no-irq --prefetch chain
+                     --load-snapshot ${CMAKE_SOURCE_DIR}/roms/disks/speedo-bench.snap
+                     --max-cycles 11000
+             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endif()

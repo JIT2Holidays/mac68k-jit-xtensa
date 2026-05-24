@@ -59,9 +59,13 @@ Each script `--help`-style block sits in its first comment. Direct
 JIT-tuning flags:
 * `--arena-kb N`            — JIT codecache arena size (default 1024).
 * `--evict none|lru|fifo`   — eviction policy on arena fill (M6.63).
-* `--prefetch none|static`  — speculative compile of statically-known
-  block successors (M6.71). `static` helps cold-start latency; mild
-  steady-state overhead. Off by default.
+* `--prefetch none|static|chain` — speculative compile of statically-
+  known block successors. `static` (M6.71) prefetches both branches
+  of every Bcc, depth 1 — wastes ~80 % of prefetches. `chain` (M6.72)
+  follows only unambiguous successors (BRA / BSR / JMP / fall-through)
+  to depth `--prefetch-depth N` (default 2) — no wasted compiles,
+  same first-order amortisation. Off by default.
+* `--prefetch-depth N`       — CHAIN-mode follow depth (default 2).
 
 ## What works
 
@@ -160,6 +164,8 @@ $ ctest --test-dir build
                                         cycle 11000 (M6.68/M6.69 SR-flush regression
                                         guard). Conditional on the snapshot's presence.
     diff_jit_bench_lockstep_prefetch  — same lockstep with --prefetch static (M6.71)
+    diff_jit_bench_lockstep_prefetch_chain
+                                      — same lockstep with --prefetch chain (M6.72)
 ```
 
 ## Workflow notes

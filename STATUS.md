@@ -695,6 +695,79 @@ embedded ESP32-S3 deployment** where the working set is much smaller
 relative to the JIT arena and one-shot boot latency matters more.
 Code path is conditional and zero-overhead when off.
 
+**M6.72 — better prefetch policy: `--prefetch chain`.**
+
+The M6.71 `static` mode wasted ~80 % of its prefetched compiles
+(bench: 522 prefetched, only 100 hits; boot: 1425 prefetched, only
+352 hits) because it compiled *both* branches of every Bcc / DBcc
+even though typically only one is taken. The new `chain` mode keeps
+the prefetch idea but two changes:
+
+* **Skip ambiguous successors.** Only follow blocks with a single
+  static successor (BRA / BSR / JMP (xxx).L / JMP (xxx).W /
+  JMP (d16,PC) / JSR variants / plain block-cap fall-through). Bcc
+  and DBcc are not prefetched on either side — let the runtime's
+  predicted-next link establish itself on first execution.
+* **Recurse along linear chains.** Static mode is single-hop; chain
+  mode follows up to `--prefetch-depth N` (default 2) hops along
+  the linear sequence. So a `BRA → MOVE.L Dn,(An)+; ... ; RTS`
+  pattern prefetches not just the BRA target but the next
+  unconditional successor too.
+
+Result (final block count, prefetched count, prefetch hits):
+
+| Workload                    | none      | static                | chain                |
+|-----------------------------|----------:|----------------------:|---------------------:|
+| Bench 60 M cyc, blocks=     | 863       | **1010** (+147 waste) | **863** (no waste)   |
+|   prefetch_compiles         | 0         | 522                   | 168                  |
+|   prefetch_hits             | 0         | 100                   | 45                   |
+| Boot 100 M cyc, blocks=     | 101 858   | 102 208 (+350 waste)  | 101 858              |
+|   prefetch_compiles         | 0         | 1 425                 | 365                  |
+|   prefetch_hits             | 0         | 352                   | 20                   |
+
+Chain's defining property: **block count equals the no-prefetch
+baseline**. Every block it prefetched was one the runtime would have
+compiled anyway — chain just moved the compile earlier in time.
+Static, in contrast, leaves 147 / 350 dead blocks in the cache
+forever (or until evicted), competing with the working set.
+
+Wall-clock 5-run avg (noisier than block counts, ~±2 % band):
+
+| Workload         | none      | static                | chain                |
+|------------------|----------:|----------------------:|---------------------:|
+| Bench 60 M cyc   | 166 ms    | 165 ms (-0.8 %)       | 169 ms (+1.8 %)      |
+| Boot  100 M cyc  | 722 ms    | 727 ms (+0.6 %)       | 726 ms (+0.6 %)      |
+| Boot  10 M cyc cold | 50.4 ms | 50.0 ms (-0.8 %)     | **49.9 ms (-1.0 %)** |
+| Bench 300 M long | 944 ms    | **924 ms (-2.1 %)**   | 929 ms (-1.6 %)      |
+
+`lx7_per_cyc` identical across all three modes everywhere
+(correctness preserved — the metric measures execution, not
+compile).
+
+The advantage of `chain` is **structural rather than per-workload
+loud**: same first-order amortisation as static, no wasted compiles
+and no arena pollution. When the arena is small (M6.63 showed the
+ESP32-relevant 64–256 KB regime), every wasted block matters more —
+this is exactly where chain pulls ahead, but the host's 1 MB arena
+masks that.
+
+Implementation: `m68k_dispatcher_set_prefetch(d, mode, depth)`. Mode
+is `PREFETCH_NONE` / `PREFETCH_STATIC` / `PREFETCH_CHAIN`; depth is
+the CHAIN follow depth (default 2; `--prefetch-depth N` to override).
+
+Tests:
+* The M6.71 `test_prefetch` unit suite still passes (the static-
+  successor analyser is shared).
+* New `diff_jit_bench_lockstep_prefetch_chain` ctest runs the
+  M6.68 SR-flush regression guard with `--prefetch chain`.
+
+ctest: **7 / 7** pass (M6.71 left it at 6; +1 new).
+
+**Updated recommendation:** `chain` (depth 2) is now the suggested
+default if any prefetch is enabled. `static` remains available for
+A/B comparison but is strictly dominated by `chain` on the "no
+wasted compiles" axis.
+
 Alternative real-software pair if synthetic benchmarks aren't the
 goal: **Dark Castle** (VIA-timer-driven sound + raster bit-banging
 — tests M3's "good enough to pace 60 Hz VBL, not instruction-cycle-

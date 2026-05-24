@@ -447,24 +447,28 @@ static void enter_block(m68k_dispatcher *d, m68k_block *b) {
 
 /* --- run loop --------------------------------------------------------- */
 
-/* M6.71 — `prefetch_depth` 0 = real demand-driven compile (may reset
- * the arena on overflow + may then prefetch successors). depth > 0 =
- * speculative prefetch — skips arena-resets (we don't want a prefetch
- * to wipe out the just-compiled real block) and skips its own
- * downstream prefetch (1-level cap). */
+/* M6.71 / M6.72 — `remaining_depth` controls speculative recursion:
+ *   `remaining_depth < 0` = real demand-driven compile (may arena-reset
+ *                            on overflow + then may seed prefetch).
+ *   `remaining_depth >= 0` = speculative prefetch step. Skips arena
+ *                            resets so a prefetch never evicts the
+ *                            just-compiled real block. The recursive
+ *                            call decrements `remaining_depth` and
+ *                            stops walking when it reaches 0. */
 static m68k_block *get_block_impl(m68k_dispatcher *d, u32 pc,
-                                  int prefetch_depth) {
+                                  int remaining_depth) {
+    bool prefetching = (remaining_depth >= 0);
     if (!d->no_cache) {
         m68k_block *b = find_block(d, pc);
         if (b) {
-            if (prefetch_depth > 0) d->prefetch_hits++;
+            if (prefetching) d->prefetch_hits++;
             return b;
         }
     }
     m68k_block *b = m68k_compile_block(&d->cc, d->cpu, pc, helper_addr, d->cpu);
-    if (!b && prefetch_depth == 0) {
-        /* Arena full: wipe everything and retry once into a fresh arena.
-         * We only do this on demand-driven calls — prefetch silently
+    if (!b && !prefetching) {
+        /* Arena full: wipe everything and retry once into a fresh
+         * arena. Only on demand-driven calls — prefetch silently
          * gives up rather than risk evicting the block we just
          * compiled to satisfy the actual dispatcher entry. */
         free_all_blocks(d);
@@ -482,31 +486,51 @@ static m68k_block *get_block_impl(m68k_dispatcher *d, u32 pc,
         d->blocks_compiled++;
         d->inline_ops_total += b->inline_ops;
         d->helper_ops_total += b->helper_ops;
-        if (prefetch_depth > 0) d->prefetch_compiles++;
+        if (prefetching) d->prefetch_compiles++;
     }
-    /* M6.71 prefetch — recursively compile statically-known successors
-     * after a real (depth-0) compile. The recursive call runs at
-     * depth=1 so it won't re-prefetch its own successors, and it skips
-     * the arena-reset path. */
-    if (b && prefetch_depth == 0 && d->prefetch_static && !d->no_cache) {
+
+    /* Prefetch step. Three modes:
+     *   STATIC — every static successor (Bcc-both-branches included),
+     *            single-step (no recursion past the first hop).
+     *   CHAIN  — only single-successor blocks (skip Bcc / DBcc), but
+     *            recurse to follow linear chains.
+     *   NONE   — nothing. */
+    if (!b || d->no_cache || d->prefetch_mode == PREFETCH_NONE) return b;
+
+    /* For STATIC: seed only from a real-demand compile, single hop. */
+    if (d->prefetch_mode == PREFETCH_STATIC && !prefetching) {
         u32 succ[2];
         int n = m68k_block_static_successors(b, d->cpu->mem, succ);
         for (int i = 0; i < n; i++) {
-            /* Skip nonsense PCs that don't map to real code — same
-             * shape of filter we apply at dispatcher entry would. */
             if (succ[i] & 1u) continue;
-            (void)get_block_impl(d, succ[i], prefetch_depth + 1);
+            (void)get_block_impl(d, succ[i], /*remaining_depth=*/0);
         }
+        return b;
+    }
+
+    /* For CHAIN: follow only single-successor blocks, recurse while
+     * remaining_depth > 0. Seeded with depth = d->prefetch_depth on the
+     * real-demand call. */
+    if (d->prefetch_mode == PREFETCH_CHAIN) {
+        int next_depth = prefetching ? (remaining_depth - 1)
+                                     : (int)d->prefetch_depth - 1;
+        if (next_depth < 0) return b;
+        u32 succ[2];
+        int n = m68k_block_static_successors(b, d->cpu->mem, succ);
+        if (n != 1) return b;          /* skip Bcc / DBcc / dynamic */
+        if (succ[0] & 1u) return b;
+        (void)get_block_impl(d, succ[0], next_depth);
     }
     return b;
 }
 
 static m68k_block *get_block(m68k_dispatcher *d, u32 pc) {
-    return get_block_impl(d, pc, 0);
+    return get_block_impl(d, pc, /*remaining_depth=*/-1);
 }
 
-void m68k_dispatcher_set_prefetch(m68k_dispatcher *d, bool on) {
-    d->prefetch_static = on;
+void m68k_dispatcher_set_prefetch(m68k_dispatcher *d, u8 mode, u8 depth) {
+    d->prefetch_mode = mode;
+    d->prefetch_depth = depth ? depth : 2;
 }
 
 void m68k_dispatcher_run_until(m68k_dispatcher *d, u64 until) {
