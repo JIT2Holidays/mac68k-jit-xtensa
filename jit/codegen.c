@@ -4318,6 +4318,88 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
               base[entry_off + jix_pos + 2] = (u8)(jw >> 16); }
 
             inline_ops++; done = true;
+        } else if (top == 0x3 && ((w >> 6) & 7) == 7 && ((w >> 9) & 7) == 0 && mode == 0) {
+            /* M6.110 — MOVE.W Dn,(xxx).W — bench-hot 0x31C0 at 21 K
+             * helpers / 100 M cyc on bench's post-cycle-11898 path.
+             * Destination side of the M6.109 (xxx).W class.
+             *
+             * Compile-time RAM check on the abs address. On RAM hit,
+             * emit 2-byte BE write directly. MOVE-family flags from
+             * the .W value. Length 4, cycles 8. */
+            int dn = w & 7;
+            u16 ext = mac_read16(cpu->mem, op_pc[i] + 2);
+            u32 abs_addr = (u32)(i32)(i16)ext;
+            abs_addr &= 0xFFFFFFu;
+
+            u32 ram_size = cpu->mem ? cpu->mem->ram_size : 0;
+            bool overlay = cpu->mem ? cpu->mem->overlay : true;
+            bool ram_pow2 = ram_size > 0 && (ram_size & (ram_size - 1)) == 0;
+            bool addr_in_ram = !overlay && ram_pow2
+                               && abs_addr < ram_size
+                               && (abs_addr & 1) == 0;
+
+            if (addr_in_ram) {
+                emit_advance_flush(&e);
+                emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                             entry_off + e.len);
+                if ((i32)abs_addr >= -128 && (i32)abs_addr <= 127) {
+                    xt_addi(&e, 9, 9, (i32)abs_addr);
+                } else if ((i32)abs_addr >= -2048 && (i32)abs_addr <= 2047) {
+                    xt_movi(&e, 10, (i32)abs_addr);
+                    xt_add (&e, 9, 9, 10);
+                } else {
+                    emit_load_imm(&e, 10, 11, abs_addr);
+                    xt_add (&e, 9, 9, 10);
+                }
+                /* Read Dn (cache slot direct if cached). */
+                u8 dn_reg = emit_read_g_in(&e, &rc, G_D(dn), 10);
+                xt_extui(&e, 11, dn_reg, 8, 7);             /* .W high byte */
+                xt_extui(&e, 12, dn_reg, 0, 7);             /* .W low byte */
+                xt_s8i  (&e, 11, 9, 0);
+                xt_s8i  (&e, 12, 9, 1);
+                if (!flags_dead[i]) {
+                    xt_slli(&e, 8, dn_reg, 16);             /* .W's sign at bit 31 */
+                    emit_logic_flags(&e, 8);
+                }
+                emit_advance(&e, 4, 8);
+                inline_ops++; done = true;
+            }
+        } else if (top == 0x1 && ((w >> 6) & 7) == 7 && ((w >> 9) & 7) == 0 && mode == 0) {
+            /* M6.110 — MOVE.B Dn,(xxx).W. Sibling of MOVE.W Dn,(xxx).W
+             * for byte writes. No alignment requirement. */
+            int dn = w & 7;
+            u16 ext = mac_read16(cpu->mem, op_pc[i] + 2);
+            u32 abs_addr = (u32)(i32)(i16)ext;
+            abs_addr &= 0xFFFFFFu;
+
+            u32 ram_size = cpu->mem ? cpu->mem->ram_size : 0;
+            bool overlay = cpu->mem ? cpu->mem->overlay : true;
+            bool ram_pow2 = ram_size > 0 && (ram_size & (ram_size - 1)) == 0;
+            bool addr_in_ram = !overlay && ram_pow2 && abs_addr < ram_size;
+
+            if (addr_in_ram) {
+                emit_advance_flush(&e);
+                emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                             entry_off + e.len);
+                if ((i32)abs_addr >= -128 && (i32)abs_addr <= 127) {
+                    xt_addi(&e, 9, 9, (i32)abs_addr);
+                } else if ((i32)abs_addr >= -2048 && (i32)abs_addr <= 2047) {
+                    xt_movi(&e, 10, (i32)abs_addr);
+                    xt_add (&e, 9, 9, 10);
+                } else {
+                    emit_load_imm(&e, 10, 11, abs_addr);
+                    xt_add (&e, 9, 9, 10);
+                }
+                u8 dn_reg = emit_read_g_in(&e, &rc, G_D(dn), 10);
+                xt_extui(&e, 11, dn_reg, 0, 7);             /* byte */
+                xt_s8i  (&e, 11, 9, 0);
+                if (!flags_dead[i]) {
+                    xt_slli(&e, 8, 11, 24);
+                    emit_logic_flags(&e, 8);
+                }
+                emit_advance(&e, 4, 8);
+                inline_ops++; done = true;
+            }
         } else if (top == 0x3 && ((w >> 6) & 7) == 0 && mode == 7 && (w & 7) == 0) {
             /* M6.109 — MOVE.W (xxx).W,Dn — sibling of M6.108's MOVE.L
              * (xxx).W form, for .W reads from a static low-RAM address.
