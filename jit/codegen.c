@@ -6731,6 +6731,88 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
 
             inline_ops++; done = true;
         } else if (top == 0x0 && !((w >> 8) & 1) && ((w >> 9) & 7) == 4
+                   && mode == 0) {
+            /* M6.154 — BTST / BCHG / BCLR / BSET #imm,Dn — static-imm
+             * bit op on a data register. Pure register-op sibling of
+             * the M6.113 (xxx).W arm below.
+             *
+             * Boot 100M's 0x08C0 (BSET #imm,D0) at 390 hits / pc=0x401a70
+             * is the highest-fire pure-register-op un-inlined opcode.
+             * 0x08D1 (BCLR #imm,(A1)) at 62 hits also matches the family
+             * but lands in mode 2 — handled by the default helper.
+             *
+             * `which = (w >> 6) & 3`: 0=BTST, 1=BCHG, 2=BCLR, 3=BSET.
+             * Bit number from following imm.W: for Dn destination, the
+             * register is .L sized so the bit number is taken modulo 32
+             * (per m68k_interp's `bit &= (sz == 4) ? 31 : 7` at line 489
+             * of m68k_interp.c).
+             *
+             * Length 4 (op + imm.W); cycles 8 (m68k_step base 4 +
+             * handler 4 — m68k_interp's bit-op path at line 920 of
+             * m68k_interp.c uses a flat 4 for all four ops).
+             *
+             * CCR: sets ONLY Z = (original bit was 0); N / V / C / X
+             * unchanged. Same Z-update shape as M6.113.
+             *
+             * Trajectory: pure register-op, no bridge. Per the safe
+             * categories established in memory/bridge-only-arms-
+             * trajectory-shift.md this matches the M6.139 / M6.149 /
+             * M6.150 / M6.151 / M6.152 pattern that landed cleanly. */
+            int which   = (w >> 6) & 3;
+            int dn      = w & 7;
+            u16 imm_w   = mac_read16(cpu->mem, op_pc[i] + 2);
+            int bit_num = imm_w & 31;     /* .L Dn destination */
+
+            int dn_xt = cache_lookup(&rc, G_D(dn));
+            u8 src_reg = (dn_xt >= 0) ? (u8)dn_xt : 8;
+            if (dn_xt < 0) emit_read_g(&e, &rc, G_D(dn), 8);
+
+            /* a10 = original bit value (0 or 1) — captured BEFORE any
+             * in-place modification of src_reg overwrites it. */
+            xt_extui(&e, 10, src_reg, (u8)bit_num, 0);
+
+            if (which != 0) {
+                /* BCHG / BCLR / BSET: build a11 = (1 << bit_num) and
+                 * apply. xt_movi can encode -2048..2047 only; for
+                 * bit_num > 11 the immediate doesn't fit, so build the
+                 * mask via xt_movi(1) + xt_slli (1-31). */
+                xt_movi(&e, 11, 1);
+                if (bit_num > 0) xt_slli(&e, 11, 11, (u8)bit_num);
+
+                u8 dst_reg = (dn_xt >= 0) ? (u8)dn_xt : 8;
+                if (which == 1) {                /* BCHG: Dn ^= mask */
+                    xt_xor(&e, dst_reg, src_reg, 11);
+                } else if (which == 2) {         /* BCLR: Dn &= ~mask */
+                    xt_movi(&e, 12, -1);
+                    xt_xor (&e, 11, 11, 12);     /* a11 = ~(1 << bit_num) */
+                    xt_and (&e, dst_reg, src_reg, 11);
+                } else {                          /* BSET: Dn |= mask */
+                    xt_or (&e, dst_reg, src_reg, 11);
+                }
+
+                if (dn_xt >= 0) {
+                    for (int s = 0; s < rc.active; s++)
+                        if (rc.guest[s] == (u8)G_D(dn)) { rc.dirty |= (u16)(1u << s); break; }
+                } else {
+                    emit_write_g(&e, &rc, G_D(dn), dst_reg);
+                }
+            }
+            /* BTST (which == 0): no writeback, only Z update. */
+
+            if (!flags_dead[i]) {
+                /* Z = (original bit == 0). Other CCR bits unchanged.
+                 * Clear SR.Z (bit 2), then OR in 0x04 if a10 == 0. */
+                xt_movi(&e, 12, -5);             /* ~0x04 = 0xFFFFFFFB */
+                xt_and (&e, R_SR, R_SR, 12);
+                xt_movi(&e, 12, 4);
+                xt_bnez(&e, 10, 6);              /* skip OR if old bit was 1 */
+                xt_or  (&e, R_SR, R_SR, 12);
+                g_sr_dirty = true;
+                sext_memo_invalidate();
+            }
+            emit_advance(&e, 4, 8);
+            inline_ops++; done = true;
+        } else if (top == 0x0 && !((w >> 8) & 1) && ((w >> 9) & 7) == 4
                    && mode == 7 && (w & 7) == 0) {
             /* M6.113 — BTST / BCHG / BCLR / BSET #imm,(xxx).W. Static
              * bit op against a low-RAM absolute address (sign-extended
