@@ -59,6 +59,13 @@ typedef enum {
     ADDR_ROM_HOST_BASE,   /* host ROM pointer shifted: rom_ptr - 0x400000, so */
                           /* base + addr lands in the host rom[] array for any */
                           /* admitted ROM-range guest address. */
+    /* M6.91 — byte-aligned versions of the RAM/ROM bounds. The plain
+     * LITERAL_RAM_BOUNDS has `| 1` to fail odd addresses (required for
+     * .W/.L access); for MOVE.B-family ops, any byte address in RAM is
+     * legal, so the byte variant drops the `| 1` to admit them. Used by
+     * the MOVE.B inline arms that need RAM-only fast paths. */
+    LITERAL_RAM_BOUNDS_BYTE,  /* ~(ram_size-1) — admits any byte addr in RAM */
+    LITERAL_ROM_BOUNDS_BYTE,  /* ~(rom_size-1) — admits any byte addr in ROM */
     LITERAL_COUNT
 } literal_id;
 

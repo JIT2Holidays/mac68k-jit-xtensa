@@ -1,5 +1,64 @@
 # Status
 
+## M6.91 — MOVE.B (d16,An),Dn + MOVE.B (d16,An),(Am) inline (delivered)
+
+Boot's top helper-histogram entry was `0x10A8` at 12 136 hits / 100 M cyc,
+first seen at PC `0x400310` (ROM). Initially mis-decoded as `MOVE.B
+(d16,A0),D0` (dst_mode=0=Dn) — that arm only matched ~270 calls at
+other PCs. Correct decode is `MOVE.B (d16,A0),(A0)` (dst_mode=2=An,
+mem-to-mem byte). Both arms now land as a class.
+
+**Byte-aligned bounds literals** (M6.91-new):
+```
+LITERAL_RAM_BOUNDS_BYTE = ~(ram_size-1)    // no `| 1`, admits any byte addr
+LITERAL_ROM_BOUNDS_BYTE = ~(rom_size-1)
+```
+
+The existing word-bounds masks (`| 1`) fail odd addresses since MOVE.W/.L
+require alignment; for MOVE.B any byte address is legal so the byte
+variants drop the alignment-fail bit.
+
+**Two arms added:**
+
+1. `MOVE.B (d16,An),Dn` (top=0x1, dst_mode=0, src_mode=5) — picks up
+   the less common variants (the dispatch I first wrote based on
+   mis-decoded bit pattern). ~270 boot helpers eliminated.
+
+2. `MOVE.B (d16,An),(Am)` mem-to-mem (top=0x1, dst_mode=2, src_mode=5) —
+   the actual boot-hot `0x10A8`. Uses the M6.76 unified RAM-or-ROM
+   source-bounds shape so A0 / Am can walk ROM-resident system tables
+   (boot's PC=0x400310 dispatches this with A0 → ROM).
+
+**Triple-diff workflow:**
+
+* ctest: 7/7
+* `--diff-jit-trace`: clean through 11 038 cycles
+* Boot 300 K det: 1192 → 896 helpers (−296). Final PC matches.
+* Boot 5 M det:  25 240 → 14 288 helpers (**−10 952**). Same final PC.
+* Boot 100 M:    222 980 → 210 844 compile-time helpers (**−12 136**).
+
+**Perf:**
+
+| Workload | M6.90 | **M6.91** | Δ |
+|----------|------:|----------:|--:|
+| Bench @ 5 M cyc   | 1.340 lx7/cyc | **1.340 lx7/cyc** | unchanged |
+| Bench @ 20 M cyc  | 1.184 lx7/cyc | **1.184 lx7/cyc** | unchanged |
+| Bench @ 100 M cyc | 1.328 lx7/cyc | **1.328 lx7/cyc** | unchanged |
+| Boot @ 300 K det  | 2.158 lx7/cyc | **2.116 lx7/cyc** | **−2.0 %** lx7 |
+| Boot @ 5 M det    | 12 352 738 lx7 → 12 341 855 (M6.87 baseline) → **11 881 871** | **−3.7 %** lx7 |
+| Boot @ 100 M cyc  | 1.734 lx7/cyc | **1.729 lx7/cyc** | **−0.3 %** lx7 |
+
+The boot perf improvement is concentrated on the deterministic windows
+(where MOVE.B-driven ROM-table reads dominate). At 100 M past the
+M6.66 VIA-tick divergence boundary the gain shrinks — that path has
+more MMIO writes and fewer MOVE.B (d16,An) sites.
+
+**First **boot-targeted** win in many milestones** — every prior
+optimization in the M6.85+ series was bench-focused. The MOVE.B class
+is the natural next inline-expansion lever; future M6.92 candidates
+are `MOVE.B (An),Dn` (0x1211 — 6 K boot helpers) and `MOVE.B Dn,(An)`
+(0x1082 — 3 K boot helpers).
+
 ## M6.90 — MOVE.W (As),(Ad) l16ui+s16i when flags dead (delivered)
 
 The inline mem-to-mem MOVE.W writes 2 bytes BE with `xt_l8ui`×2 + `xt_s8i`×2
@@ -332,15 +391,15 @@ them each iteration.
    intermediate register writeback. See M6.85 below for the first
    fusion lever in this class.
 
-## Where things stand right now (post-M6.90)
+## Where things stand right now (post-M6.91)
 
 | Engine | lx7 / cyc | × interp baseline |
 |--------|----------:|------------------:|
 | **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.184** | **5.46 ×** ✅ |
 | **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.328** | **4.87 ×** |
-| **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.734** | **3.40 ×** |
-| **Boot** (Mac Plus ROM, 5 M cycles, PC=`0x40032C` deterministic)    | **2.468** | **2.39 ×** |
-| **Boot** (Mac Plus ROM, 300 K cycles, PC=`0x40032C` deterministic)  | **2.158** | **2.73 ×** |
+| **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.729** | **3.41 ×** |
+| **Boot** (Mac Plus ROM, 5 M cycles, PC=`0x40032C` deterministic)    | **2.376** | **2.49 ×** |
+| **Boot** (Mac Plus ROM, 300 K cycles, PC=`0x40032C` deterministic)  | **2.116** | **2.79 ×** |
 
 **Important note — M6.77 reset.** The bench numbers in this table
 are the **first correct measurements** of the milestone in many

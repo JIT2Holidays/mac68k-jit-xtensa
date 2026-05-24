@@ -56,6 +56,23 @@ static u32 rom_bounds_mask(m68k_cpu *cpu) {
     return (~(sz - 1u)) | 1u;
 }
 
+/* M6.91 — byte-aligned bounds. Drops the `| 1` so any byte address in
+ * RAM (or ROM) passes the AND fast-path. Used by the MOVE.B inline arms. */
+static u32 ram_bounds_mask_byte(m68k_cpu *cpu) {
+    if (!cpu || !cpu->mem) return 0xFFFFFFFFu;
+    if (cpu->mem->overlay) return 0xFFFFFFFFu;
+    u32 sz = cpu->mem->ram_size;
+    if (sz == 0 || (sz & (sz - 1))) return 0xFFFFFFFFu;
+    return ~(sz - 1u);
+}
+static u32 rom_bounds_mask_byte(m68k_cpu *cpu) {
+    if (!cpu || !cpu->mem) return 0xFFFFFFFFu;
+    if (cpu->mem->overlay) return 0xFFFFFFFFu;
+    u32 sz = cpu->mem->rom_size;
+    if (sz == 0 || (sz & (sz - 1))) return 0xFFFFFFFFu;
+    return ~(sz - 1u);
+}
+
 static u32 helper_addr(literal_id id, void *user) {
     m68k_cpu *cpu = (m68k_cpu *)user;
 #if defined(ESP_PLATFORM)
@@ -79,6 +96,8 @@ static u32 helper_addr(literal_id id, void *user) {
             return (cpu && cpu->mem && cpu->mem->rom)
                 ? ((u32)(uintptr_t)cpu->mem->rom - MAC_ROM_BASE)
                 : 0u;
+        case LITERAL_RAM_BOUNDS_BYTE: return ram_bounds_mask_byte(cpu);
+        case LITERAL_ROM_BOUNDS_BYTE: return rom_bounds_mask_byte(cpu);
         default:                return 0;
     }
 #else
@@ -102,6 +121,8 @@ static u32 helper_addr(literal_id id, void *user) {
          * same sentinel base on host — the sim's auto-route handles ROM. */
         case ADDR_ROM_HOST_BASE:
             return (cpu && cpu->mem && cpu->mem->rom) ? HOST_RAM_BASE : 0u;
+        case LITERAL_RAM_BOUNDS_BYTE: return ram_bounds_mask_byte(cpu);
+        case LITERAL_ROM_BOUNDS_BYTE: return rom_bounds_mask_byte(cpu);
         default:                return 0;
     }
 #endif
