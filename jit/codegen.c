@@ -2644,6 +2644,26 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                 emit_move_l_dd(&e, dn, dm, flags_dead[i], &rc);
                 inline_ops++; done = true;
             }
+        } else if (top == 0x2 && mode == 1 && ((w >> 6) & 7) == 0) {
+            /* M6.176 — MOVE.L Am,Dn. thinkc8-folder-open bench's 0x200D
+             * (MOVE.L A5,D0) at PC=0x3ED9E2 ~25 K hits / 100 M.
+             * Absent from boot 100 M and speedo. Sibling of M6.X
+             * MOVE.L Dm,Dn just above; just reads from A reg instead
+             * of D reg. Length 2, cycles 8. */
+            int dn = (w >> 9) & 7;
+            int am = w & 7;
+            int xt_dst = cache_lookup(&rc, G_D(dn));
+            u8 dst = (xt_dst >= 0) ? (u8)xt_dst : 8;
+            emit_read_g(&e, &rc, G_A(am), dst);
+            if (xt_dst >= 0) {
+                for (int s = 0; s < rc.active; s++)
+                    if (rc.guest[s] == (u8)G_D(dn)) { rc.dirty |= (u16)(1u << s); break; }
+            } else {
+                xt_s32i(&e, dst, R_CPU, OFF_D(dn));
+            }
+            if (!flags_dead[i]) emit_logic_flags(&e, dst);
+            emit_advance(&e, 2, 8);
+            inline_ops++; done = true;
         } else if (top == 0x2 && ((w >> 6) & 7) == 1 && mode <= 1) {
             /* M6.85 — Peek for fusion: MOVEA.L <Dm|Am>,Am followed by
              * ADDA.W <Dx|Ax>,Am (same Am). If the op after the ADDA is
