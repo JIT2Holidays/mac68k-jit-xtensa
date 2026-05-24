@@ -1,13 +1,51 @@
 # Status
 
-## Where things stand right now (post-M6.143)
+## Where things stand right now (post-M6.152)
 
 | Engine | lx7 / cyc | real_lx7 / cyc | × interp baseline (host) |
 |--------|----------:|---------------:|-------------------------:|
-| **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.164** | **1.165** | **5.55 ×** ✅ |
-| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.183** | **1.184** | **5.46 ×** ✅ |
-| **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.665** | **1.666** | **3.88 ×** |
+| **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.163** | **1.164** | **5.56 ×** ✅ |
+| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.183** | **1.183** | **5.46 ×** ✅ |
+| **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.664** | **1.664** | **3.88 ×** |
 | **Boot** (Mac Plus ROM, 5 M cycles, PC=`0x40032C` deterministic)    | **2.196** | **2.196** | **2.94 ×** |
+
+## M6.149-M6.152 — pure register-op inline series 🎯
+
+After M6.148's bridge-arm revert clarified that **pure register-op
+arms are the trajectory-safe sweet spot** (independent of boot-fire
+count), four consecutive iterations landed wins on this category:
+
+| Milestone | Pattern | Boot 100M helpers Δ |
+|-----------|---------|--------------------:|
+| **M6.149** | ROXL.B/W/L #imm,Dn (sibling of M6.143 ROXR) | **-1 701** |
+| **M6.150** | ROR/ROL.B/W/L #imm,Dn plain rotate (RO type) | -697 |
+| **M6.151** | ASL.B/W #imm,Dn (left arith, V flag detection) | -441 |
+| **M6.152** | ADDA.L Dm/Am,An (sibling of M6.104 ADDA.W) | -653 |
+| **Total** | | **-3 492 (-1.9 %)** |
+
+| Workload | Pre-iter (M6.148 revert) | Post-iter | Δ |
+|----------|-------------------------:|----------:|--:|
+| Bench 20M `lx7/cyc` | 1.164 | **1.163** | **-0.001** |
+| Bench helpers | 2 744 | **2 504** | -240 (-9 %) |
+| Boot 5M det helpers | 54 | **22** | -32 (-59 %) |
+| Boot 100M `lx7/cyc` | 1.665 | **1.664** | **-0.001** |
+| Boot 100M helpers | 181 951 | **178 459** | **-3 492** |
+| Boot 100M jit_cost | 166 511 K | **166 361 K** | **-150 K LX7** |
+
+The rule validated: pure register-op extensions of existing arm
+classes are safe regardless of boot 100M fire count. M6.149 ROXL
+caught 1 688 boot fires; M6.150 ROR caught 696; M6.151 ASL caught
+244; M6.152 ADDA.L caught 645. All four landed cleanly.
+
+### M6.151 ASL implementation gotcha — clobbered R_SR
+
+First attempt used `xt_movi(e, 14, ...)` for V-flag scratch — **a14
+is R_SR**! Bench diverged at PC=0x41E054 with SR interp=0x2704 vs
+jit=0x0004 (upper byte T/S/IPL cleared). Fixed by routing all V-
+computation through a11/a12/a13. a13 (R_HELP) is safe as scratch in
+pure-inline code where no CALLX0 happens.
+
+## M6.148 finding — sibling-symmetry isn't enough for bridge arms
 
 ## Trajectory-safe inline series — M6.141, M6.142, M6.143
 
