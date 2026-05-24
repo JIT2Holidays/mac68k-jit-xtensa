@@ -1,13 +1,57 @@
 # Status
 
-## Where things stand right now (post-M6.137)
+## Where things stand right now (post-M6.139)
 
 | Engine | lx7 / cyc | real_lx7 / cyc | × interp baseline (host) |
 |--------|----------:|---------------:|-------------------------:|
 | **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.168** | **1.169** | **5.53 ×** ✅ |
 | **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.184** | **1.184** | **5.46 ×** ✅ |
 | **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.665** | **1.666** | **3.88 ×** |
-| **Boot** (Mac Plus ROM, 5 M cycles, PC=`0x40032C` deterministic)    | **2.197** | **2.197** | **2.94 ×** |
+| **Boot** (Mac Plus ROM, 5 M cycles, PC=`0x40032C` deterministic)    | **2.196** | **2.196** | **2.94 ×** |
+
+## M6.138 + M6.139 — small inline wins on Dn-form ops 🎯
+
+Two small Dn-form arms after M6.137 closed out the bench-hot F-line zone:
+
+* **M6.138 — TST.W Dn** (sibling of M6.101's TST.B / TST.L Dn). Boot 5 M
+  det's 0x4A45 was 38 of 93 deterministic-window helpers (~41 %).
+  Result: boot 5 M det helpers 93 → 55.
+* **M6.139 — CLR.B/W/L Dn**. Bench 5 M's 0x4240 (CLR.W D0) at 85 hits +
+  similar; one arm for all three sizes. Result: bench helpers 4 105 →
+  3 937 (−168). No trajectory shift; boot 100 M unchanged.
+
+Both committed cleanly. `lx7/cyc` at 3-decimal precision unchanged
+(savings absorbed below the rounding boundary) but `real_helpers` and
+`jit_cost` both improved on the targeted workloads.
+
+### Attempted but reverted: M6.139 ROR/ROL.B/W/L #imm,Dn
+
+The boot 5 M det's biggest remaining helpers were three ROL.B #1,Dn at
+0x40025{8,A,C} (24 of the 55 helpers). Wrote a generic ROR/ROL.B/W/L
+#imm,Dn inline arm (sibling of M6.97/98/99 LSR/ASR family). It worked
+correctly (ctest 7/7, --diff-jit-trace 11 038 clean) and dropped boot
+5 M det helpers 55 → 31 (-24, the ROL.B fires) and bench 100 M helpers
+4 105 → 3 316 (-789).
+
+But boot 100 M regressed **+0.18 %** (1.665 → 1.668). The arm shifted
+the M6.66 chaotic trajectory significantly:
+
+* `blocks=104K/1.07M` → `76K/1.46M` (33 % more compiles)
+* `inline_ops=6.19M` → `4.52M` (fewer total inline executions)
+* `xt_instrs=154.88M` → `155.86M` (more total Xtensa ops)
+* Boot ended at `PC=0x000000` instead of `0x12C4E5FD` — different
+  divergent path entirely.
+
+Per the [[m6.66-trajectory-traps]] memory's decision framework, regression
+in boot 100 M is acceptable IF a real-workload metric improved. Boot 5 M
+det `lx7/cyc` did move 2.197 → 2.196 (+0.045 %), but the boot 100 M cost
+(-0.146 %) outweighs the boot 5 M det gain. Reverted.
+
+The lesson: ROR/ROL.B inlines fire in both pre-divergence (small win) and
+post-divergence (chaotic). The trajectory disruption from changing the
+block code in the divergence region exceeds the local op-level savings.
+Pattern: ROL.B is a "shared" arm that's mostly post-divergence — bad
+candidate. CLR.B/W/L Dn is bench-pre-divergence-only — safe candidate.
 
 ## M6.137 — F-line trap fast helper — bench 100 M real_lx7 1.197 → 1.184 (−1.09 %) 🎯
 
