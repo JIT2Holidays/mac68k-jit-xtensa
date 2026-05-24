@@ -6760,6 +6760,80 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             }
             emit_advance(&e, 2, 4);
             inline_ops++; done = true;
+        } else if ((w & 0xFFF8) == 0x4E58) {
+            /* M6.173 — UNLK An. thinkc8-folder-open bench's 0x4E5E
+             * (UNLK A6) at PC=0x3E9800 — subroutine epilogue stack-frame
+             * teardown. ~50K helpers/100 M cyc; absent from boot 100 M
+             * and almost absent from speedo (34 hits in 100 M).
+             * M6.142 trajectory-safe.
+             *
+             * Semantics (per m68k_interp.c:1048):
+             *     cpu->a[7]  = cpu->a[an];
+             *     cpu->a[an] = mac_read32(cpu->mem, cpu->a[7]);
+             *     cpu->a[7] += 4;
+             *
+             * For An==7 (UNLK A7, rare/degenerate) the writes overlap;
+             * we follow the interp order exactly so the final a[7] =
+             * popped_value + 4 matches.
+             *
+             * MMIO falls through to the default m68k_step helper —
+             * the stack is virtually always in RAM, so the fast path
+             * dominates. Length 2, cycles 16 (base 4 + handler 12). */
+            int an = w & 7;
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(an), 8);          /* a8 = cpu->a[an] */
+
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_unlk = 2, op_cyc_unlk = 16;
+            /* UNLK touches a[an] and a[7]. */
+            g_helper_touched_mask = (u16)((1u << G_A(an)) | (1u << G_A(7)));
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_unlk, op_cyc_unlk)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_unlk, op_cyc_unlk);
+            g_helper_touched_mask = 0xFFFFu;
+            u32 junlk_pos = e.len;
+            xt_j    (&e, 4);
+
+            /* Fast path:
+             *   a[7] = a8  (= original a[an])
+             *   a10 = mem32(a8)
+             *   a[an] = a10
+             *   a[7] = a[7] + 4 (read back a[7] in case an==7 caused
+             *                    the prior write to be overlaid). */
+            emit_write_g(&e, &rc, G_A(7), 8);
+
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);                     /* a9 = ram + addr */
+            xt_l8ui (&e, 11, 9, 0);
+            xt_l8ui (&e, 12, 9, 1);
+            xt_slli (&e, 10, 11, 24);
+            xt_slli (&e, 12, 12, 16);
+            xt_or   (&e, 10, 10, 12);
+            xt_l8ui (&e, 11, 9, 2);
+            xt_l8ui (&e, 12, 9, 3);
+            xt_slli (&e, 11, 11, 8);
+            xt_or   (&e, 10, 10, 11);
+            xt_or   (&e, 10, 10, 12);                  /* a10 = popped .L */
+            emit_write_g(&e, &rc, G_A(an), 10);        /* a[an] = popped */
+
+            emit_read_g(&e, &rc, G_A(7), 11);
+            xt_addi (&e, 11, 11, 4);
+            emit_write_g(&e, &rc, G_A(7), 11);         /* a[7] += 4 */
+
+            emit_advance(&e, op_pc_unlk, op_cyc_unlk);
+
+            u32 here_unlk = e.len;
+            i32 jo_unlk = (i32)(here_unlk - junlk_pos) - 4;
+            u32 jw_unlk = ((u32)((u32)jo_unlk & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + junlk_pos    ] = (u8)jw_unlk;
+            base[entry_off + junlk_pos + 1] = (u8)(jw_unlk >> 8);
+            base[entry_off + junlk_pos + 2] = (u8)(jw_unlk >> 16);
+
+            inline_ops++; done = true;
         } else if (top == 0x4 && ((w >> 8) & 0xF) == 0xA && szf == 0
                    && mode == 7 && (w & 7) == 0) {
             /* TST.B (xxx).W — bench-hot 0x4A38 at ~15 K helpers in 20 M cyc
