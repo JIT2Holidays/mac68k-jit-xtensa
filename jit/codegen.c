@@ -1921,6 +1921,55 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + jlL_pos + 2] = (u8)(jwL >> 16);
 
             inline_ops++; done = true;
+        } else if (top == 0x2 && ((w >> 6) & 7) == 1 && mode == 3) {
+            /* MOVEA.L (An)+,Am — bench-hot 0x28D8 (MOVEA.L (A0)+,A4) at
+             * ~71 K helpers in 20M cyc (M6.74). Mirrors MOVE.L (An)+,Dn
+             * but writes 32-bit result to Am (no sign-extend needed for
+             * long), no flag computation (MOVEA never touches CCR). */
+            int dst_am = (w >> 9) & 7;        /* dst Am */
+            int src_an = w & 7;               /* src An (post-incr) */
+
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(src_an), 8);
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_mAl = 2, op_cyc_mAl = 8;
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_mAl, op_cyc_mAl)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_mAl, op_cyc_mAl);
+            u32 jmAl_pos = e.len;
+            xt_j    (&e, 4);
+            /* Fast path: 4 BE byte loads. */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);
+            xt_l8ui (&e, 11, 9, 0);
+            xt_l8ui (&e, 12, 9, 1);
+            xt_slli (&e, 10, 11, 24);
+            xt_slli (&e, 12, 12, 16);
+            xt_or   (&e, 10, 10, 12);
+            xt_l8ui (&e, 11, 9, 2);
+            xt_l8ui (&e, 12, 9, 3);
+            xt_slli (&e, 11, 11, 8);
+            xt_or   (&e, 10, 10, 11);
+            xt_or   (&e, 10, 10, 12);                /* a10 = .L */
+            emit_write_g(&e, &rc, G_A(dst_am), 10);
+            /* Post-increment An by 4 (the src). */
+            xt_addi (&e, 8, 8, 4);
+            emit_write_g(&e, &rc, G_A(src_an), 8);
+            /* MOVEA — no flags. */
+            emit_advance(&e, op_pc_mAl, op_cyc_mAl);
+
+            u32 mAl_here = e.len;
+            i32 jo_mAl = (i32)(mAl_here - jmAl_pos) - 4;
+            u32 jwAl = ((u32)((u32)jo_mAl & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jmAl_pos    ] = (u8)jwAl;
+            base[entry_off + jmAl_pos + 1] = (u8)(jwAl >> 8);
+            base[entry_off + jmAl_pos + 2] = (u8)(jwAl >> 16);
+
+            inline_ops++; done = true;
         } else if (top == 0x2 && ((w >> 6) & 7) == 4 && (mode == 0 || mode == 1)) {
             /* MOVE.L Dn|Am,-(An) — pre-decrement push pattern (boot 0x24C3
              * MOVE.L D3,-(A2) ~5 K, bench 0x2F08 MOVE.L A0,-(SP) ~2 K).
@@ -2205,6 +2254,57 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + jpdw_pos + 2] = (u8)(jw_pdw >> 16);
 
             inline_ops++; done = true;
+        } else if (top == 0x4 && ((w >> 8) & 0xF) == 0x2 && szf == 2 && mode == 3) {
+            /* CLR.L (An)+ — bench-warm 0x4299 (CLR.L (A1)+) at ~26 K helpers
+             * in 20M cyc (M6.74). Long sibling of M6.73's CLR.W (An)+. Same
+             * shape but writes 4 zero bytes, post-increments An by 4. CLR
+             * cycle accounting is size-independent in the interp (base 4 +
+             * handler 4 = 8 cyc). */
+            int an = w & 7;
+
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(an), 8);
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_clrl = 2, op_cyc_clrl = 8;
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_clrl, op_cyc_clrl)));
+
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_clrl, op_cyc_clrl);
+            u32 jclrl_pos = e.len;
+            xt_j    (&e, 4);
+
+            /* Fast path: write 4 zero bytes at [ram_base + An], An += 4. */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);
+            xt_movi (&e, 11, 0);
+            xt_s8i  (&e, 11, 9, 0);
+            xt_s8i  (&e, 11, 9, 1);
+            xt_s8i  (&e, 11, 9, 2);
+            xt_s8i  (&e, 11, 9, 3);
+            xt_addi (&e, 8, 8, 4);
+            emit_write_g(&e, &rc, G_A(an), 8);
+            if (!flags_dead[i]) {
+                xt_movi (&e, 12, -16);
+                xt_and  (&e, R_SR, R_SR, 12);
+                xt_movi (&e, 12, 0x04);
+                xt_or   (&e, R_SR, R_SR, 12);
+                g_sr_dirty = true;
+                sext_memo_invalidate();
+            }
+            emit_advance(&e, op_pc_clrl, op_cyc_clrl);
+
+            u32 here_clrl = e.len;
+            i32 jo_clrl = (i32)(here_clrl - jclrl_pos) - 4;
+            u32 jw_clrl = ((u32)((u32)jo_clrl & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jclrl_pos    ] = (u8)jw_clrl;
+            base[entry_off + jclrl_pos + 1] = (u8)(jw_clrl >> 8);
+            base[entry_off + jclrl_pos + 2] = (u8)(jw_clrl >> 16);
+
+            inline_ops++; done = true;
         } else if (top == 0x4 && ((w >> 8) & 0xF) == 0x2 && szf == 1 && mode == 3) {
             /* CLR.W (An)+ — bench-hot 0x4258 at ~23 % of all helpers (M6.73).
              * Speedometer runs a memset-zero loop body that hammers this.
@@ -2257,6 +2357,21 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + jclr_pos + 1] = (u8)(jw_clr >> 8);
             base[entry_off + jclr_pos + 2] = (u8)(jw_clr >> 16);
 
+            inline_ops++; done = true;
+        } else if (top == 0xB && szf == 3 && ((w >> 8) & 1) == 1 && (mode == 0 || mode == 1)) {
+            /* CMPA.L (Dn|An),An — bench-hot 0xB1C9 (CMPA.L A1,A0) at
+             * 21 % of 20M-cyc helpers (M6.74). 32-bit register-source
+             * compare: An_dst - <src.L>. Sets full N/Z/V/C, leaves X
+             * unchanged (CMPA never writes X). 2-byte instruction;
+             * 10 cycles (interp base 4 + handler 6). */
+            int dst_an = (w >> 9) & 7;
+            int src_reg = w & 7;
+            int g_src = (mode == 1) ? G_A(src_reg) : G_D(src_reg);
+            emit_read_g(&e, &rc, g_src, 8);            /* a8 = src .L */
+            emit_read_g(&e, &rc, G_A(dst_an), 9);      /* a9 = dst .L */
+            xt_sub(&e, 10, 9, 8);                       /* a10 = d - s */
+            emit_addsub_flags_long_masked(&e, true, true, 8, 9, 10, flags_needed[i]);
+            emit_advance(&e, 2, 10);
             inline_ops++; done = true;
         } else if (top == 0xB && szf == 3 && ((w >> 8) & 1) == 0 && mode == 5) {
             /* CMPA.W (d16,An),An — bench-hot 0xBC6D (~6.8 %).

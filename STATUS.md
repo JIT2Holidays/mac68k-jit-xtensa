@@ -844,6 +844,64 @@ helper-eviction work.
 
 ctest: **7 / 7** pass.
 
+**M6.74 — three more hot-opcode native emits (CMPA.L, MOVEA.L (An)+, CLR.L).**
+The M6.73 / `JIT_HELPER_HISTO` re-scan at 20 M-cycle bench found a
+new top entry: `0xB1C9` (CMPA.L A1, A0) at **272 K hits — 21 % of
+all bench helpers and ≈ 17 % of total bench `jit_cost`**. Inlining
+it is the single biggest helper-eviction left on the table.
+
+Added three emits in one batch:
+
+| Opcode | Form | 20 M bench count | Notes |
+|--------|------|-----------------:|-------|
+| `0xB1C9` etc. | `CMPA.L (Dn|An),An` | 272 K | Register-source. `top==0xB && szf==3 && (w>>8)&1==1 && mode∈{0,1}`. Two reads + sub + flags via `emit_addsub_flags_long_masked` (with `keep_x=true` — CMPA never writes X). 2 bytes / 10 cyc. |
+| `0x28D8` etc. | `MOVEA.L (An)+,Am` | 71 K | Long sibling of the M6.62 `MOVE.L (An)+,Dn` arm; writes to An (no flags). Still helper-bound 71 K times in 20 M cyc because the bench reads ROM tables — RAM_BOUNDS only validates the RAM range. |
+| `0x4299` etc. | `CLR.L (An)+`     | 26 K | Long sibling of M6.73's CLR.W (An)+. 4-byte zero-write + 4-byte post-incr; same CLR-specific flag emit. |
+
+**Workflow** ran the new triple-diff SOP unchanged: after each emit,
+ctest → diff-jit-trace (DIVERGENCE only at the documented M6.66
+cycle 11898) → boot @ 300 K and 5 M (PC=`0x40032C` and helpers
+both still match the M6.73 baseline — these opcodes are bench-hot,
+not boot-hot, so the boot path is undisturbed).
+
+**Perf delta (post-M6.74):**
+
+| Workload | M6.73 | M6.74 | Δ |
+|----------|------:|------:|--:|
+| Bench @ 11 K cyc (deterministic) | 405 helpers, 3.959 lx7/cyc | **385 helpers, 3.873 lx7/cyc** | −20 helpers, **−2.2 % lx7** |
+| Bench @ 5 M cyc (PC=`0x401F52` both) | 197 K helpers, 3.969 lx7/cyc | **115 K helpers, 2.932 lx7/cyc** | −82 K helpers, **−26 % lx7** |
+| Bench @ 20 M cyc (PC=`0x40115E` both) | 796 K helpers, 3.978 lx7/cyc | **469 K helpers, 2.950 lx7/cyc** | −327 K helpers, **−26 % lx7** |
+| Boot @ 5 M cyc (deterministic) | 25240 helpers, 2.603 lx7/cyc | 25240 helpers, 2.603 lx7/cyc | identical (boot not hot on these ops) |
+| Boot @ 100 M cyc | 1.734 lx7/cyc | 1.734 lx7/cyc | identical |
+
+The bench gain is the largest single jump since the M6.30s. CMPA.L
+A1,A0 was a single inner-loop instruction in Speedometer's
+result-tally code that the JIT had been bridging to `m68k_step` ~14
+million times per 100 M-cyc run.
+
+**Why MOVEA.L (An)+ still shows 71 K helpers** (didn't drop):
+Bench's hot loop reads structure pointers out of a ROM-resident
+table (PC ≈ `0x408???`). The current RAM_BOUNDS literal only
+validates the **RAM** range; ROM reads always go to the helper.
+Extending the fast path to also cover ROM (which is read-only, so
+no SMC tracking concerns) is the next obvious step — listed in
+"Open follow-ups" below.
+
+ctest: **7 / 7** pass.
+
+### Open follow-ups after M6.74
+
+* **Extend the bounds-check literal to admit ROM reads.** ROM at
+  `0x400000-0x41FFFF` is a single contiguous range; a two-mask
+  emit (RAM accept OR ROM accept) would unlock ~71 K bench helper
+  conversions and likely matter on the ESP32 hardware where
+  byte-by-byte ROM reads dominate boot's MOVE.B-heavy init code.
+* **Overlay-aware bounds check.** During Mac Plus overlay (the
+  first ~300 K cycles of boot), `ram_bounds_mask` returns all-ones
+  → every memory op goes to the helper. Boot's overlay phase is
+  ~25 K helpers in 5 M cyc; adding a second mask for the overlay's
+  RAM-at-0x600000 placement would knock ≥ 80 % of those out.
+
 Alternative real-software pair if synthetic benchmarks aren't the
 goal: **Dark Castle** (VIA-timer-driven sound + raster bit-banging
 — tests M3's "good enough to pace 60 Hz VBL, not instruction-cycle-
