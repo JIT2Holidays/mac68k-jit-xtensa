@@ -5886,6 +5886,79 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
 
             inline_ops++; done = true;
         } else if (top == 0x0 && !((w >> 8) & 1) && ((w >> 9) & 7) == 4
+                   && mode == 7 && (w & 7) == 0) {
+            /* M6.113 — BTST / BCHG / BCLR / BSET #imm,(xxx).W. Static
+             * bit op against a low-RAM absolute address (sign-extended
+             * 16-bit ext word). Bench-hot 0x08F8 (BSET #imm,(xxx).W)
+             * at 21 K helpers / 100 M cyc on the post-cycle-11898 path.
+             *
+             * `which = (w >> 6) & 3`: 0=BTST, 1=BCHG, 2=BCLR, 3=BSET.
+             * For byte EA, bit number = imm_word & 7. Cycles 8 (m68k_step
+             * base 4 + handler 4); length 6 (op + imm.W + abs.W).
+             *
+             * Sets ONLY Z = !old_bit. Other CCR bits unchanged.
+             *
+             * Compile-time RAM check on abs_addr (M6.77 pattern). For
+             * non-BTST ops, the byte is read-modified-written; BTST just
+             * reads and sets Z. */
+            int which = szf;  /* (w >> 6) & 3 = 0..3 */
+            u16 imm_word = mac_read16(cpu->mem, op_pc[i] + 2);
+            int bit = imm_word & 7;
+            u16 abs_word = mac_read16(cpu->mem, op_pc[i] + 4);
+            u32 abs_addr = (u32)(i32)(i16)abs_word;
+            abs_addr &= 0xFFFFFFu;
+
+            u32 ram_size = cpu->mem ? cpu->mem->ram_size : 0;
+            bool overlay = cpu->mem ? cpu->mem->overlay : true;
+            bool ram_pow2 = ram_size > 0 && (ram_size & (ram_size - 1)) == 0;
+            bool addr_in_ram = !overlay && ram_pow2 && abs_addr < ram_size;
+
+            if (addr_in_ram) {
+                emit_advance_flush(&e);
+                emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                             entry_off + e.len);
+                if ((i32)abs_addr >= -128 && (i32)abs_addr <= 127) {
+                    xt_addi(&e, 9, 9, (i32)abs_addr);
+                } else if ((i32)abs_addr >= -2048 && (i32)abs_addr <= 2047) {
+                    xt_movi(&e, 10, (i32)abs_addr);
+                    xt_add (&e, 9, 9, 10);
+                } else {
+                    emit_load_imm(&e, 10, 11, abs_addr);
+                    xt_add (&e, 9, 9, 10);
+                }
+                xt_l8ui (&e, 10, 9, 0);                 /* a10 = byte */
+                xt_extui(&e, 11, 10, (u8)bit, 0);       /* a11 = old bit (0/1) */
+
+                /* For BCHG/BCLR/BSET: modify and write back. */
+                if (which != 0) {
+                    int mask = 1 << bit;
+                    if (which == 1) {        /* BCHG: byte ^= mask */
+                        xt_movi(&e, 12, mask);
+                        xt_xor (&e, 10, 10, 12);
+                    } else if (which == 2) { /* BCLR: byte &= ~mask */
+                        xt_movi(&e, 12, ~mask & 0xFF);
+                        xt_and (&e, 10, 10, 12);
+                    } else {                 /* BSET: byte |= mask */
+                        xt_movi(&e, 12, mask);
+                        xt_or  (&e, 10, 10, 12);
+                    }
+                    xt_s8i(&e, 10, 9, 0);
+                }
+
+                /* Update SR.Z (bit 2): set if old bit was 0, clear else.
+                 * Other CCR bits unchanged. */
+                xt_movi(&e, 12, -5);                    /* ~0x04 */
+                xt_and(&e, R_SR, R_SR, 12);
+                xt_movi(&e, 12, 0x04);
+                xt_bnez(&e, 11, 6);                     /* skip OR if bit set */
+                xt_or(&e, R_SR, R_SR, 12);
+                g_sr_dirty = true;
+                sext_memo_invalidate();
+                emit_advance(&e, 6, 8);
+                inline_ops++; done = true;
+            }
+            /* else: fall through to helper. */
+        } else if (top == 0x0 && !((w >> 8) & 1) && ((w >> 9) & 7) == 4
                    && szf == 0 && mode == 5) {
             /* BTST #imm,(d16,An) — boot-hot 0x082D at 214 K execs.
              * Byte EA: bit & 7 selects the bit to test. Sets only Z.
