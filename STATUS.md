@@ -97,6 +97,29 @@ forward is structural, not piecemeal. Three items, biggest-win-first:
 
 ### 1. Full register caching of hot D/A regs across a block
 
+**Empirical update (post-M6.139): cache miss rate is already < 1 %.**
+Measured compile-time hit/miss counts via temporary instrumentation:
+
+| Workload | Read hit | Read miss | Read miss % | Write hit | Write miss | Write miss % |
+|----------|---------:|----------:|------------:|----------:|-----------:|-------------:|
+| Bench 100 M  | 235 265   | 642   | **0.3 %** | 2 224   | 423   | 16.0 % |
+| Boot  100 M  | 6 351 301 | 3 048 | **0.0 %** | 3 031 355 | 2 714 | **0.1 %** |
+| Boot 5 M det | 71        | 58    | 45.0 %    | 23      | 39    | 62.9 % |
+
+The picker (top-4 most-frequent guest regs per block, with a `≥ 2 uses`
+threshold) already covers ~99 % of accesses on the steady-state
+workloads. Cache widening (adding `a8..a9` as R_CACHE4/5) would shave
+the remaining < 1 % — not worth the inline-arm scratch-register churn.
+
+The boot 5 M det miss rate is high (~50 %) because init code compiles
+many tiny blocks where the picker's `≥ 2 uses` threshold leaves most
+regs uncached. But this is < 5 % of boot's total runtime; the picker
+is right to leave them uncached (extra cache-load overhead per block
+outweighs the per-op savings on a tiny block).
+
+**Implication for Item 1:** The "eliminates intra-block l32i/s32i pairs"
+premise is already substantially achieved. Remaining sub-items:
+
 Current cache holds 4 hot guest regs in `a4..a7` (`R_CACHE0..3`), picked
 at block-compile time. Hits eliminate `l32i`/`s32i`; misses fall back to
 `cpu_state` loads/stores. Two known limits:
