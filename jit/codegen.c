@@ -2529,7 +2529,9 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             xt_and  (&e, 10, 8, 9);
             emit_cache_flush(&e, &rc);
             i32 op_pc_wp = 2, op_cyc_wp = 8;
-            /* Custom MMIO helper bridge — replaces m68k_step for VIA reads. */
+            /* Custom MMIO helper bridge — replaces m68k_step for VIA reads.
+             * M6.127 — m68k_jit_move_w_postinc_to_dn modifies Dn and An. */
+            g_helper_touched_mask = (u16)((1u << G_D(dn)) | (1u << G_A(an)));
             u32 wp_bridge_size = emit_jit_fast_helper_size(&rc);
             xt_beqz (&e, 10, (i32)(6u + wp_bridge_size));
             /* a8 still has An (the addr). Use it for jit_arg1 (helper ignores
@@ -2537,6 +2539,7 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             emit_jit_fast_helper(&e, 8, dn | (an << 4),
                                  lit_off[HELPER_JIT_MOVE_W_POSTINC_TO_DN],
                                  entry_off, &rc);
+            g_helper_touched_mask = 0xFFFFu;
             (void)op_pc_wp; (void)op_cyc_wp;
             u32 jwp_pos = e.len;
             xt_j    (&e, 4);
@@ -2600,9 +2603,12 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             xt_and  (&e, 10, 8, 9);
             emit_cache_flush(&e, &rc);
             i32 op_pc_lan = 2, op_cyc_lan = 8;
+            /* M6.127 — MOVE.L (An),Dn modifies only Dn (An is read). */
+            g_helper_touched_mask = (u16)(1u << G_D(dn));
             xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_lan, op_cyc_lan)));
             emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
                                               entry_off, &rc, op_pc_lan, op_cyc_lan);
+            g_helper_touched_mask = 0xFFFFu;
             u32 jlan_pos = e.len;
             xt_j    (&e, 4);
             /* Fast path: read 4 BE bytes into a10 (.L value). */
@@ -3512,9 +3518,13 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
 
             emit_cache_flush(&e, &rc);
             i32 op_pc_mb2 = 4, op_cyc_mb2 = 8;
+            /* M6.127 — MOVE.B (d16,An),(Am) modifies no D/A reg
+             * (memory + CCR only; both An and Am are read for EAs). */
+            g_helper_touched_mask = 0u;
             xt_beqz (&e, 12, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_mb2, op_cyc_mb2)));
             emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
                                               entry_off, &rc, op_pc_mb2, op_cyc_mb2);
+            g_helper_touched_mask = 0xFFFFu;
             u32 jmb2_pos = e.len;
             xt_j    (&e, 4);
 
@@ -3635,9 +3645,12 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             xt_and  (&e, 12, 10, 11);
             emit_cache_flush(&e, &rc);
             i32 op_pc_b3 = 2, op_cyc_b3 = 8;
+            /* M6.127 — MOVE.B (An)+,Dn modifies Dn and An (post-incr). */
+            g_helper_touched_mask = (u16)((1u << G_D(dn)) | (1u << G_A(an)));
             xt_beqz (&e, 12, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_b3, op_cyc_b3)));
             emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
                                               entry_off, &rc, op_pc_b3, op_cyc_b3);
+            g_helper_touched_mask = 0xFFFFu;
             u32 jb3_pos = e.len;
             xt_j    (&e, 4);
 
@@ -3687,9 +3700,13 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             xt_and  (&e, 10, 8, 9);
             emit_cache_flush(&e, &rc);
             i32 op_pc_b4 = 2, op_cyc_b4 = 8;
+            /* M6.127 — MOVE.B Dn,(An)+ modifies only An (post-incr).
+             * Dn is read for the byte; not modified by helper. */
+            g_helper_touched_mask = (u16)(1u << G_A(dst_an));
             xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_b4, op_cyc_b4)));
             emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
                                               entry_off, &rc, op_pc_b4, op_cyc_b4);
+            g_helper_touched_mask = 0xFFFFu;
             u32 jb4_pos = e.len;
             xt_j    (&e, 4);
 
@@ -4782,11 +4799,14 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
              * next flush adds the accumulator just once. */
             i32 op_pc_delta = 2, op_cyc = 8;
             emit_cache_flush(&e, &rc);   /* before conditional helper */
+            /* M6.127 — MOVE.W (An),Dn modifies only Dn. */
+            g_helper_touched_mask = (u16)(1u << G_D(dn));
             xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_delta, op_cyc)));
 
             /* 3. Helper path (mov + l32r + callx0 + undo PC/cyc + sr_reload + cache_reload). */
             emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
                                               entry_off, &rc, op_pc_delta, op_cyc);
+            g_helper_touched_mask = 0xFFFFu;
 
             /* 4. j past fast path — backpatched after fast path. */
             u32 jad_pos = e.len;
