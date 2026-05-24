@@ -541,6 +541,49 @@ that dumps R_SR and cpu->sr just before the standard return, to
 distinguish "R_SR is correct in-register but flushed wrong" from
 "R_SR is wrong in-register".
 
+**M6.68 — root-caused + fixed.**
+Followed M6.66's "next iteration" plan: instrumented the simulator
+to log every `xt_or`/`xt_and` touching R_SR (a14) and every `s16i`
+to OFF_SR. Trace showed R_SR ending at 0x2700 in-register but
+`cpu->sr` becoming 0x2704 after the block.
+
+Root cause: `emit_helper_step_after_flush_undo` is called from the
+*slow-path* branch of a beqz/bnez. Its first emission is an
+`emit_sr_flush`. At runtime that s16i only fires on the slow path,
+but the *compile-time* `emit_sr_flush` clears `g_sr_dirty`. The rest
+of the block then "thinks" R_SR has been flushed, and the epilogue's
+own `emit_sr_flush` becomes a no-op. On the fast path (e.g., RTS
+with SP in RAM, no bridge), R_SR's prior modifications (ADDQ.W's
+flag writes) are still live but never reach `cpu->sr`.
+
+Fix: snapshot `g_sr_dirty` on entry of `emit_helper_step_after_flush_undo`
+and restore it on exit. Diff-jit-trace divergence moved from
+step 36 (cycle 1666) to step 350 (cycle 11898). The remaining
+"divergence" at 350 is the documented VIA-tick granularity artifact
+— only VIA registers differ, no register/PC/SR/RAM diffs.
+
+**M6.69 — same fix applied to `emit_jit_fast_helper`.**
+Same shape (called from the slow-path branch of a beqz, with an
+internal `emit_sr_flush`). Used by the MOVE.W (An)+,Dn MMIO fast-
+helper bridge. Same snapshot-and-restore fix.
+
+Bench 1.279 / boot 1.735 unchanged across M6.68 + M6.69.
+ctest 3/3.
+
+**Remaining divergence (≥ 50 K cycles) is not a JIT bug.** It's
+downstream propagation from the VIA-tick granularity artifact:
+Speedometer reads VIA T1, the JIT and interp see slightly different
+timer values (~4 emulated cycles apart), code branches differently.
+Fixing would require per-instruction `mac_mem_tick` in the JIT too
+— a substantial perf hit. Documented as a known limitation of the
+timing model (matches M3's "good enough to pace ~60 Hz VBL, not
+instruction-cycle-accurate" note).
+
+**Triple-differential SOP vindicated.** M6.68 was a real correctness
+bug present at least since M6.61 (and probably earlier) that ctest
+missed. `--diff-jit` on the real benchmark snapshot caught it
+immediately. Workflow memory at `memory/triple-differential.md`.
+
 Alternative real-software pair if synthetic benchmarks aren't the
 goal: **Dark Castle** (VIA-timer-driven sound + raster bit-banging
 — tests M3's "good enough to pace 60 Hz VBL, not instruction-cycle-
