@@ -4554,6 +4554,28 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             }
             /* else: empty reglist — fall through to helper. */
         } else if (top == 0x4 && ((w >> 6) & 7) == 7
+                   && mode == 7 && (w & 7) == 2) {
+            /* M6.107 — LEA (d16,PC),An — bench-hot 0x41FA at 21 K helpers /
+             * 100 M cyc (in the bench's post-cycle-11898 path). Target is
+             * a compile-time constant: An = op_pc + 2 + sext16(d16).
+             *
+             * Same length (4) and cycles (8) as the other LEA forms.
+             * Stash target in the literal pool when possible for a 1-op
+             * l32r; otherwise emit_load_imm32 (10 ops). */
+            int an = (w >> 9) & 7;
+            u16 ext = mac_read16(cpu->mem, op_pc[i] + 2);
+            u32 target = op_pc[i] + 2 + (u32)(i32)(i16)ext;
+
+            if (g_pc_lit_valid && target == g_pc_lit_val) {
+                emit_l32r_at(&e, 8, g_pc_lit_off,
+                             g_pc_lit_entry_off + e.len);
+            } else {
+                emit_load_imm32(&e, 8, 9, target);
+            }
+            emit_write_g(&e, &rc, G_A(an), 8);
+            emit_advance(&e, 4, 8);
+            inline_ops++; done = true;
+        } else if (top == 0x4 && ((w >> 6) & 7) == 7
                    && (mode == 2 || mode == 5 || mode == 6
                        || (mode == 7 && (w & 7) <= 1))) {
             /* LEA <ea>,An */

@@ -1,5 +1,49 @@
 # Status
 
+## M6.107 — LEA (d16,PC),An inline — bench 100 M crosses 5.04 × interp
+
+The existing LEA arm covered srcmode 2/5/6/7-0/7-1 but not mode 7/2
+(PC-relative `(d16,PC)`). Bench 100 M's helper-histo revealed
+0x41FA (LEA (d16,PC),A0) at **21 K helpers / 100 M cyc** — the
+biggest single missing inline on the bench's post-cycle-11898 path.
+
+The target is a compile-time constant: `An = op_pc + 2 + sext16(d16)`.
+Implementation is the leanest of any branch-class arm — just an
+`emit_load_imm32` (or l32r if the target happens to match
+LITERAL_BCC_PC) followed by `emit_write_g(An)`. Length 4, cycles 8.
+
+**Triple-diff workflow:**
+
+* ctest: 7/7
+* `--diff-jit-trace`: clean through 11 038 cycles
+* Boot 5 M det: 144 → 139 helpers (−5)
+* Boot 100 M: 185 842 → 185 612 helpers (−230); no cycle drift
+* Bench (20 M): 6 868 → 6 828 helpers (−40)
+* Bench (100 M): 226 445 → 204 807 helpers (**−21 638**)
+
+**Perf:**
+
+| Workload | M6.106 | **M6.107** | Δ |
+|----------|------:|----------:|--:|
+| Bench (20 M)     | 1.177 lx7/cyc | **1.177** | unchanged |
+| **Bench (100 M)** | 1.292 lx7/cyc | **1.281 lx7/cyc** | **−0.85 %** lx7 |
+| Boot @ 100 M cyc | 1.717 lx7/cyc | **1.716 lx7/cyc** | within noise |
+
+🎯 **Bench 100 M crosses 5.04 × interp** — biggest single-arm bench
+100 M improvement since M6.105's BSR.W (which crossed 5.00 ×).
+
+The pattern: bench's post-M6.66-divergence path runs through a code
+region rich in PC-relative addressing (probably trap dispatch tables
+or compiled C functions). Catching `LEA (d16,PC),An` saves the
+helper for what is effectively a constant load + write.
+
+Cumulative M6.84 → M6.107:
+* Bench (20 M): 1.257 → **1.177** (−6.4 %)
+* Bench (100 M): 1.396 → **1.281** (−8.2 %)
+* Boot 300 K det: 2.170 → **1.975** (−9.0 %)
+* Boot 5 M det:   2.471 → **2.236** (−9.5 %)
+* Boot 100 M:     1.734 → **1.716** (−1.0 %)
+
 ## M6.106 — BRA.W / Bcc.W disp16 inline
 
 Companion to M6.105's BSR.W: handles the conditional/unconditional .W
@@ -1033,13 +1077,13 @@ them each iteration.
    intermediate register writeback. See M6.85 below for the first
    fusion lever in this class.
 
-## Where things stand right now (post-M6.106)
+## Where things stand right now (post-M6.107)
 
 | Engine | lx7 / cyc | × interp baseline |
 |--------|----------:|------------------:|
 | **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.177** | **5.49 ×** ✅ |
-| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.292** | **5.00 ×** ✅ |
-| **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.717** | **3.44 ×** |
+| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.281** | **5.04 ×** ✅ |
+| **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.716** | **3.45 ×** |
 | **Boot** (Mac Plus ROM, 5 M cycles, PC=`0x40032C` deterministic)    | **2.236** | **2.64 ×** |
 | **Boot** (Mac Plus ROM, 300 K cycles, PC=`0x40032C` deterministic)  | **1.975** | **2.99 ×** |
 
