@@ -2221,11 +2221,30 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                          entry_off + e.len);
             xt_add  (&e, 8, 8, 11);                  /* a8 = ram + src */
             xt_add  (&e, 9, 9, 11);                  /* a9 = ram + dst */
-            xt_l8ui (&e, 10, 8, 0);                  /* read high */
-            xt_l8ui (&e, 12, 8, 1);                  /* read low  */
-            xt_s8i  (&e, 10, 9, 0);                  /* write high */
-            xt_s8i  (&e, 12, 9, 1);                  /* write low  */
-            if (!flags_dead[i]) {
+            if (flags_dead[i]) {
+                /* M6.90 — when flags are dead, the byte order in the
+                 * intermediate register doesn't matter; only the bytes
+                 * landing at mem[dst+0..1] in BE order matters. Xtensa's
+                 * `l16ui at,as,imm` reads bytes p[0]+(p[1]<<8) (little-
+                 * endian in the register), and `s16i at,as,imm` writes
+                 * back byte-swapped. The net effect is a 2-byte copy
+                 * preserving BE order on the destination — saves 2 LX7
+                 * ops per execution (4 byte ops → 1 l16ui + 1 s16i).
+                 *
+                 * Bench's 0x3692 (MOVE.W (A2),(A3)) at ~60 K runtime
+                 * iters / 20 M cyc × 2 LX7 saved ≈ 0.5 % bench.
+                 *
+                 * Alignment: LITERAL_RAM_BOUNDS = `~(ram_size-1) | 1`
+                 * fails the AND fast-path for any odd address, so the
+                 * fast path only runs when both src and dst are 2-byte
+                 * aligned (l16ui/s16i requirement). */
+                xt_l16ui(&e, 10, 8, 0);
+                xt_s16i (&e, 10, 9, 0);
+            } else {
+                xt_l8ui (&e, 10, 8, 0);              /* read high */
+                xt_l8ui (&e, 12, 8, 1);              /* read low  */
+                xt_s8i  (&e, 10, 9, 0);              /* write high */
+                xt_s8i  (&e, 12, 9, 1);              /* write low  */
                 /* Assemble .W only when flags are actually consumed. */
                 xt_slli (&e, 10, 10, 8);
                 xt_or   (&e, 10, 10, 12);            /* a10 = .W value */

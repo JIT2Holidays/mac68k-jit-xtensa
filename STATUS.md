@@ -1,5 +1,58 @@
 # Status
 
+## M6.90 — MOVE.W (As),(Ad) l16ui+s16i when flags dead (delivered)
+
+The inline mem-to-mem MOVE.W writes 2 bytes BE with `xt_l8ui`×2 + `xt_s8i`×2
+= 4 LX7 ops. When the lazy-CC pass sets flags_dead = true, the
+intermediate register value isn't needed — only the bytes landing at
+`mem[dst+0..1]` in BE order matter.
+
+Xtensa's `l16ui at,as,imm` reads `p[0] + (p[1] << 8)` (little-endian
+into register), and `s16i at,as,imm` writes `p[0] = at[7:0]; p[1] = at[15:8]`.
+Used together as a copy:
+
+```
+src bytes [0xHI, 0xLO]  →  l16ui →  register = 0xLOHI (byte-swapped)
+                        →  s16i  →  dst bytes [0xHI, 0xLO]    (BE preserved)
+```
+
+Net: 2 LX7 ops (l16ui + s16i) replace 4 (l8ui×2 + s8i×2) when flags
+are dead. Alignment safety: `LITERAL_RAM_BOUNDS = ~(ram_size-1) | 1`
+fails the AND fast-path for any odd address, so l16ui/s16i's 2-byte
+alignment requirement is already enforced.
+
+**Triple-diff workflow:**
+
+* ctest: 7/7
+* `--diff-jit-trace`: clean through 11 038 cycles
+* Boot 300 K / 5 M / 100 M det: byte-identical (this opcode doesn't
+  appear on the deterministic boot path or 100 M ROM init)
+
+**Perf:**
+
+| Workload | M6.88 | **M6.90** | Δ |
+|----------|------:|----------:|--:|
+| Bench @ 5 M cyc   | 1.350 | **1.340** | **−0.7 %** lx7 |
+| Bench @ 20 M cyc  | 1.191 | **1.184** | **−0.6 %** lx7 |
+| Bench @ 100 M cyc | 1.334 | **1.328** | **−0.5 %** lx7 |
+| Boot 300 K / 5 M / 100 M det | unchanged | unchanged | — |
+
+**Cumulative M6.84 → M6.90:**
+
+| Workload | M6.84 | M6.90 | Δ |
+|----------|------:|------:|--:|
+| Bench @ 20 M cyc  | 1.257 | **1.184** | **−5.8 %** lx7 |
+| Bench @ 100 M cyc | 1.396 | **1.328** | **−4.9 %** lx7 |
+
+**Bench is now 1.184 lx7/cyc @ 20 M cyc = 5.46 × interp baseline.**
+
+The byte-swap trick generalises to any mem-to-mem .W or .L copy where
+the register value's byte order doesn't matter (flags dead, no
+intermediate use). Future candidates: MOVE.L mem-to-mem
+((An)+,(Am)+ at line 2556) — would need a 4-byte version using
+`l32i` + `s32i` on word-aligned addresses, save 6 ops per call
+(8 byte ops → l32i + s32i).
+
 ## M6.88 — MOVE.W Dm,Dn skip-flags lean path (delivered)
 
 Same class as M6.87 but for `MOVE.W Dm,Dn`. When the lazy-CC pass
@@ -279,12 +332,12 @@ them each iteration.
    intermediate register writeback. See M6.85 below for the first
    fusion lever in this class.
 
-## Where things stand right now (post-M6.88)
+## Where things stand right now (post-M6.90)
 
 | Engine | lx7 / cyc | × interp baseline |
 |--------|----------:|------------------:|
-| **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.191** | **5.42 ×** ✅ |
-| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.334** | **4.84 ×** |
+| **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.184** | **5.46 ×** ✅ |
+| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.328** | **4.87 ×** |
 | **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.734** | **3.40 ×** |
 | **Boot** (Mac Plus ROM, 5 M cycles, PC=`0x40032C` deterministic)    | **2.468** | **2.39 ×** |
 | **Boot** (Mac Plus ROM, 300 K cycles, PC=`0x40032C` deterministic)  | **2.158** | **2.73 ×** |
