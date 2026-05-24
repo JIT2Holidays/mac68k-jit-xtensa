@@ -1,5 +1,39 @@
 # Status
 
+## M6.96 — TST.B (xxx).W + Bcc.S fusion (delivered)
+
+Sibling of M6.95 TST.L + Bcc fusion, applied to the M6.77 TST.B (xxx).W
+inline arm (the bench-hot 0x4A38 at 15 K helpers / 20 M cyc that only
+admits compile-time-known RAM addresses).
+
+The byte value is shifted left by 24 so its bit 7 becomes bit 31 of
+the register; passing `s == d == r == shifted_byte` to
+`emit_cmp_cond_fused` makes V cancel (s == d) and N = bit31 = byte
+sign — exactly matching the .B TST CCR convention. Same cc∈{6, 7, 13,
+15} coverage as the M6.95 TST.L pattern.
+
+The first attempt always shifted the byte; the revised version only
+shifts when fusion fires OR `!flags_dead`. For pure flags_dead + no-
+fusion paths (e.g., TST.B (xxx).W followed by a setter), no shift is
+emitted.
+
+**Triple-diff workflow:**
+
+* ctest: 7/7
+* `--diff-jit-trace`: clean through 11 038 cycles
+* Boot 300 K / 5 M / 100 M det: byte-identical to M6.95
+
+**Perf:** bench dropped 264 LX7 (1.183 unchanged at lx7/cyc resolution).
+The fusion fires modestly — most TST.B (xxx).W hot calls land at MMIO
+addresses (caught by the M6.77 compile-time RAM check and routed to
+m68k_step before the arm runs). Inside the arm's RAM-path, the
+follow-on Bcc is less common than I expected.
+
+The win is again structural — pattern is now established for any
+single-operand-then-Bcc combination. Future candidates: TST.W
+(xxx).W (not currently inlined), SWAP+Bcc, EXT.W/EXT.L+Bcc, BSET
+result+Bcc.
+
 ## M6.95 — TST.L + Bcc.S fusion (delivered)
 
 Extends the M6.30 CMP+Bcc fusion infrastructure to TST.L Dn followed

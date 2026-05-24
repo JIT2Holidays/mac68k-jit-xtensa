@@ -4745,6 +4745,28 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             bool addr_in_ram = !overlay && ram_pow2 && abs_addr < ram_size;
 
             if (addr_in_ram) {
+                /* M6.95 — TST.B + Bcc.S fusion (sibling of M6.95 TST.L+Bcc).
+                 * The byte's bit 7 becomes bit 31 after shift, so passing
+                 * s == d == r == shifted_byte to emit_cmp_cond_fused makes
+                 * V cancel (s==d) and N=bit31(r)=byte sign, Z=(byte==0). */
+                bool fuse_tb = false;
+                int fuse_tb_cc = 0;
+                i32 fuse_tb_disp = 0;
+                u32 fuse_tb_ft = 0;
+                if (i + 1 < n_ops) {
+                    u16 nw = op_word[i + 1];
+                    if ((nw >> 12) == 0x6) {
+                        int cc = (nw >> 8) & 0xF;
+                        i32 disp = (i8)(nw & 0xFF);
+                        if ((cc == 6 || cc == 7 || cc == 13 || cc == 15) && disp != 0 && disp != -1) {
+                            fuse_tb = true;
+                            fuse_tb_cc = cc;
+                            fuse_tb_disp = disp;
+                            fuse_tb_ft = op_pc[i + 1] + 2;
+                        }
+                    }
+                }
+
                 emit_advance_flush(&e);
                 emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
                              entry_off + e.len);
@@ -4759,14 +4781,25 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                     xt_add (&e, 9, 9, 10);
                 }
                 xt_l8ui(&e, 10, 9, 0);          /* a10 = byte */
-                if (!flags_dead[i]) {
+                if (fuse_tb) {
+                    /* Shift byte to bit 31 so N = byte's sign. */
+                    xt_slli(&e, 10, 10, 24);
+                    emit_cmp_cond_fused(&e, fuse_tb_cc, 10, 10, 10);
+                    /* TST.B base 4 + Bcc.S base 12 = 16 cyc folded. */
+                    emit_bcc_branchless_tail(&e, fuse_tb_ft, fuse_tb_disp, 16);
+                    g_pc_acc = 0;
+                    g_cyc_acc = 0;
+                    i++;   /* skip absorbed Bcc.S */
+                } else if (!flags_dead[i]) {
                     /* Shift byte to bit 31 so emit_logic_flags sees the
                      * .B sign bit at the same position it would for a 32-
                      * bit value, and Z is preserved (zero-shifted-zero). */
                     xt_slli(&e, 10, 10, 24);
                     emit_logic_flags(&e, 10);
+                    emit_advance(&e, 4, 4);          /* len 4 (op+ext), 4 cyc */
+                } else {
+                    emit_advance(&e, 4, 4);
                 }
-                emit_advance(&e, 4, 4);          /* len 4 (op+ext), 4 cyc */
                 inline_ops++; done = true;
             }
             /* else: fall through to the generic helper-step path below. */
