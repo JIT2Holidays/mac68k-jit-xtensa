@@ -2399,6 +2399,59 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             /* ADD.L Dm/Am,Dn — M6.104 extends to An source. */
             emit_add_l_dd(&e, (w >> 9) & 7, w & 7, mode == 1, flags_dead[i], &rc);
             inline_ops++; done = true;
+        } else if ((top == 0x9 || top == 0xD) && ((w >> 8) & 1)
+                   && szf == 2 && mode == 0) {
+            /* M6.142 — ADDX.L / SUBX.L Dm,Dn. Bench-only per the full
+             * helper-histo scan: 476 hits across 4 instances (d984/d381/
+             * d981/9383) at pc=0x41E6xx; the pattern (top=9/D, bit8=1,
+             * szf=2, mode=0) is STRICTLY ABSENT from boot 100M, so
+             * inlining doesn't shift the M6.66 trajectory.
+             *
+             * ADDX semantics differ from plain ADD/SUB in two ways:
+             *   1) carry/borrow include the X input (the standard
+             *      C-formula (s & d) | (~r & (s | d)) works for r =
+             *      s + d + X — verified by hand calculation);
+             *   2) Z is STICKY: Z_new = Z_prev AND (result == 0).
+             *
+             * X is written = C (keep_x=false to emit_addsub_flags_long_masked).
+             *
+             * Cycles: m68k_step base 4 + handler 8 = 12 (m68k_interp uses
+             * cycles += 8 for all ADDX/SUBX sizes uniformly). */
+            bool is_sub = (top == 0x9);
+            int s = w & 7;          /* src Dn */
+            int d = (w >> 9) & 7;   /* dst Dn */
+
+            emit_read_g(&e, &rc, G_D(s), 8);     /* a8 = src */
+            emit_read_g(&e, &rc, G_D(d), 9);     /* a9 = dst */
+            /* Read X into a12 (NOT a10 — we'll keep the result in a10
+             * because emit_addsub_flags_long_masked uses a11/a12/a13 as
+             * internal scratch and would clobber a result placed there). */
+            xt_extui(&e, 12, R_SR, 4, 0);         /* a12 = X (bit 4 of SR) */
+            if (is_sub) {
+                xt_sub  (&e, 10, 9, 8);          /* a10 = dst - src */
+                xt_sub  (&e, 10, 10, 12);        /* a10 = dst - src - X */
+            } else {
+                xt_add  (&e, 10, 8, 9);          /* a10 = src + dst */
+                xt_add  (&e, 10, 10, 12);        /* a10 = src + dst + X */
+            }
+            emit_write_g(&e, &rc, G_D(d), 10);
+
+            if (!flags_dead[i]) {
+                /* Compute N/V/C plus X=C, leave Z untouched in R_SR.
+                 * The helper writes to a8/a11/a12/a13 internally; passing
+                 * r=10 keeps the result safe (also the convention used by
+                 * the existing CMP.W Dm,Dn arm). */
+                emit_addsub_flags_long_masked(&e, is_sub, false, 8, 9, 10,
+                                               CCR_BIT_N | CCR_BIT_V | CCR_BIT_C);
+                /* Sticky Z: if r != 0, clear Z bit (else preserve). */
+                xt_movi (&e, 12, -5);            /* 0xFFFFFFFB — clear bit 2 */
+                xt_beqz (&e, 10, 6);             /* if r == 0, skip the AND */
+                xt_and  (&e, R_SR, R_SR, 12);    /* r != 0: clear Z */
+                g_sr_dirty = true;
+                sext_memo_invalidate();
+            }
+            emit_advance(&e, 2, 12);
+            inline_ops++; done = true;
         } else if (top == 0x5 && szf == 2 && mode == 0) {
             /* ADDQ.L / SUBQ.L #imm,Dn */
             int data = (w >> 9) & 7; if (data == 0) data = 8;
