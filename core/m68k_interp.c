@@ -719,6 +719,24 @@ void m68k_jit_bsr_w_mmio(m68k_cpu *cpu) {
     cpu->pc = cpu->jit_arg1;
 }
 
+void m68k_jit_move_l_postinc_to_dn_mmio(m68k_cpu *cpu) {
+    /* MOVE.L (An)+,Dn — bench-hot 0x201F (MOVE.L (A7)+,D0) at 21 808
+     * helpers / 100 M cyc when SP→MMIO. Args: jit_arg2 packed = dn |
+     * (an << 4). Reads .L from cpu->a[an], writes to cpu->d[dn], post-
+     * increments An by 4. MOVE-family flags (N/Z from .L, V/C=0,
+     * X preserved). */
+    int dn = (int)(cpu->jit_arg2 & 7);
+    int an = (int)((cpu->jit_arg2 >> 4) & 7);
+    u32 addr = cpu->a[an];
+    u32 v = mac_read32(cpu->mem, addr);
+    cpu->d[dn] = v;
+    cpu->a[an] = addr + 4;
+    u8 ccr = m68k_get_ccr(cpu) & CCR_X;
+    if (v == 0)             ccr |= CCR_Z;
+    if (v & 0x80000000u)    ccr |= CCR_N;
+    m68k_set_ccr(cpu, ccr);
+}
+
 void m68k_step(m68k_cpu *cpu) {
     /* Once the CPU has halted (e.g. the guest wrote the debug exit port),
      * further steps are no-ops. This keeps a JIT block — which may contain

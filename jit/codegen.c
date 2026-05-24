@@ -2899,11 +2899,17 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             xt_and  (&e, 10, 8, 9);
             emit_cache_flush(&e, &rc);
             i32 op_pc_lL = 2, op_cyc_lL = 8;
+            /* M6.132 — fast helper for MMIO. Helper uses jit_arg2's packed
+             * dn|an<<4 to know which regs to touch (reads cpu->a[an], not
+             * the a8 we pre-loaded). Cycles owned by JIT's emit_advance. */
             g_helper_touched_mask = (u16)((1u << G_D(dn)) | (1u << G_A(an)));
-            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_lL, op_cyc_lL)));
-            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
-                                              entry_off, &rc, op_pc_lL, op_cyc_lL);
+            u32 lL_bridge_size = emit_jit_fast_helper_size(&rc);
+            xt_beqz (&e, 10, (i32)(6u + lL_bridge_size));
+            emit_jit_fast_helper(&e, 8, dn | (an << 4),
+                                 lit_off[HELPER_JIT_MOVE_L_POSTINC_TO_DN_MMIO],
+                                 entry_off, &rc);
             g_helper_touched_mask = 0xFFFFu;
+            (void)op_pc_lL; (void)op_cyc_lL;
             u32 jlL_pos = e.len;
             xt_j    (&e, 4);
             /* Fast path: read 4 BE bytes into a10 (the .L value). */
