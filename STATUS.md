@@ -1,5 +1,51 @@
 # Status
 
+## M6.111 — AND.L / OR.L (xxx).W,Dn — bench 100 M crosses 5.20 × interp
+
+Continues the (xxx).W class to the logic-ALU family. Bench's
+0xC4B8 (AND.L (xxx).W,D2) at 21 K helpers / 100 M cyc was the next
+hot un-inlined (xxx).W variant.
+
+Combined arm handles both AND.L and OR.L (top=0xC and 0x8 respectively),
+since they share the read-modify-write structure — only differ in the
+combine op (xt_and vs xt_or). Same M6.77/M6.108 compile-time RAM check.
+
+EOR.L (xxx).W is structurally different (EOR only has Dn,(ea) form,
+not (ea),Dn) — would need a separate write-back arm. Skipped since
+bench doesn't show EOR.L (xxx).W in the top helpers.
+
+**Triple-diff workflow:**
+
+* ctest: 7/7
+* `--diff-jit-trace`: clean through 11 038 cycles
+* Boot 5 M det / 100 M: byte-identical (no cycle drift)
+* Bench (20 M): 6 647 → 6 570 helpers (−77)
+* Bench (100 M): 139 832 → 118 158 helpers (**−21 674**)
+
+**Perf:**
+
+| Workload | M6.110 | **M6.111** | Δ |
+|----------|------:|----------:|--:|
+| Bench (20 M)     | 1.177 lx7/cyc | **1.176** | **−0.08 %** |
+| **Bench (100 M)** | 1.253 lx7/cyc | **1.242 lx7/cyc** | **−0.88 %** lx7 |
+| Boot @ 100 M cyc | 1.716 lx7/cyc | **1.716** | within noise |
+
+🎯 **Bench 100 M crosses 5.20 × interp** — sixth consecutive 100 M
+bench improvement:
+* M6.105 BSR.W:           5.00 ×
+* M6.107 LEA(d16,PC):     5.04 ×
+* M6.108 (xxx).W .L:      5.08 ×
+* M6.109 (xxx).W .W/.B:   5.12 ×
+* M6.110 Dn,(xxx).W:      5.16 ×
+* M6.111 AND/OR.L (xxx).W: 5.20 ×
+
+Cumulative M6.84 → M6.111:
+* Bench (20 M): 1.257 → **1.176** (−6.4 %)
+* Bench (100 M): 1.396 → **1.242** (−11.0 %)
+* Boot 300 K det: 2.170 → **1.975** (−9.0 %)
+* Boot 5 M det:   2.471 → **2.236** (−9.5 %)
+* Boot 100 M:     1.734 → **1.716** (−1.0 %)
+
 ## M6.110 — MOVE.W / MOVE.B Dn,(xxx).W — bench 100 M crosses 5.16 × interp
 
 Write-side counterparts to M6.109's MOVE.W/.B (xxx).W,Dn. Bench's 0x31C0
@@ -1219,12 +1265,12 @@ them each iteration.
    intermediate register writeback. See M6.85 below for the first
    fusion lever in this class.
 
-## Where things stand right now (post-M6.110)
+## Where things stand right now (post-M6.111)
 
 | Engine | lx7 / cyc | × interp baseline |
 |--------|----------:|------------------:|
-| **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.177** | **5.49 ×** ✅ |
-| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.253** | **5.16 ×** ✅ |
+| **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.176** | **5.49 ×** ✅ |
+| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.242** | **5.20 ×** ✅ |
 | **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.716** | **3.45 ×** |
 | **Boot** (Mac Plus ROM, 5 M cycles, PC=`0x40032C` deterministic)    | **2.236** | **2.64 ×** |
 | **Boot** (Mac Plus ROM, 300 K cycles, PC=`0x40032C` deterministic)  | **1.975** | **2.99 ×** |

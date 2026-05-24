@@ -5687,6 +5687,71 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             emit_logic_l_dd_kind(&e, (w >> 9) & 7, w & 7, (w >> 9) & 7,
                                  0, flags_dead[i], &rc);
             inline_ops++; done = true;
+        } else if ((top == 0xC || top == 0x8) && szf == 2 && !((w >> 8) & 1)
+                   && mode == 7 && (w & 7) == 0) {
+            /* M6.111 — AND.L (xxx).W,Dn  /  OR.L (xxx).W,Dn — bench-hot
+             * 0xC4B8 (AND.L (xxx).W,D2) at 21 K helpers / 100 M cyc on
+             * bench's post-cycle-11898 path.
+             *
+             * Compile-time RAM check (M6.77/M6.108 pattern): if the
+             * .W absolute addr is in RAM and 2-aligned, inline the
+             * 4-byte BE read + AND/OR with Dn + write back + logic
+             * flags. Else fall through to helper. Length 4, cycles 8. */
+            int dn = (w >> 9) & 7;
+            bool is_or = (top == 0x8);
+            u16 ext = mac_read16(cpu->mem, op_pc[i] + 2);
+            u32 abs_addr = (u32)(i32)(i16)ext;
+            abs_addr &= 0xFFFFFFu;
+
+            u32 ram_size = cpu->mem ? cpu->mem->ram_size : 0;
+            bool overlay = cpu->mem ? cpu->mem->overlay : true;
+            bool ram_pow2 = ram_size > 0 && (ram_size & (ram_size - 1)) == 0;
+            bool addr_in_ram = !overlay && ram_pow2
+                               && abs_addr < ram_size
+                               && (abs_addr & 1) == 0;
+
+            if (addr_in_ram) {
+                emit_advance_flush(&e);
+                emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                             entry_off + e.len);
+                if ((i32)abs_addr >= -128 && (i32)abs_addr <= 127) {
+                    xt_addi(&e, 9, 9, (i32)abs_addr);
+                } else if ((i32)abs_addr >= -2048 && (i32)abs_addr <= 2047) {
+                    xt_movi(&e, 10, (i32)abs_addr);
+                    xt_add (&e, 9, 9, 10);
+                } else {
+                    emit_load_imm(&e, 10, 11, abs_addr);
+                    xt_add (&e, 9, 9, 10);
+                }
+                /* Read 4 BE bytes into a10 (.L source value). */
+                xt_l8ui (&e, 11, 9, 0);
+                xt_l8ui (&e, 12, 9, 1);
+                xt_slli (&e, 10, 11, 24);
+                xt_slli (&e, 12, 12, 16);
+                xt_or   (&e, 10, 10, 12);
+                xt_l8ui (&e, 11, 9, 2);
+                xt_l8ui (&e, 12, 9, 3);
+                xt_slli (&e, 11, 11, 8);
+                xt_or   (&e, 10, 10, 11);
+                xt_or   (&e, 10, 10, 12);          /* a10 = .L value */
+
+                /* Read Dn (cache-slot direct if cached). */
+                int dn_xt = cache_lookup(&rc, G_D(dn));
+                u8 dn_reg = (dn_xt >= 0) ? (u8)dn_xt : 11;
+                if (dn_xt < 0) emit_read_g(&e, &rc, G_D(dn), 11);
+                if (is_or) xt_or (&e, dn_reg, dn_reg, 10);
+                else       xt_and(&e, dn_reg, dn_reg, 10);
+                if (dn_xt >= 0) {
+                    for (int s = 0; s < rc.active; s++)
+                        if (rc.guest[s] == (u8)G_D(dn)) { rc.dirty |= (u16)(1u << s); break; }
+                } else {
+                    emit_write_g(&e, &rc, G_D(dn), 11);
+                }
+                if (!flags_dead[i]) emit_logic_flags(&e, dn_reg);
+                emit_advance(&e, 4, 8);
+                inline_ops++; done = true;
+            }
+            /* else: fall through to helper. */
         } else if (top == 0xB && szf == 2 && ((w >> 8) & 1) && mode == 0) {
             /* EOR.L Dn,Dm  (result -> Dm) */
             emit_logic_l_dd(&e, (w >> 9) & 7, w & 7, w & 7, true, &rc);
