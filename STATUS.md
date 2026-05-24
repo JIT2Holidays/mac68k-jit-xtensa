@@ -1,5 +1,33 @@
 # Status
 
+## M6.93 — MOVE.L Dn|Am,(An) inline (delivered)
+
+Fills the dst_mode=2 gap in the MOVE.L Dn|Am,<ea> arm series.
+Existing arms covered post-incr (M6.91-era), pre-dec (M6.91), and
+(d16,An) (M6.73), but plain (An) destination was unhandled. Boot's
+0x228a (`MOVE.L A2,(A1)`) at 626 hits is the most common variant.
+
+Sibling of the M6.91-era MOVE.L Dn|Am,(An)+ arm — same RAM-only
+byte-bounds, 4 BE byte stores, MOVE-family flags — but without the
+post-increment.
+
+**Triple-diff workflow:**
+
+* ctest: 7/7
+* `--diff-jit-trace`: clean through 11 038 cycles
+* Boot 300 K / 5 M det: unchanged from M6.92 (0x228a not in deterministic
+  windows; the variant appears in longer boot paths)
+* Boot 100 M: 195 104 → 194 458 compile-time helpers (−646)
+
+**Perf:** marginal at the lx7/cyc resolution — boot 100M jit_cost
+dropped by 29 680 LX7 (646 helper bridges × 64 helpers-equivalent
+minus 11 664 extra inline ops). The win is well below the rounding
+threshold for lx7/cyc but real on the raw counter. All other workloads
+unchanged.
+
+The MOVE.L Dn|Am,<ea> family is now complete for dst_modes {2, 3, 4, 5}
+× src_modes {0, 1}. Plain `MOVE.L Dn,Dm` is already covered separately.
+
 ## M6.92 — MOVE.B (An),Dn + MOVE.B Dn,(An) inline (delivered)
 
 Continuation of the M6.91 MOVE.B class. Two more arms covering the
@@ -440,7 +468,7 @@ them each iteration.
    intermediate register writeback. See M6.85 below for the first
    fusion lever in this class.
 
-## Where things stand right now (post-M6.92)
+## Where things stand right now (post-M6.93)
 
 | Engine | lx7 / cyc | × interp baseline |
 |--------|----------:|------------------:|

@@ -2529,6 +2529,49 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + jpi_pos + 2] = (u8)(jw_pi >> 16);
 
             inline_ops++; done = true;
+        } else if (top == 0x2 && ((w >> 6) & 7) == 2 && (mode == 0 || mode == 1)) {
+            /* M6.93 — MOVE.L Dn|Am,(An) — boot's 0x228a (MOVE.L A2,(A1))
+             * at 626 helpers, plus various other A/D source variants.
+             * Sibling of the M6.91-era MOVE.L Dn|Am,(An)+ arm just below
+             * but without the post-increment. Same RAM-only byte-bounds
+             * (writes to ROM not supported); 4 byte stores BE; MOVE-family
+             * flags from the .L value. Length 2, cycles 8. */
+            int an = (w >> 9) & 7;            /* dst An (no post-incr) */
+            int dm = w & 7;                   /* src reg */
+            int g_src = (mode == 1) ? G_A(dm) : G_D(dm);
+
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(an), 8);
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_lp2 = 2, op_cyc_lp2 = 8;
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_lp2, op_cyc_lp2)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_lp2, op_cyc_lp2);
+            u32 jlp2_pos = e.len;
+            xt_j    (&e, 4);
+            /* Fast path: load src reg, write 4 BE bytes. */
+            emit_read_g(&e, &rc, g_src, 10);
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);
+            xt_extui(&e, 11, 10, 24, 7); xt_s8i(&e, 11, 9, 0);
+            xt_extui(&e, 11, 10, 16, 7); xt_s8i(&e, 11, 9, 1);
+            xt_extui(&e, 11, 10,  8, 7); xt_s8i(&e, 11, 9, 2);
+            xt_extui(&e, 11, 10,  0, 7); xt_s8i(&e, 11, 9, 3);
+            if (!flags_dead[i]) emit_logic_flags(&e, 10);
+            emit_advance(&e, op_pc_lp2, op_cyc_lp2);
+
+            u32 here_lp2 = e.len;
+            i32 jo_lp2 = (i32)(here_lp2 - jlp2_pos) - 4;
+            u32 jw_lp2 = ((u32)((u32)jo_lp2 & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jlp2_pos    ] = (u8)jw_lp2;
+            base[entry_off + jlp2_pos + 1] = (u8)(jw_lp2 >> 8);
+            base[entry_off + jlp2_pos + 2] = (u8)(jw_lp2 >> 16);
+
+            inline_ops++; done = true;
         } else if (top == 0x2 && ((w >> 6) & 7) == 3 && (mode == 0 || mode == 1)) {
             /* MOVE.L Dn|Am,(An)+ — boot-hot 0x20C1 at 262 K execs / 60 M cycles.
              * Bounds check the An address; on fast path do 4 byte writes
