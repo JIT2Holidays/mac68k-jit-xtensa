@@ -446,6 +446,28 @@ static void emit_logic_flags(xt_emit *e, u8 vreg) {
     sext_memo_invalidate();
 }
 
+/* M6.119 — MOVE-family flags with COMPILE-TIME-known N/Z. Saves 3-5
+ * LX7 ops vs `emit_logic_flags(e, dst)` whose extui/slli/bnez chain
+ * computes N and Z at RUNTIME. For MOVEQ / MOVE.L #imm32 / MOVE.W
+ * #imm16 / MOVE.B #imm8, the value being written is the immediate,
+ * so N (= bit 31) and Z (= value == 0) are known at compile time.
+ *
+ * Preserves X (bit 4+), clears V/C, sets N/Z to compile-time values. */
+static void emit_logic_flags_const(xt_emit *e, u32 value) {
+    bool n = (value & 0x80000000u) != 0;
+    bool z = (value == 0);
+    u32 ccr_bits = (n ? 0x08u : 0u) | (z ? 0x04u : 0u);
+    xt_movi(e, 10, -16);                    /* keep bits 4+ */
+    xt_and (e, R_SR, R_SR, 10);
+    if (ccr_bits != 0) {
+        /* ccr_bits ∈ {0x04, 0x08, 0x0C} — always in xt_movi's range. */
+        xt_movi(e, 10, (i32)ccr_bits);
+        xt_or  (e, R_SR, R_SR, 10);
+    }
+    g_sr_dirty = true;
+    sext_memo_invalidate();
+}
+
 /* MOVEQ #imm8,Dn — d[n] = sign-extend(imm8); MOVE-family flags. */
 static void emit_moveq(xt_emit *e, u16 op, bool skip_flags, regcache *rc) {
     int dn = (op >> 9) & 7;
@@ -459,7 +481,7 @@ static void emit_moveq(xt_emit *e, u16 op, bool skip_flags, regcache *rc) {
     } else {
         xt_s32i(e, dst, R_CPU, OFF_D(dn));
     }
-    if (!skip_flags) emit_logic_flags(e, dst);
+    if (!skip_flags) emit_logic_flags_const(e, (u32)imm);
     emit_advance(e, 2, 4);
 }
 
@@ -474,7 +496,7 @@ static void emit_move_l_imm_dn(xt_emit *e, int dn, u32 imm, bool skip_flags, reg
     } else {
         xt_s32i(e, dst, R_CPU, OFF_D(dn));
     }
-    if (!skip_flags) emit_logic_flags(e, dst);
+    if (!skip_flags) emit_logic_flags_const(e, imm);
     emit_advance(e, 6, 8);
 }
 
@@ -2312,8 +2334,8 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             xt_or   (&e, 11, 11, 10);
             emit_write_g(&e, &rc, G_D(dn), 11);
             if (!flags_dead[i]) {
-                xt_slli (&e, 8, 10, 16);            /* sign of .W in bit 31 */
-                emit_logic_flags(&e, 8);
+                /* M6.119 — compile-time N/Z from .W imm (bit 15 → N, imm==0 → Z). */
+                emit_logic_flags_const(&e, (u32)imm << 16);
             }
             emit_advance(&e, 4, 8);                 /* length 4 (op + imm16) */
             inline_ops++; done = true;
@@ -6109,10 +6131,13 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             xt_and(&e, 10, 8, 9);
             emit_cache_flush(&e, &rc);
             i32 op_pc_bt = 6, op_cyc_bt = 8;
-            /* Custom MMIO helper bridge (mirrors the ORI.B M6.42 pattern). */
+            /* Custom MMIO helper bridge (mirrors the ORI.B M6.42 pattern).
+             *
+             * M6.119 — btst_b_mmio doesn't touch guest D/A regs (only
+             * reads byte, sets Z); SKIP emit_cache_reload (saves 3 LX7
+             * × active slots per fire). */
             u32 btst_bridge_size = 3*7;  /* mov, l32r, callx0, sr_reload, 3 setup */
             if (g_sr_dirty) btst_bridge_size += 3;
-            btst_bridge_size += (u32)rc.active * 3;
             xt_beqz(&e, 10, (i32)(6u + btst_bridge_size));
             /* --- Custom MMIO BTST helper bridge. --- */
             sext_memo_invalidate();
@@ -6126,7 +6151,7 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             xt_callx0(&e, R_HELP);
             g_block_emitted_callx0 = true;  /* M6.84 */
             emit_sr_reload(&e);
-            emit_cache_reload(&e, &rc);
+            /* Note: NO emit_cache_reload — btst_b_mmio preserves D/A. */
             /* --- end custom bridge --- */
             u32 jbt_pos = e.len;
             xt_j(&e, 4);
@@ -6177,13 +6202,15 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             i32 op_pc_oo = 6, op_cyc_oo = 8;
             /* Custom helper bridge size: sr_flush (0/3) + s32i addr (3) +
              * movi imm (3) + s32i imm (3) + mov a2 (3) + l32r (3) +
-             * callx0 (3) + sr_reload (3) + cache_reload (3*N). The
-             * helper is m68k_jit_ori_b_mmio — it does just the byte
-             * read/OR/write/CCR work, no PC or cycle advance (the JIT
-             * supplies those via emit_advance below). */
+             * callx0 (3) + sr_reload (3). The helper is m68k_jit_ori_b_mmio
+             * — it does just the byte read/OR/write/CCR work, no PC or
+             * cycle advance (the JIT supplies those via emit_advance below).
+             *
+             * M6.119 — ori_b_mmio doesn't touch guest D/A registers, so
+             * SKIP emit_cache_reload (saves 3 LX7 × active slots per MMIO
+             * fire). Only emit_sr_reload is needed (helper updates CCR). */
             u32 mmio_bridge_size = 3*7;  /* mov, l32r, callx0, sr_reload, 3 setup */
             if (g_sr_dirty) mmio_bridge_size += 3;
-            mmio_bridge_size += (u32)rc.active * 3;
             xt_beqz(&e, 10, (i32)(6u + mmio_bridge_size));
             /* --- Custom MMIO ORI.B helper bridge (replaces emit_helper_step). --- */
             sext_memo_invalidate();
@@ -6197,7 +6224,7 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             xt_callx0(&e, R_HELP);
             g_block_emitted_callx0 = true;  /* M6.84 */
             emit_sr_reload(&e);
-            emit_cache_reload(&e, &rc);
+            /* Note: NO emit_cache_reload — ori_b_mmio preserves D/A. */
             /* --- end custom bridge --- */
             u32 joo_pos = e.len;
             xt_j(&e, 4);

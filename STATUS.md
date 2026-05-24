@@ -1,14 +1,71 @@
 # Status
 
-## Where things stand right now (post-M6.118)
+## Where things stand right now (post-M6.119)
 
 | Engine | lx7 / cyc | × interp baseline |
 |--------|----------:|------------------:|
 | **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.173** | **5.51 ×** ✅ |
 | **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.210** | **5.34 ×** ✅ |
-| **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.715** | **3.45 ×** |
+| **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.668** | **3.87 ×** 🎯 |
 | **Boot** (Mac Plus ROM, 5 M cycles, PC=`0x40032C` deterministic)    | **2.223** | **2.66 ×** |
 | **Boot** (Mac Plus ROM, 300 K cycles, PC=`0x40032C` deterministic)  | **1.975** | **2.99 ×** |
+
+## M6.119 — Skip cache_reload in register-preserving fast helpers — boot 100 M 1.715 → 1.668 lx7/cyc (−2.74 %) 🎯
+
+Two micro-optimizations that share the "compile-time-known result" theme:
+
+**Part A — register-preserving fast-helper bridges skip `emit_cache_reload`:**
+
+The MMIO fast-helpers `m68k_jit_btst_b_mmio` and `m68k_jit_ori_b_mmio`
+only read/write memory + CCR — they DO NOT touch any guest D/A register.
+The BTST and ORI inline arms' MMIO-fallback bridges were doing a full
+`emit_cache_reload` (1 l32i per active slot) after the helper call,
+restoring values that hadn't changed.
+
+Removing the reload saves `3 LX7 × rc.active` per MMIO fire. With 4
+active cache slots, that's 12 LX7 per fire. Boot's BTST #imm,(d16,An)
+fires ~200 K times on its hot VIA-register-polling loop; ORI.B similarly.
+
+`emit_sr_reload` is still needed (the helpers DO update CCR).
+
+**Part B — compile-time-constant MOVE-family flag emit:**
+
+New `emit_logic_flags_const(e, value)` helper writes N and Z from a
+compile-time-known value with 2–4 ops instead of `emit_logic_flags`'s
+7–8 ops. Applied to:
+* MOVEQ #imm8,Dn — value = sext(imm8)
+* MOVE.L #imm32,Dn — value = imm32
+* MOVE.W #imm16,Dn — value = (u32)imm16 << 16
+
+Tiny effect on host metric (these ops aren't frequent enough).
+
+**Triple-diff workflow:** ctest 7/7, `--diff-jit-trace` clean through
+11 038 cycles, boot 100 M helper count 184 693 (M6.118) → 184 692
+(−1, within noise — correctness preserved).
+
+**Perf:**
+
+| Workload | M6.118 | **M6.119** | Δ |
+|----------|------:|----------:|--:|
+| Bench (20 M)        | 1.173 | **1.173** | xt −4 K (Part B) |
+| Bench (100 M)       | 1.210 | **1.210** | xt −10 K (Part B) |
+| **Boot 5 M det**    | 2.223 | **2.223** | xt −7 |
+| **Boot 100 M**      | **1.715** | **1.668** | **−2.74 %** 🎯 (Part A) |
+
+Real metrics confirm the win:
+* `real_helpers`: 217 613 → 217 612 (unchanged — correctness preserved)
+* `real_lx7_per_cyc`: 1.736 → 1.689 (−2.7 %)
+
+🎯 **Boot 100 M crosses 3.87 × interp** (= 6.462 / 1.668). Biggest single
+boot-100M jump in many milestones — the BTST/ORI MMIO bridges fire on
+every hot VIA-register access in boot's IRQ/timer-polling loop.
+
+Cumulative M6.84 → M6.119:
+* Bench (20 M): 1.257 → **1.173** (−6.7 %)
+* Bench (100 M): 1.396 → **1.210** (−13.3 %)
+* Boot 300 K det: 2.170 → **1.975** (−9.0 %)
+* Boot 5 M det:   2.471 → **2.223** (−10.0 %)
+* Boot 100 M:    1.734 → **1.668** (**−3.8 %**) 🎯
 
 ## M6.118 — MOVE.W Dn,(d16,An) — bench 20 M crosses 5.51 × interp 🎯
 
