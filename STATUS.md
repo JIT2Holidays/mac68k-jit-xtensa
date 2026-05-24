@@ -1,6 +1,32 @@
 # Status
 
-## Where things stand right now (post-M6.114)
+## M6.115 — classify_op safety: ROXR/ROXL/ABCD/SBCD consume X (SET|CONS)
+
+Safety follow-up to M6.114. Previously top=0x8/0xC/0xE all returned
+SET-only in `classify_op`. But several opcodes in those families consume
+X from the prior op's flag emit:
+
+* **ROXR / ROXL** (top=0xE, type=10 at bits 4-3 register-form or bits
+  11-9 memory-form): rotate through eXtend. Reads X, sets X from final
+  shifted-out bit.
+* **ABCD / SBCD** (top=0xC / 0x8 with bit 8 = 1 AND bits 7-4 = 0000):
+  BCD add/subtract with X. Reads X.
+
+Without M6.114, this latent bug never fired because plain ADD/SUB were
+ALSO classified SET|CONS (over-conservative), so the prior op's flag
+emit was always live regardless of what followed. With M6.114 making
+ADD/SUB SET-only, a hypothetical `ADD.L Dn,Dm ; ROXR.L Dx,Dy` block
+would have ADD's flag emit (which writes X) marked dead, then ROXR
+would read stale X.
+
+ctest 7/7, --diff-jit-trace clean, boot 100 M helper count 185 089
+unchanged → the sequence isn't actually exercised in our workloads,
+but the fix is still right to preserve forward safety.
+
+**Perf:** unchanged (+9 LX7 at 100 M cyc = noise). The fix only matters
+if/when such a sequence appears.
+
+## Where things stand right now (post-M6.115)
 
 | Engine | lx7 / cyc | × interp baseline |
 |--------|----------:|------------------:|

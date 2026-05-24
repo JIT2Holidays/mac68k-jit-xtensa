@@ -1467,8 +1467,34 @@ static u32 classify_op(u16 w) {
     case 0x6:                              /* Bcc.S / BRA.S / BSR.S */
         return (((w >> 8) & 0xF) > 1) ? CONS : 0u;
     case 0x7: return SET;                  /* MOVEQ */
-    case 0x8: case 0xB: case 0xC: case 0xE: case 0xF:
-        return SET;                        /* OR / CMP / AND / shifts / fp */
+    case 0x8: case 0xC: {
+        /* OR / DIVU/DIVS / AND / MULU/MULS / ABCD / SBCD / EXG.
+         * ABCD/SBCD consume X. Encoding: 1c0r_rrr_1_0000_a_sss with
+         * bits 8 = 1 AND bits 7-4 = 0000. (top=0x8 → SBCD, 0xC → ABCD.) */
+        if (((w >> 8) & 1) && ((w >> 4) & 0xF) == 0) {
+            return SET | CONS;             /* ABCD / SBCD */
+        }
+        return SET;                        /* OR / DIVU/DIVS / AND / MULU/MULS / EXG */
+    }
+    case 0xB: case 0xF:
+        return SET;                        /* CMP / EOR / fp */
+    case 0xE: {
+        /* Shifts. ROXR/ROXL consume X — must be SET|CONS so prior op's
+         * flag emit (which sets X) isn't marked dead.
+         *
+         * Encoding split:
+         *   register-form  (szf != 3): type in bits 4-3 (10 = ROX)
+         *   memory-form    (szf == 3, mode-EA): type in bits 11-9 (010 = ROX) */
+        int szf_local = (w >> 6) & 3;
+        if (szf_local == 3) {
+            int t = (w >> 9) & 7;
+            if (t == 2) return SET | CONS; /* ROXR/ROXL <ea> */
+        } else {
+            int t = (w >> 3) & 3;
+            if (t == 2) return SET | CONS; /* ROXR/ROXL Dn */
+        }
+        return SET;                        /* ASR/ASL/LSR/LSL/ROR/ROL */
+    }
     case 0x9: case 0xD:                    /* SUB/ADD family — SUBA/ADDA no flags */
         if (szf == 3) return 0u;
         /* M6.114 — refine: only ADDX/SUBX consume X (and Z, sticky).
