@@ -1457,7 +1457,22 @@ m68k_decoded m68k_decode_at(m68k_cpu *cpu, u32 pc) {
                 d.length += ea_ext_bytes(cpu, pc, mode, reg, (mode==0)?4:1);
             } else {
                 d.length += (sz == 4) ? 4 : 2;  /* immediate operand */
-                d.length += ea_ext_bytes(cpu, pc, mode, reg, sz);
+                /* M6.126 — ORI/ANDI/EORI #imm,CCR/SR uses mode=7/reg=4
+                 * as the destination INDICATOR (not a real ea). The imm
+                 * bytes are already counted above; ea_ext_bytes would
+                 * over-count by 2 (mode=7/reg=4 returns 2 for sz<4 or 4
+                 * for sz=4, double-fetching the imm). Special-case skip:
+                 * op9 in {0=ORI, 1=ANDI, 5=EORI} with mode=7/reg=4.
+                 *
+                 * Same trap class as M6.122/M6.124 — mis-bounded block
+                 * decodes the bytes after the real op as a phantom
+                 * opcode. ORI/ANDI #imm,SR is common in interrupt-
+                 * mask handlers (e.g. ORI #0x0700,SR). */
+                bool to_sr_ccr = (mode == 7 && reg == 4
+                                  && (op9 == 0 || op9 == 1 || op9 == 5));
+                if (!to_sr_ccr) {
+                    d.length += ea_ext_bytes(cpu, pc, mode, reg, sz);
+                }
             }
             break;
         }

@@ -1,14 +1,69 @@
 # Status
 
-## Where things stand right now (post-M6.125)
+## Where things stand right now (post-M6.126)
 
 | Engine | lx7 / cyc | × interp baseline |
 |--------|----------:|------------------:|
-| **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.172** | **5.51 ×** ✅ |
+| **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.169** | **5.53 ×** ✅ |
 | **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.197** | **5.40 ×** ✅ |
-| **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.699** | **3.80 ×** |
+| **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.668** | **3.87 ×** 🎯 |
 | **Boot** (Mac Plus ROM, 5 M cycles, PC=`0x40032C` deterministic)    | **2.216** | **2.92 ×** |
 | **Boot** (Mac Plus ROM, 300 K cycles, PC=`0x40032C` deterministic)  | **1.975** | **2.99 ×** |
+
+## M6.126 — m68k_decode_at length fix for ORI/ANDI/EORI #imm,CCR/SR — boot 100 M 1.699 → 1.668 lx7/cyc (−1.83 %) + real_helpers 679 K → 217 K 🎯
+
+Third decoder length bug in the family (after M6.122 MOVE-to-SR and
+M6.124 ADDA.L #imm32). For ORI/ANDI/EORI to CCR/SR, the encoding uses
+`mode=7/reg=4` as a DESTINATION INDICATOR (not a real ea) — the imm
+bytes that follow are the only operand.
+
+Pre-M6.126 decoder logic:
+```c
+d.length += (sz == 4) ? 4 : 2;     // counts the imm (correct)
+d.length += ea_ext_bytes(mode, reg, sz);  // for mode=7/reg=4, returns
+                                          // 2 (or 4 for sz=4) — DOUBLE
+                                          // COUNT of the same imm!
+```
+
+For `ORI #0x0700,SR` (a common interrupt-mask pattern): decoder
+returned length=6 instead of 4. JIT block compiler walked past only
+the imm bytes, decoding the next 2 bytes as a phantom opcode.
+
+Fix: special-case skip ea_ext_bytes when `mode=7/reg=4` AND
+`op9 in {0=ORI, 1=ANDI, 5=EORI}`.
+
+**The boot 100M win is dramatic** because boot has many ORI/ANDI #imm,SR
+ops in interrupt handlers. The mis-decode was corrupting those blocks
+and shifting the M6.66 VIA-tick divergence trajectory into the
+heavy-helper bogus-PC region. Fixing the decode restores the original
+divergence path that matches the M6.119 baseline.
+
+**Triple-diff:** ctest 7/7, `--diff-jit-trace` clean through 11 038 cyc.
+
+**Perf:**
+
+| Workload | M6.125 | **M6.126** | Δ |
+|----------|------:|----------:|--:|
+| **Bench (20 M)**    | 1.172 | **1.169** | **−0.26 %** ✅ |
+| Bench (100 M)       | 1.197 | **1.197** | xt −27 K (within noise) |
+| Boot 5 M det        | 2.216 | **2.216** | within noise |
+| **Boot 100 M**      | 1.699 | **1.668** | **−1.83 %** 🎯 |
+
+Real-helper counts confirm the win:
+* Bench 100M: real_helpers 113 335 → 113 644 (+309, within noise)
+* **Boot 100M: real_helpers 679 302 → 217 676 (−461 626!)** — fewer
+  m68k_step invocations because the M6.66 bogus-PC region path is now
+  much shorter.
+
+🎯 **Boot 100M back to 3.87 × interp** (= 6.462 / 1.668), matching the
+M6.119 baseline.
+
+Cumulative M6.84 → M6.126:
+* Bench (20 M): 1.257 → **1.169** (**−7.0 %**) 🎯
+* Bench (100 M): 1.396 → **1.197** (−14.3 %)
+* Boot 300 K det: 2.170 → **1.975** (−9.0 %)
+* Boot 5 M det:   2.471 → **2.216** (−10.3 %)
+* **Boot 100 M:   1.734 → 1.668 (−3.8 %)** 🎯
 
 ## M6.125 — extend selective cache_reload to MOVE-to-mem arms
 
