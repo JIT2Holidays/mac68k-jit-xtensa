@@ -3223,6 +3223,118 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                 /* M6.131 — MOVE.L (xxx).W,Dn modifies only Dn. */
                 g_helper_touched_mask = (u16)(1u << G_D(dn));
             }
+        } else if (top == 0x2 && ((w >> 6) & 7) == 5 && mode == 7 && (w & 7) == 0) {
+            /* M6.175 — MOVE.L (xxx).W,(d16,An). thinkc8-folder-open
+             * bench's 0x2178 at PC=0x402746 — Toolbox dispatcher
+             * (read .L from low-mem dispatch table at static abs.W,
+             * write to stack frame at (d16,A0)). 50K hits/100 M.
+             * Absent from boot 100 M and speedo. Trajectory-safe.
+             *
+             * Composite of two existing sibling patterns:
+             *   - M6.108 MOVE.L (xxx).W,Dn (just above): COMPILE-TIME
+             *     RAM check on source; static abs_addr; .L byte-by-byte
+             *     read from RAM_BASE + abs_addr.
+             *   - M6.118 MOVE.W Dn,(d16,An) at line 4732: RUNTIME RAM
+             *     bounds check on destination; helper bridge for MMIO.
+             *
+             * Length 6 (op + abs.W ext + d16 ext), cycles 8 (interp
+             * base 4 + handler 4). The destination write triggers
+             * MOVE-family flags from the .L value just read. */
+            int dst_an = (w >> 9) & 7;
+            u16 src_ext = mac_read16(cpu->mem, op_pc[i] + 2);
+            u32 abs_addr = (u32)(i32)(i16)src_ext;
+            abs_addr &= 0xFFFFFFu;
+            u16 d_ext = mac_read16(cpu->mem, op_pc[i] + 4);
+            i32 d16 = (i16)d_ext;
+
+            u32 ram_size = cpu->mem ? cpu->mem->ram_size : 0;
+            bool overlay = cpu->mem ? cpu->mem->overlay : true;
+            bool ram_pow2 = ram_size > 0 && (ram_size & (ram_size - 1)) == 0;
+            bool addr_in_ram = !overlay && ram_pow2
+                               && abs_addr < ram_size
+                               && (abs_addr & 1) == 0;
+
+            if (addr_in_ram) {
+                emit_advance_flush(&e);
+                /* Dest EA into a8: a[dst_an] + d16. */
+                emit_read_g(&e, &rc, G_A(dst_an), 8);
+                if (d16 >= -128 && d16 <= 127) {
+                    xt_addi(&e, 8, 8, d16);
+                } else {
+                    emit_load_imm(&e, 11, 12, (u32)d16);
+                    xt_add (&e, 8, 8, 11);
+                }
+                emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                             entry_off + e.len);
+                xt_and  (&e, 10, 8, 9);
+                emit_cache_flush(&e, &rc);
+                i32 op_pc_mxd = 6, op_cyc_mxd = 8;
+                /* MOVE flag-only side effects (CCR write but no D/A reg
+                 * touched by the helper itself for this addressing). */
+                g_helper_touched_mask = 0u;
+                xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_mxd, op_cyc_mxd)));
+                emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                                  entry_off, &rc, op_pc_mxd, op_cyc_mxd);
+                g_helper_touched_mask = 0xFFFFu;
+                u32 jmxd_pos = e.len;
+                xt_j    (&e, 4);
+
+                /* Fast path:
+                 *   Read .L from compile-time RAM_BASE + abs_addr → a11.
+                 *   Write .L to runtime RAM_BASE + a8 (4 BE bytes).
+                 *   emit_logic_flags on the .L. */
+                emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                             entry_off + e.len);
+                /* a9 = ram_base + abs_addr (source pointer). */
+                u32 abs_addr_off = abs_addr;
+                if ((i32)abs_addr_off >= -128 && (i32)abs_addr_off <= 127) {
+                    xt_addi(&e, 9, 9, (i32)abs_addr_off);
+                } else if ((i32)abs_addr_off >= -2048 && (i32)abs_addr_off <= 2047) {
+                    xt_movi(&e, 12, (i32)abs_addr_off);
+                    xt_add (&e, 9, 9, 12);
+                } else {
+                    emit_load_imm(&e, 12, 11, abs_addr_off);
+                    xt_add (&e, 9, 9, 12);
+                }
+                xt_l8ui (&e, 12, 9, 0);
+                xt_l8ui (&e, 11, 9, 1);
+                xt_slli (&e, 10, 12, 24);
+                xt_slli (&e, 11, 11, 16);
+                xt_or   (&e, 10, 10, 11);
+                xt_l8ui (&e, 12, 9, 2);
+                xt_l8ui (&e, 11, 9, 3);
+                xt_slli (&e, 12, 12, 8);
+                xt_or   (&e, 10, 10, 12);
+                xt_or   (&e, 10, 10, 11);              /* a10 = .L source */
+
+                /* Compute dest pointer (RAM_BASE + a8). a9 reused. */
+                emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                             entry_off + e.len);
+                xt_add  (&e, 9, 9, 8);
+                xt_extui(&e, 11, 10, 24, 7);
+                xt_s8i  (&e, 11, 9, 0);
+                xt_extui(&e, 11, 10, 16, 7);
+                xt_s8i  (&e, 11, 9, 1);
+                xt_extui(&e, 11, 10,  8, 7);
+                xt_s8i  (&e, 11, 9, 2);
+                xt_extui(&e, 11, 10,  0, 7);
+                xt_s8i  (&e, 11, 9, 3);
+
+                if (!flags_dead[i]) emit_logic_flags(&e, 10);
+                emit_advance(&e, op_pc_mxd, op_cyc_mxd);
+
+                u32 here_mxd = e.len;
+                i32 jo_mxd = (i32)(here_mxd - jmxd_pos) - 4;
+                u32 jw_mxd = ((u32)((u32)jo_mxd & 0x3FFFFu) << 6) | 0x06u;
+                base[entry_off + jmxd_pos    ] = (u8)jw_mxd;
+                base[entry_off + jmxd_pos + 1] = (u8)(jw_mxd >> 8);
+                base[entry_off + jmxd_pos + 2] = (u8)(jw_mxd >> 16);
+
+                inline_ops++; done = true;
+            } else {
+                /* MMIO source — flag-only effect for helper. */
+                g_helper_touched_mask = 0u;
+            }
         } else if (top == 0x2 && ((w >> 6) & 7) == 1 && mode == 7 && (w & 7) == 0) {
             /* M6.108 — MOVEA.L (xxx).W,Am — sibling of MOVE.L (xxx).W,Dn
              * but writes to An (MOVEA never touches CCR). Bench-warm
