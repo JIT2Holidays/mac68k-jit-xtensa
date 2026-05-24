@@ -138,11 +138,27 @@ static void emit_cache_flush(xt_emit *e, regcache *rc) {
     rc->dirty = 0;
 }
 
-/* Reload every cached slot from cpu state. Called after a helper. */
+/* M6.123 — bitmask of guest registers (G_D(n)/G_A(n) encoding, 0..15)
+ * the upcoming helper bridge MAY MODIFY. Default 0xFFFF means
+ * "helper can touch anything" (m68k_step's conservative assumption).
+ * Specific arms (RTS, BSR.S/W, POP, etc.) narrow this when they know
+ * exactly which regs the helper modifies — emit_cache_reload then skips
+ * the l32i for untouched slots (helper didn't change them; cpu state
+ * still matches the cache register's pre-bridge value).
+ *
+ * MUST be reset to 0xFFFF after each helper bridge — leaks would
+ * silently produce stale cache for subsequent helpers' touched regs. */
+static u16 g_helper_touched_mask = 0xFFFFu;
+
+/* Reload every cached slot from cpu state. Called after a helper.
+ * Selective per g_helper_touched_mask — slots whose guest reg the
+ * helper didn't touch are skipped (cpu state already matches the
+ * existing cache value, since neither was modified). */
 static void emit_cache_reload(xt_emit *e, regcache *rc) {
     if (!rc) return;
     for (int i = 0; i < rc->active; i++) {
         int gi = rc->guest[i];
+        if (!(g_helper_touched_mask & (1u << gi))) continue;
         if (gi < 8) xt_l32i(e, cache_xt_slot(i), R_CPU, OFF_D(gi));
         else        xt_l32i(e, cache_xt_slot(i), R_CPU, OFF_A(gi - 8));
     }
@@ -312,12 +328,19 @@ static void emit_helper_step(xt_emit *e, u32 helper_lit_off, u32 entry_off,
  * emit_helper_step_after_flush_undo at every conditional helper site.) */
 
 /* Byte size of the conditional-helper bridge before the optional undo
- * is added. Used by helper_step_after_flush_undo_size. */
+ * is added. Used by helper_step_after_flush_undo_size.
+ *
+ * M6.123: cache_reload is now selective per g_helper_touched_mask — only
+ * slots whose guest reg is in the mask get an l32i. Size estimate must
+ * match the actual emit exactly (beqz offset depends on it). */
 static u32 helper_step_after_flush_base_size(const regcache *rc) {
     u32 sz = 3u /*mov*/ + 3u /*l32r*/ + 3u /*callx0*/ + 3u /*sr_reload*/;
     if (g_sr_dirty) sz += 3u;
     if (!rc) return sz;
-    sz += (u32)rc->active * 3u;
+    for (int i = 0; i < rc->active; i++) {
+        int gi = rc->guest[i];
+        if (g_helper_touched_mask & (1u << gi)) sz += 3u;
+    }
     return sz;
 }
 
@@ -415,7 +438,12 @@ static u32 emit_jit_fast_helper_size(const regcache *rc) {
            + 3u /*mov R_ARG*/ + 3u /*l32r*/ + 3u /*callx0*/
            + 3u /*sr_reload*/;
     if (g_sr_dirty) sz += 3u;
-    if (rc) sz += (u32)rc->active * 3u;
+    if (rc) {
+        for (int i = 0; i < rc->active; i++) {
+            int gi = rc->guest[i];
+            if (g_helper_touched_mask & (1u << gi)) sz += 3u;
+        }
+    }
     return sz;
 }
 
@@ -2020,7 +2048,13 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             inline_ops++; done = true;
         } else if (w == 0x4E75) {
             /* RTS — pop 32-bit PC from stack, set cpu->pc, SP += 4.
-             * Block terminator. Bench-hot (7K). Cycles = 16 = 4 + 12. */
+             * Block terminator. Bench-hot (7K). Cycles = 16 = 4 + 12.
+             *
+             * M6.123 — narrow the helper's touched_mask to A7 only.
+             * m68k_step for RTS modifies cpu->pc (not cached) and
+             * cpu->a[7]. No other guest reg is touched. The post-helper
+             * cache_reload only needs to load A7's slot (skipping all
+             * other slots saves 3 LX7 × (active-1) per MMIO fire). */
             emit_advance_flush(&e);
             emit_read_g(&e, &rc, G_A(7), 8);              /* a8 = SP */
             emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
@@ -2029,9 +2063,11 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             emit_cache_flush(&e, &rc);
             i32 op_pc_rts = 0;        /* m68k_step's RTS handler sets pc directly */
             i32 op_cyc_rts = 16;      /* full m68k_step adds: 4 base + 12 handler */
+            g_helper_touched_mask = (u16)(1u << G_A(7));
             xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_rts, op_cyc_rts)));
             emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
                                               entry_off, &rc, op_pc_rts, op_cyc_rts);
+            g_helper_touched_mask = 0xFFFFu;    /* reset for subsequent helpers */
             u32 jrts_pos = e.len;
             xt_j    (&e, 4);
             /* Fast path: read 4 BE bytes from mem[SP] into a10, write to
@@ -2091,9 +2127,12 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             emit_cache_flush(&e, &rc);
             i32 op_pc_jsr = 0;        /* m68k_step sets cpu->pc directly */
             i32 op_cyc_jsr = 20;      /* full m68k_step: base 4 + handler 16 */
+            /* M6.123 — narrow touched_mask: JSR modifies only A7. */
+            g_helper_touched_mask = (u16)(1u << G_A(7));
             xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_jsr, op_cyc_jsr)));
             emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
                                               entry_off, &rc, op_pc_jsr, op_cyc_jsr);
+            g_helper_touched_mask = 0xFFFFu;
             u32 jjsr_pos = e.len;
             xt_j    (&e, 4);
             /* Fast path: write return_pc (= cpu->pc + 4) as 4 BE bytes to
@@ -2166,9 +2205,12 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             emit_cache_flush(&e, &rc);
             i32 op_pc_jsra = 0;
             i32 op_cyc_jsra = 20;            /* base 4 + handler 16 */
+            /* M6.123 — narrow touched_mask: JSR (d16,An) modifies only A7. */
+            g_helper_touched_mask = (u16)(1u << G_A(7));
             xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_jsra, op_cyc_jsra)));
             emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
                                               entry_off, &rc, op_pc_jsra, op_cyc_jsra);
+            g_helper_touched_mask = 0xFFFFu;
             u32 jjsra_pos = e.len;
             xt_j    (&e, 4);
             /* Fast path: write return_pc to mem[new SP], then commit new
@@ -2745,7 +2787,11 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
         } else if (top == 0x2 && ((w >> 6) & 7) == 0 && mode == 3) {
             /* MOVE.L (An)+,Dn — common pair to the 0x20C1 store pattern.
              * Bounds-check the An address; on fast path read 4 BE bytes
-             * into Dn, post-increment An by 4, emit logic flags. */
+             * into Dn, post-increment An by 4, emit logic flags.
+             *
+             * M6.123 — narrow helper touched_mask to {Dn, An}. m68k_step
+             * for MOVE.L (An)+,Dn modifies cpu->d[dn] (target) and
+             * cpu->a[an] (post-increment). No other guest reg touched. */
             int dn = (w >> 9) & 7;        /* dst Dn */
             int an = w & 7;               /* src An (post-incr) */
 
@@ -2756,9 +2802,11 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             xt_and  (&e, 10, 8, 9);
             emit_cache_flush(&e, &rc);
             i32 op_pc_lL = 2, op_cyc_lL = 8;
+            g_helper_touched_mask = (u16)((1u << G_D(dn)) | (1u << G_A(an)));
             xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_lL, op_cyc_lL)));
             emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
                                               entry_off, &rc, op_pc_lL, op_cyc_lL);
+            g_helper_touched_mask = 0xFFFFu;
             u32 jlL_pos = e.len;
             xt_j    (&e, 4);
             /* Fast path: read 4 BE bytes into a10 (the .L value). */
@@ -3362,9 +3410,13 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             xt_and  (&e, 12, 10, 11);                /* a12 == 0 iff RAM-or-ROM */
             emit_cache_flush(&e, &rc);
             i32 op_pc_mb = 4, op_cyc_mb = 8;
+            /* M6.123 — narrow touched_mask: MOVE.B (d16,An),Dn modifies
+             * only Dn. An is read for the EA, not written. */
+            g_helper_touched_mask = (u16)(1u << G_D(dn));
             xt_beqz (&e, 12, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_mb, op_cyc_mb)));
             emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
                                               entry_off, &rc, op_pc_mb, op_cyc_mb);
+            g_helper_touched_mask = 0xFFFFu;
             u32 jmb_pos = e.len;
             xt_j    (&e, 4);
 
@@ -5152,9 +5204,12 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             emit_cache_flush(&e, &rc);
             i32 op_pc_bsr = 0;        /* m68k_step sets cpu->pc directly */
             i32 op_cyc_bsr = 22;
+            /* M6.123 — narrow touched_mask: BSR modifies only A7. */
+            g_helper_touched_mask = (u16)(1u << G_A(7));
             xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_bsr, op_cyc_bsr)));
             emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
                                               entry_off, &rc, op_pc_bsr, op_cyc_bsr);
+            g_helper_touched_mask = 0xFFFFu;
             u32 jbsr_pos = e.len;
             xt_j    (&e, 4);
             /* Fast path: write return_pc (= cpu->pc + 2) as 4 BE bytes
@@ -5215,9 +5270,12 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             emit_cache_flush(&e, &rc);
             i32 op_pc_bsw = 0;        /* m68k_step sets cpu->pc directly */
             i32 op_cyc_bsw = 22;
+            /* M6.123 — narrow touched_mask: BSR.W modifies only A7. */
+            g_helper_touched_mask = (u16)(1u << G_A(7));
             xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_bsw, op_cyc_bsw)));
             emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
                                               entry_off, &rc, op_pc_bsw, op_cyc_bsw);
+            g_helper_touched_mask = 0xFFFFu;
             u32 jbsw_pos = e.len;
             xt_j    (&e, 4);
             /* Fast path: write return PC (= cpu->pc + 4 since BSR.W is 4

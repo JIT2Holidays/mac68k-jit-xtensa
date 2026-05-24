@@ -1,14 +1,65 @@
 # Status
 
-## Where things stand right now (post-M6.122)
+## Where things stand right now (post-M6.123)
 
 | Engine | lx7 / cyc | × interp baseline |
 |--------|----------:|------------------:|
 | **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.172** | **5.51 ×** ✅ |
-| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.198** | **5.39 ×** ✅ |
-| **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.704** | **3.79 ×** |
+| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.197** | **5.40 ×** ✅ |
+| **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.700** | **3.80 ×** |
 | **Boot** (Mac Plus ROM, 5 M cycles, PC=`0x40032C` deterministic)    | **2.223** | **2.66 ×** |
 | **Boot** (Mac Plus ROM, 300 K cycles, PC=`0x40032C` deterministic)  | **1.975** | **2.99 ×** |
+
+## M6.123 — selective cache_reload via touched_mask for SP/An-only helper bridges
+
+New `g_helper_touched_mask` global (default 0xFFFF = "helper can touch
+any reg") narrowed by SP-touching block-terminator arms. After a helper
+bridge, `emit_cache_reload` and `emit_helper_step_after_flush_undo_size`
+skip slots whose guest reg isn't in the mask — the helper didn't
+modify them, so cpu state still matches the cache register's pre-bridge
+value (no l32i needed).
+
+Per-fire savings: `3 LX7 × (rc.active - touched_slots)`. For RTS at
+active=4 with one A7 slot: 3 × 3 = 9 LX7 saved per MMIO fire.
+
+Arms narrowed:
+* **RTS** (0x4E75) — `m68k_step` modifies only A7 (and cpu->pc, not cached)
+* **MOVE.L (An)+,Dn** — modifies Dn and An (mask = `{Dn, An}`)
+* **BSR.S / BSR.W** — modifies A7
+* **JSR (d16,PC) / JSR (d16,An)** — modifies A7
+* **MOVE.B (d16,An),Dn** — modifies Dn
+
+**Safety:** unlike M6.121-broad (which crashed bench by skipping ALL
+slots and corrupting state via stale dirty bits), selective reload only
+SKIPS the l32i for slots that didn't change. The dirty-bit flow stays
+the same — fast path's `emit_write_g` sets bits; epilogue's
+`cache_flush` writes them back; cache values match cpu for all paths.
+
+**Triple-diff:** ctest 7/7, `--diff-jit-trace` clean through 11 038 cyc.
+
+**Perf:**
+
+| Workload | M6.122 | **M6.123** | Δ |
+|----------|------:|----------:|--:|
+| Bench (20 M)        | 1.172 | **1.172** | unchanged |
+| **Bench (100 M)**   | 1.198 | **1.197** | xt −90 K (−0.08 %) |
+| Boot 5 M det        | 2.223 | **2.223** | unchanged |
+| **Boot 100 M**      | 1.704 | **1.700** | xt −440 K (−0.24 %) |
+
+Real-helper counts unchanged (correctness preserved):
+* Bench 100M: real_helpers 113 335 unchanged
+* Boot 100M:  real_helpers 679 302 unchanged
+
+Modest gain but accumulates. Each new arm narrowed adds ~3 LX7 ×
+hit_count savings. Future arms can pile on as their helper modifies a
+known subset of guest regs.
+
+Cumulative M6.84 → M6.123:
+* Bench (20 M): 1.257 → **1.172** (−6.8 %)
+* Bench (100 M): 1.396 → **1.197** (**−14.3 %**) 🎯
+* Boot 300 K det: 2.170 → **1.975** (−9.0 %)
+* Boot 5 M det:   2.471 → **2.223** (−10.0 %)
+* Boot 100 M:     1.734 → **1.700** (−2.0 %)
 
 ## M6.122 — m68k_decode_at length fix for MOVE-to-SR/CCR — bench 100 M 1.210 → 1.198 lx7/cyc (−1.0 %)
 
