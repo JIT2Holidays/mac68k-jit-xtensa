@@ -719,6 +719,32 @@ void m68k_jit_bsr_w_mmio(m68k_cpu *cpu) {
     cpu->pc = cpu->jit_arg1;
 }
 
+void m68k_jit_move_b_addr_to_dn_mmio(m68k_cpu *cpu) {
+    /* Generic MOVE.B src→Dn fast helper. Caller pre-computes the source
+     * address in jit_arg1; jit_arg2 holds the destination Dn (0..7).
+     *
+     * Used by inline arms for:
+     *   MOVE.B (d16,An),Dn — addr = An + sext16(d16)
+     *   MOVE.B (An),Dn     — addr = An
+     *   MOVE.B (xxx).W,Dn  — addr = sext16(ext)
+     *
+     * Boot's 0x10A8 (12 K), 0x1211 (6 K), 0x1082 (3 K), 0x1411 (3 K)
+     * fire this when their RAM-or-ROM bounds check fails (MMIO target).
+     *
+     * Reads byte from mac_read8(jit_arg1); merges into low 8 of
+     * cpu->d[dn] preserving high 24. Sets MOVE-family CCR (N/Z from
+     * byte sign, V/C=0, X preserved). Does NOT advance pc/cycles
+     * (JIT's emit_advance owns them); does NOT increment cpu->instrs. */
+    int dn = (int)(cpu->jit_arg2 & 7);
+    u32 addr = cpu->jit_arg1;
+    u8 v = mac_read8(cpu->mem, addr);
+    cpu->d[dn] = (cpu->d[dn] & 0xFFFFFF00u) | v;
+    u8 ccr = m68k_get_ccr(cpu) & CCR_X;
+    if (v == 0)        ccr |= CCR_Z;
+    if (v & 0x80)      ccr |= CCR_N;
+    m68k_set_ccr(cpu, ccr);
+}
+
 void m68k_jit_move_l_postinc_to_dn_mmio(m68k_cpu *cpu) {
     /* MOVE.L (An)+,Dn — bench-hot 0x201F (MOVE.L (A7)+,D0) at 21 808
      * helpers / 100 M cyc when SP→MMIO. Args: jit_arg2 packed = dn |

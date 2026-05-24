@@ -3524,13 +3524,17 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             xt_and  (&e, 12, 10, 11);                /* a12 == 0 iff RAM-or-ROM */
             emit_cache_flush(&e, &rc);
             i32 op_pc_mb = 4, op_cyc_mb = 8;
-            /* M6.123 — narrow touched_mask: MOVE.B (d16,An),Dn modifies
-             * only Dn. An is read for the EA, not written. */
+            /* M6.133 — fast helper for MMIO. a8 has addr; helper reads
+             * byte from addr, writes to Dn[7:0], sets MOVE-family CCR.
+             * touched_mask = {Dn}. */
             g_helper_touched_mask = (u16)(1u << G_D(dn));
-            xt_beqz (&e, 12, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_mb, op_cyc_mb)));
-            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
-                                              entry_off, &rc, op_pc_mb, op_cyc_mb);
+            u32 mb_bridge_size = emit_jit_fast_helper_size(&rc);
+            xt_beqz (&e, 12, (i32)(6u + mb_bridge_size));
+            emit_jit_fast_helper(&e, 8, dn,
+                                 lit_off[HELPER_JIT_MOVE_B_ADDR_TO_DN_MMIO],
+                                 entry_off, &rc);
             g_helper_touched_mask = 0xFFFFu;
+            (void)op_pc_mb; (void)op_cyc_mb;
             u32 jmb_pos = e.len;
             xt_j    (&e, 4);
 
@@ -3682,13 +3686,18 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             xt_and  (&e, 12, 10, 11);
             emit_cache_flush(&e, &rc);
             i32 op_pc_b1 = 2, op_cyc_b1 = 8;
-            /* M6.123 — MOVE.B (An),Dn modifies only Dn (An is read,
-             * not written). */
+            /* M6.133 — fast helper. an_reg holds addr (= An). */
             g_helper_touched_mask = (u16)(1u << G_D(dn));
-            xt_beqz (&e, 12, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_b1, op_cyc_b1)));
-            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
-                                              entry_off, &rc, op_pc_b1, op_cyc_b1);
+            /* Pass an_reg directly as the arg1 source register —
+             * emit_jit_fast_helper does xt_s32i a_arg1_reg → jit_arg1.
+             * It doesn't clobber the source. */
+            u32 b1_bridge_size = emit_jit_fast_helper_size(&rc);
+            xt_beqz (&e, 12, (i32)(6u + b1_bridge_size));
+            emit_jit_fast_helper(&e, an_reg, dn,
+                                 lit_off[HELPER_JIT_MOVE_B_ADDR_TO_DN_MMIO],
+                                 entry_off, &rc);
             g_helper_touched_mask = 0xFFFFu;
+            (void)op_pc_b1; (void)op_cyc_b1;
             u32 jb1_pos = e.len;
             xt_j    (&e, 4);
 
