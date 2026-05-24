@@ -437,7 +437,7 @@ static void sim_call(xt_sim *s, u32 fn_token) {
     }
 }
 
-static void enter_block(m68k_dispatcher *d, m68k_block *b) {
+static void enter_block(m68k_dispatcher *d, m68k_block *b, u32 start_off) {
     /* Set current_block for parity with the ESP32 path. Host's xt_sim
      * runs one block per invocation, so native chaining isn't emitted
      * here, but keeping cpu state consistent helps any future host-side
@@ -447,7 +447,37 @@ static void enter_block(m68k_dispatcher *d, m68k_block *b) {
 
     xt_sim s;
     xt_sim_init(&s, b->code, b->code_size);
-    s.pc = b->entry_off;
+    s.pc = start_off;
+    /* M6.82 — when the dispatcher routes the chain hit to chain_entry_off
+     * (partial-skip) or body_off (full-skip), the prologue ops that would
+     * have set up a3/a14/a4..a7 are skipped. On the ESP32 chain-JX path
+     * those registers are preserved naturally (a3 is callee-saved across
+     * the JX, the others held by the predecessor); on the host sim each
+     * block runs in a fresh xt_sim with all regs zeroed, so we have to
+     * pre-load the equivalent state here in C. The host's pre-load cost
+     * isn't counted in xt_instrs, so the host metric correctly reflects
+     * the LX7-op savings the ESP32 path gets. */
+    {
+        u32 entry_off = b->entry_off;
+        u32 body_off  = (u32)((const u8 *)b->body_addr        - (const u8 *)b->code);
+        u32 chain_off = (u32)((const u8 *)b->chain_entry_addr - (const u8 *)b->code);
+        if (start_off != entry_off) {
+            s.a[3] = HOST_CPU_BASE;   /* R_CPU = a3, set by the l32r */
+            if (start_off == body_off) {
+                /* body_off: also pre-load R_SR + every active cache slot,
+                 * because the cache_reload / sr_reload between
+                 * chain_entry_off and body_off is also skipped. */
+                if (b->sr_loaded) s.a[14] = (u32)d->cpu->sr;
+                int active = (int)(b->cache_sig & 0xFu);
+                for (int slot = 0; slot < active; slot++) {
+                    int gi = (int)((b->cache_sig >> (4 + slot * 4)) & 0xFu);
+                    if (gi < 8) s.a[4 + slot] = d->cpu->d[gi];
+                    else        s.a[4 + slot] = d->cpu->a[gi - 8];
+                }
+            }
+            (void)chain_off;   /* used only for documentation symmetry */
+        }
+    }
     s.translate = sim_translate;
     s.read_literal = sim_read_literal;
     s.call_thunk = sim_call;
@@ -572,10 +602,12 @@ void m68k_dispatcher_run_until(m68k_dispatcher *d, u64 until) {
 
         u32 pc = cpu->pc;
         m68k_block *b;
+        bool chain_hit = false;
 
         if (prev && prev->predicted_next && prev->predicted_next_pc == pc) {
             b = prev->predicted_next;
             d->chain_hits++;
+            chain_hit = true;
             if (prev->cache_sig == b->cache_sig) d->chain_cache_matches++;
         } else {
             /* get_block may trigger an arena reset (free_all_blocks)
@@ -592,17 +624,31 @@ void m68k_dispatcher_run_until(m68k_dispatcher *d, u64 until) {
             if (prev && !d->no_cache) {
                 prev->predicted_next = b;
                 prev->predicted_next_pc = pc;
-                /* M6.62 cross-block-cache: precompute the chain JX target.
-                 * If prev's cache + SR state is compatible with what b's
-                 * prologue would set up, JX directly to b->body_addr,
-                 * skipping the entire prologue (cpu_base load, jit_ret_pc
-                 * save, sr_reload, cache_load — ~5 LX7 ops). Compat:
-                 *   cache_sig must match (a4..a7 hold correct values), AND
-                 *   if b needs SR, prev must also have had SR loaded
-                 *   (a14 holds the correct R_SR value). */
+                /* M6.62 / M6.82 — pick the chain JX target along three tiers:
+                 *
+                 *   compat (cache_sig + SR match):  → body_addr (skip ALL of
+                 *                                    prologue: ~5+ LX7 ops)
+                 *   not compat (chain hit only):    → chain_entry_addr (skip
+                 *                                    the first 2 prologue ops
+                 *                                    that are redundant on
+                 *                                    chain transitions —
+                 *                                    R_CPU is callee-saved
+                 *                                    and a0 was just reloaded
+                 *                                    from OFF_JITRETPC; saves
+                 *                                    2 LX7 ops per chain
+                 *                                    on the bench's 96.7 %
+                 *                                    no-cache-compat path)
+                 *   (cold dispatch from this loop:    → entry_addr, full
+                 *                                    prologue, picked when
+                 *                                    `prev == NULL`)
+                 *
+                 * Compat = cache_sig match (a4..a7 hold correct values) AND
+                 *          if b needs SR, prev must also have had SR loaded
+                 *          (a14 holds the correct R_SR value). */
                 bool compat = (prev->cache_sig == b->cache_sig) &&
                               (!b->sr_loaded || prev->sr_loaded);
-                prev->predicted_next_entry = compat ? b->body_addr : b->entry_addr;
+                prev->predicted_next_entry = compat ? b->body_addr
+                                                    : b->chain_entry_addr;
             }
         }
 
@@ -623,7 +669,19 @@ void m68k_dispatcher_run_until(m68k_dispatcher *d, u64 until) {
          * which keeps the root hot — eviction follows the root. */
         b->last_used_cycle = cpu->cycles;
 
-        enter_block(d, b);
+        /* M6.82 — on chain hits, start the sim at the precomputed
+         * predicted_next_entry (body_addr or chain_entry_addr) so the
+         * host metric reflects the same skip-prologue savings the ESP32
+         * native-chain path gets. On chain miss (cold dispatch from this
+         * loop), start at entry_off for the full prologue. */
+        u32 start_off;
+        if (chain_hit && prev->predicted_next_entry) {
+            start_off = (u32)((const u8 *)prev->predicted_next_entry
+                              - (const u8 *)b->code);
+        } else {
+            start_off = b->entry_off;
+        }
+        enter_block(d, b, start_off);
         d->blocks_executed++;
 
         if (d->no_cache) { m68k_block_free(b); prev = NULL; }

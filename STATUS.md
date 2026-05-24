@@ -1,12 +1,14 @@
 # Status
 
-## Where things stand right now (post-M6.81)
+## Where things stand right now (post-M6.82)
 
 | Engine | lx7 / cyc | × interp baseline |
 |--------|----------:|------------------:|
-| **Bench** (Speedometer frozen snapshot, 20 M cycles, PC=`0x03DF58`) | **1.284** | **5.03 ×** ✅ |
-| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.436** | **4.50 ×** |
-| **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.779** | **3.31 ×** |
+| **Bench** (Speedometer frozen snapshot, 20 M cycles, PC=`0x03DF58`) | **1.259** | **5.13 ×** ✅ |
+| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.409** | **4.59 ×** |
+| **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.735** | **3.40 ×** |
+| **Boot** (Mac Plus ROM, 5 M cycles, PC=`0x40032C` deterministic)    | **2.471** | **2.39 ×** |
+| **Boot** (Mac Plus ROM, 300 K cycles, PC=`0x40032C` deterministic)  | **2.170** | **2.72 ×** |
 
 **Important note — M6.77 reset.** The bench numbers in this table
 are the **first correct measurements** of the milestone in many
@@ -1404,6 +1406,88 @@ The 20 M helper drop of 2009 matches the predicted savings exactly
 (6.462 / 1.284). The new MULL instruction unlocks future multiply-
 heavy inlines (DIVS/DIVU need a divide instruction, which Xtensa
 LX7 doesn't have natively — those will stay as helpers).
+
+ctest: **7 / 7** pass.
+
+**M6.82 — third-tier chain entry (skip the redundant prologue ops on
+chain-hit + no-cache-compat). Structural win: bench −1.9 %, boot
+−5 % on the deterministic window.**
+
+The M6.62 cross-block reg-cache already had two tiers for chain JX
+target selection: `body_addr` (skip everything when cache+SR match)
+and `entry_addr` (full prologue otherwise). On bench the cache-match
+rate is only 3.3 % (vs boot's 99.7 %), so 96.7 % of bench's 241 K
+chain transitions paid the full prologue cost.
+
+But two of the prologue ops are **redundant on every chain
+transition**, regardless of cache match:
+
+* `l32r R_CPU, ADDR_CPU_BASE` — `R_CPU = a3` is a callee-saved
+  register in the CALL0 ABI, and the chain JX is a register jump,
+  not a call. The predecessor's `a3` already holds `HOST_CPU_BASE`.
+* `s32i a0, R_CPU, OFF_JITRETPC` — the chain epilogue's
+  `l32i a0, R_CPU, OFF_JITRETPC` BEFORE the JX already restored a0
+  to the saved value, so this s32i writes the same value back.
+
+Added a third entry point per block, **`chain_entry_addr`**, which
+points AFTER those two ops but BEFORE the SR reload and cache
+reloads. Dispatcher now picks:
+
+| Chain state | Target | Skips |
+|---|---|---|
+| Cold dispatch (`prev == NULL`) | `entry_addr` | nothing |
+| Chain hit + cache_sig + SR compat | `body_addr` | l32r RCPU + s32i a0 + sr_reload + cache_reload |
+| Chain hit + not compat | **`chain_entry_addr`** *(new)* | l32r RCPU + s32i a0 only |
+
+On the ESP32 native-chain path the savings come for free (a3 / a0
+are naturally preserved across the JX). On the **host** xt_sim each
+block runs in a fresh sim with all registers zeroed, so the host
+side pre-loads the equivalent state in C before `xt_sim_run`:
+
+* `chain_entry_addr` start: pre-set `s.a[3] = HOST_CPU_BASE`.
+* `body_addr` start: pre-set `s.a[3] = HOST_CPU_BASE`, `s.a[14] =
+  cpu->sr` if `b->sr_loaded`, and each active cache slot
+  `s.a[4+slot] = cpu->d[gi] / cpu->a[gi-8]`. C-side cost isn't
+  counted in `xt_instrs`, so the host metric correctly reflects the
+  LX7-op savings the ESP32 path gets from the prologue skip.
+
+**Why boot wins so much more than bench:** boot's 99.7 % cache-match
+rate means almost every chain transition now reaches `body_addr` and
+skips the **entire** prologue (5+ ops). Bench's 3.3 % match rate
+means most transitions use `chain_entry_addr` and save only 2 ops
+per transition. Boot's per-transition savings are ~2.5× bench's.
+
+**Triple-diff workflow:**
+
+* ctest: 7/7
+* `--diff-jit-trace`: only the documented M6.66 cycle-11898 divergence
+* Boot @ 300 K / 5 M deterministic: same final PC (`0x40032C`), same
+  helper count (1192 / 25240) as M6.81 — the metric drop is from
+  reduced inline op count, not from runtime divergence
+
+**Perf:**
+
+| Workload | M6.81 | **M6.82** | Δ |
+|----------|------:|----------:|--:|
+| Bench @ 5 M cyc   | 9 091 h, 1.447 lx7/cyc | **9 091 h, 1.418 lx7/cyc** | **−2.0 %** lx7 |
+| Bench @ 20 M cyc  | 10 065 h, 1.284 lx7/cyc | **10 065 h, 1.259 lx7/cyc** | **−1.9 %** lx7 |
+| Bench @ 100 M cyc | 316 022 h, 1.436 lx7/cyc | **316 022 h, 1.409 lx7/cyc** | **−1.9 %** lx7 |
+| Boot @ 300 K det  | 1 192 h, 2.320 lx7/cyc | **1 192 h, 2.170 lx7/cyc** | **−6.5 %** lx7 ✨ |
+| Boot @ 5 M det    | 25 240 h, 2.603 lx7/cyc | **25 240 h, 2.471 lx7/cyc** | **−5.1 %** lx7 ✨ |
+| Boot @ 100 M cyc  | 1.779 lx7/cyc | **1.735 lx7/cyc** | **−2.5 %** lx7 |
+
+The helper counts are identical to M6.81 — this is a pure prologue-
+trim win, no opcodes changed.
+
+**Bench is now `1.259 lx7/cyc` at 20 M cyc = `5.133 × interp`**
+(6.462 / 1.259). The chain-prologue lever (the largest structural
+piece flagged in M6.80) is now spent. The remaining structural
+piece would be **improving bench's cache-match rate** — every match
+upgrades a `chain_entry_addr`-tier hit into a `body_addr`-tier hit,
+doubling that transition's savings. Bench's per-block reg-set
+diversity makes this hard (an experimental canonical-slot-order
+refactor was prototyped this iteration but had zero effect — bench's
+blocks pick different reg *sets*, not just different orderings).
 
 ctest: **7 / 7** pass.
 

@@ -83,6 +83,17 @@ typedef struct m68k_block {
                          * sr_reload, cache_load). Chain JX uses this when
                          * prev block's cache + SR state is compatible
                          * (see dispatcher's predict-time selection). */
+    void *chain_entry_addr; /* M6.82 partial-prologue skip for chain-hit/no-
+                         * cache-compat case. Points AFTER the prologue's
+                         * `l32r R_CPU` and `s32i a0, OFF_JITRETPC` ops
+                         * (both redundant on chain transitions — R_CPU
+                         * = a3 is callee-saved across the JX, and the
+                         * predecessor's chain epilogue already reloaded
+                         * a0 from OFF_JITRETPC before the JX so the
+                         * s32i would write the same value back). Saves
+                         * 2 LX7 ops per chain-hit-no-cache-compat
+                         * dispatch (which on bench is 96.7 % of chain
+                         * transitions). */
     u8   sr_loaded;     /* M6.62: whether prologue did `l32i a14, OFF_SR`
                          * — i.e., a14 holds a valid SR at block start.
                          * Used by predict-time compat check: a chained

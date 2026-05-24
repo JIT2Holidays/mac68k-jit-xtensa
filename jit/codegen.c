@@ -1589,6 +1589,14 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
     g_sext_src_reg = -1;
     emit_l32r_at(&e, R_CPU, lit_off[ADDR_CPU_BASE], entry_off + e.len);
     xt_s32i(&e, 0, R_CPU, OFF_JITRETPC);
+    /* M6.82 — chain_entry skip target. Both the l32r above and the s32i
+     * above are redundant on chain-transition entries: R_CPU is a3
+     * (callee-saved across the JX), and the chain epilogue reloads a0
+     * from OFF_JITRETPC before the JX so the s32i would just write the
+     * same value back. Dispatcher uses this offset when chain hits but
+     * cache_sig doesn't match (body_addr is unsafe but the first two
+     * ops aren't needed). */
+    u32 chain_entry_off = entry_off + e.len;
     if (block_needs_sr_load) {
         emit_sr_reload(&e);
     }
@@ -4410,6 +4418,7 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
     b->entry_off = entry_off;
     b->entry_addr = (void *)(base + entry_off);
     b->body_addr = (void *)(base + body_off);
+    b->chain_entry_addr = (void *)(base + chain_entry_off);
     b->sr_loaded = (u8)(block_needs_sr_load ? 1 : 0);
     b->inline_ops = inline_ops;
     b->helper_ops = helper_ops;
