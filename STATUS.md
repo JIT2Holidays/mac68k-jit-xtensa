@@ -440,6 +440,41 @@ Plausible causes (not investigated to root):
 any JIT-affecting commit. ctest passing isn't enough. Memory at
 `memory/triple-differential.md`.
 
+**M6.66 — narrowed M6.65 bug to `emit_addq_w_dn`.**
+Bisect via temporary env-gated bridge: forcing the ADDQ.W to fall
+through to `m68k_step` makes the divergence at step 36 (PC=0x41E184)
+disappear — confirming the bug is in `emit_addq_w_dn` or its
+`emit_addsub_flags_long_masked` call.
+
+What was verified:
+* `flags_dead[1]` is 0 (correct — flag write isn't dead).
+* `block_needs_sr_load` is 1 (correct — prologue loads R_SR).
+* `rc.active` is 0 (D3 not cached; read via l32i).
+* The emitted bytes (102 = 34 instructions × 3) match the expected
+  layout. Decoded `xt_bnez(a10, 6)` = `56 2A 00` — target PC+6
+  cleanly skips the 3-byte `xt_or(8,8,9)` that would set the Z bit
+  when `a10 != 0`. `xt_movi(12, -32)` = `C2 AF E0` — correctly
+  sign-extends to `0xFFFFFFE0` to clear CCR bits 0-4.
+
+Where the bug must be (not pinpointed):
+* The SUBA.L bridge's `emit_sr_reload` may be reading a `cpu->sr`
+  mutated during `m68k_step` by some subtle path.
+* `g_sr_dirty` may be incorrectly false at epilogue flush time,
+  causing the modified R_SR not to be written back.
+* Some clobbered-register interaction between the SUBA.L bridge's
+  cache_reload and the inline's emit_read_g.
+
+Workaround (NOT committed; diagnostic only):
+```c
+if (getenv("MAC68K_NO_ADDQW_INLINE")) { /* fall through */ } else { … }
+```
+Around the `emit_addq_w_dn` call site.
+
+Next iteration: insert a debug print at the END of block emission
+that dumps R_SR and cpu->sr just before the standard return, to
+distinguish "R_SR is correct in-register but flushed wrong" from
+"R_SR is wrong in-register".
+
 Alternative real-software pair if synthetic benchmarks aren't the
 goal: **Dark Castle** (VIA-timer-driven sound + raster bit-banging
 — tests M3's "good enough to pace 60 Hz VBL, not instruction-cycle-
