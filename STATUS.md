@@ -1,16 +1,30 @@
 # Status
 
-## Where things stand right now (post-M6.70)
+## Where things stand right now (post-M6.77)
 
 | Engine | lx7 / cyc | × interp baseline |
 |--------|----------:|------------------:|
-| **Bench** (Speedometer frozen snapshot, 60 M cycles) | **1.279** | **5.05 ×** ✅ |
-| **Boot** (Mac Plus ROM, 100 M cycles)                | **1.735** | **3.40 ×** |
+| **Bench** (Speedometer frozen snapshot, 20 M cycles, PC=`0x03DF58`) | **1.304** | **4.96 ×** ✅ |
+| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.446** | **4.47 ×** |
+| **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.779** | **3.31 ×** |
 
-Bench cleared the 5×-interp goal at M6.31; M6.51 stretched it to
-5.16 ×, M6.68 reset to the current 5.05 × (the SR-flush bug had been
-masking some inline work — the new number reflects honest cost).
-ctest: **4/4** including the M6.68 SR-flush regression guard.
+**Important note — M6.77 reset.** The bench numbers in this table
+are the **first correct measurements** of the milestone in many
+sub-steps. From M6.62 to M6.76, a latent
+`emit_logic_flags` `vreg=10/11` clobber (see
+`memory/emit-logic-flags-vreg-conflict.md`) silently emitted wrong
+N/Z flags whenever the lazy-CC pass didn't mark
+`flags_dead = true` for the follow-on. The
+`diff_jit_bench_lockstep` ctest passed lockstep up to cycle 11898
+in every case (the documented M6.66 VIA-tick boundary), but
+post-cycle-11898 the bench ran on a wrong code path — usually
+"stuck looping in a ROM segment at PC ≈ `0x401???`" instead of the
+intended Speedometer hot loop at PC ≈ `0x03DF58` in RAM. Numbers
+recorded in M6.74-76 (`2.950`, `2.868`, `2.787`) are not directly
+comparable to the post-M6.77 figures — they were measured on the
+wrong path. M6.77 fixed the clobber and unblocked the correct
+loop. **ctest: 7/7** including the diff_jit_bench_lockstep
+regression guard.
 
 The JIT exceeds interp on every host metric. The remaining ESP32-only
 optimisations (M6.54 native chaining, M6.62 cross-block register
@@ -1032,6 +1046,113 @@ The next two top helpers (`0x4a38` TST.B (xxx).W at 15 K and
 targets. The "ROM source admitted" literals are now in steady use
 and ready for other reads (e.g. `MOVE.L (xxx).W,Dn` patterns at
 boot if they surface).
+
+**M6.77 — TST.B (xxx).W inline + latent `emit_logic_flags` clobber
+fix (huge bench unblock).**
+
+Started this iteration targeting `0x4A38` (TST.B (xxx).W, 15 K
+bench helpers in 20 M cyc) with a compile-time-RAM-static inline:
+the 16-bit ext word is known at codegen time, sign-extends to a 24-
+bit address, and the bench's first-PC (`0x4028DE`) reads
+`(xxx).W = 0x0349` — Mac low-memory RAM globals, statically RAM.
+For RAM-bound addresses the inline loads RAM_BASE + abs_addr → host
+ptr, reads one byte, sets MOVE-family CCR via shift-to-bit-31 +
+`emit_logic_flags`; for MMIO/out-of-RAM the static analysis skips
+the inline and falls to the m68k_step helper. 4 cycles, length 4.
+
+First measurement after the new inline: **bench got STUCK at PC=
+`0x4028F0`** (the BEQ right after the TST.B at `0x4028DE`),
+spinning through ~227 K helpers in 5 M cyc. ctest passed, the
+boot-deterministic 300 K window still matched byte-for-byte, but
+the bench was clearly wrong. Bisecting the new emit by-line found
+that `emit_logic_flags(e, vreg=10)` was the actual culprit.
+
+**The bug:** `emit_logic_flags`'s VERY FIRST emitted instruction is
+`xt_movi a10, -16` — clobbering `a10` before the subsequent `extui`
+and `bnez` read `vreg`. If the caller passes `vreg ∈ {10, 11}`
+(both used internally for scratch), the read sees the clobbered
+value instead. With `vreg=10`, every flag emit gets:
+
+* `extui a11, a10, 31, 0` reads `0xFFFFFFF0` → N bit = 1 always.
+* `bnez a10, +6` is taken → Z=0 always.
+
+So the function emits a sequence that yields **N=1, Z=0 regardless
+of the actual value.** Existing callers in M6.62, M6.73, and M6.74
+all pass `vreg=10` (the .L value lands in a10 after the BE-byte
+assembly), and have been silently relying on the lazy-CC pass
+marking the typical follow-on flags_dead — but the bug was always
+there, waiting for a consumer that actually reads Z. The new TST.B
+inline's natural follow-on is BEQ/BNE, which reads Z; the bug
+manifested instantly.
+
+**Fix:** shadow `vreg` into `a9` before the body runs:
+
+```c
+static void emit_logic_flags(xt_emit *e, u8 vreg) {
+    if (vreg == 10 || vreg == 11) {
+        xt_mov(e, 9, vreg);
+        vreg = 9;
+    }
+    /* ... unchanged body ... */
+}
+```
+
+One extra `mov` for vreg=10/11 callers; existing callers' wrong
+behavior corrected silently.
+
+**The bench wasn't measuring what we thought it was.** With the
+bug, bench's `MOVE.L (d16,An),Dn` and `MOVE.L (An)+,Dn` (the M6.62 /
+M6.73 inlines, where the .L value lands in a10) emitted bogus
+flags whenever the lazy-CC analysis didn't mark flags_dead. The
+`diff_jit_trace` ctest still passes lockstep up to cycle 11898
+because pre-11898 the bench either doesn't exercise those emits
+with flags_dead=false or interp/JIT happen to agree on the wrong
+behavior (since both make the same "wrong" branch). **Post-11898**
+(the documented VIA-tick artifact), the JIT diverges to whatever
+path the wrong flags push it down. From M6.62 onward, that path
+has been "stuck looping in some ROM code segment at PC ≈ 0x401???"
+instead of the bench's intended Speedometer hot loop at
+`PC ≈ 0x03DF58` in RAM.
+
+All M6.62→M6.76 bench numbers were measured on that wrong path.
+The M6.77 numbers below — and the new headline — are the first
+**correct** bench measurements since the bug landed.
+
+**Perf (post-fix, the new honest baseline):**
+
+| Workload | M6.76 (buggy path) | **M6.77 (corrected)** | Δ |
+|----------|-------------------:|----------------------:|---|
+| Bench @ 5 M cyc   | 84 963 h, 2.767 lx7/cyc, PC=`0x401F52` | **14 124 h, 1.487 lx7/cyc, PC=`0x03DF58`** | **−84 % helpers, −46 % lx7** |
+| Bench @ 20 M cyc  | 349 500 h, 2.787 lx7/cyc, PC=`0x40115E` | **20 766 h, 1.304 lx7/cyc, PC=`0x03DF58`** | **−94 % helpers, −53 % lx7** |
+| Bench @ 100 M cyc | 4 765 088 h, 4.163 lx7/cyc | **344 973 h, 1.446 lx7/cyc** | **−93 % helpers, −65 % lx7** |
+| Boot @ 300 K det  | unchanged | **unchanged** | byte-identical |
+| Boot @ 1 M / 5 M det | unchanged | **unchanged (±6 lx7 from the extra mov)** | byte-identical helper counts |
+| Boot @ 100 M (path-divergent) | 1.735 | 1.779 | within noise of post-VBL path-divergence |
+
+**Comparison to the original 5×-interp goal:** the bench's interp
+baseline is `6.462 lx7/cyc`. The corrected JIT bench `1.304` →
+**5.0× interp at 20 M cyc**, **4.5× interp at 100 M cyc** —
+matching the M6.51 headline claim that this 5×-line had been
+crossed, except now the comparison is real.
+
+**Triple-diff workflow:**
+
+* ctest: 7/7
+* `--diff-jit-trace`: only the documented M6.66 cycle-11898 divergence
+* Boot @ 300 K, 1 M, 5 M deterministic windows: byte-identical
+  helper counts vs M6.76; tiny `xt_mov`-added lx7 deltas
+
+**Memory recorded:**
+
+`memory/emit-logic-flags-vreg-conflict.md` documents the bug class
+(emit-side internal scratch overlapping with caller's vreg) and the
+defensive-shadow pattern as the standard fix. Linked from
+`memory/triple-differential.md` since it's the second internal-
+scratch-clobber to ship undetected by ctest's 11K bench window
+(after the M6.75 `xt_movi`-12-bit-range one — see
+`xtensa-movi-range.md`).
+
+ctest: **7 / 7** pass.
 
 Alternative real-software pair if synthetic benchmarks aren't the
 goal: **Dark Castle** (VIA-timer-driven sound + raster bit-banging

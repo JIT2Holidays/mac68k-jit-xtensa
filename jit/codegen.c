@@ -398,8 +398,27 @@ static u32 emit_movem_fast_bridge_size(u32 list, const regcache *rc) {
 }
 
 /* MOVE-family CCR update: N,Z from the value in `vreg`; V,C cleared;
- * X preserved. `vreg` is not clobbered. R_SR is updated in place. */
+ * X preserved. `vreg` is not clobbered. R_SR is updated in place.
+ *
+ * IMPORTANT (M6.77 fix): the body uses a10 and a11 as scratch. The
+ * VERY FIRST emitted instruction overwrites a10. If the caller passes
+ * vreg ∈ {10, 11}, the subsequent `extui` and `bnez` would read the
+ * clobbered value instead of the intended source — yielding the wrong
+ * N (=1, always) and the wrong Z (=0, always). Existing callers in
+ * M6.62 / M6.73 etc. routinely pass vreg=10 (the same scratch the
+ * load-/.L-assemble code paths land the value in) and have been
+ * silently relying on the lazy-CC pass marking flags_dead=true for the
+ * common-case follow-on, which made the bug invisible.
+ *
+ * Caught on M6.77's TST.B (xxx).W inline whose follow-on is a Bcc that
+ * really does consume Z — the bench got stuck at PC=0x4028F0 (the BEQ
+ * after TST.B at 0x4028DE) because Z was wrong. Fix: shadow vreg into
+ * a9 before clobbering a10/a11. */
 static void emit_logic_flags(xt_emit *e, u8 vreg) {
+    if (vreg == 10 || vreg == 11) {
+        xt_mov(e, 9, vreg);   /* a9 is not touched by the body */
+        vreg = 9;
+    }
     xt_movi (e, 10, -16);               /* keep bit 4 (X) and up */
     xt_and  (e, R_SR, R_SR, 10);
     xt_extui(e, 11, vreg, 31, 0);       /* N bit */
@@ -3336,6 +3355,64 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             if (!flags_dead[i]) emit_logic_flags(&e, 8);
             emit_advance(&e, 2, 4);
             inline_ops++; done = true;
+        } else if (top == 0x4 && ((w >> 8) & 0xF) == 0xA && szf == 0
+                   && mode == 7 && (w & 7) == 0) {
+            /* TST.B (xxx).W — bench-hot 0x4A38 at ~15 K helpers in 20 M cyc
+             * (M6.77). The 16-bit ext word holds a signed absolute address
+             * (range ±32 K), known at COMPILE TIME. For Mac Plus that's
+             * either low-memory RAM globals (0x000000-0x007FFE) or the
+             * high MMIO region (0xFF8000-0xFFFFFE). We inline only when
+             * compile-time analysis places the address in valid RAM —
+             * the MMIO case still needs m68k_step to dispatch through
+             * region_of() and the device handlers.
+             *
+             * Bit-field decode (per memory/triple-differential.md):
+             *   0x4A38 = 0100_1010_0011_1000
+             *            top=4 op=A   sz=00 m=111 reg=000
+             *          → top=0x4, op11-8=0xA (TST), size=byte, mode=7/reg=0 = (xxx).W
+             *
+             * No runtime bounds check needed — the static check is exact.
+             * Fast path: load RAM_BASE + abs_addr → host ptr; l8ui byte;
+             * sext to 32 via `<< 24` so emit_logic_flags reads bit 31 as
+             * the sign of the byte and Z is preserved (shift by 24 keeps
+             * zero-ness). MOVE-family CCR with V=C=0, X kept. 4 cycles
+             * (interp returns after set_flags_logic, no `cycles +=` after
+             * the base 4). */
+            u16 ext = mac_read16(cpu->mem, op_pc[i] + 2);
+            u32 abs_addr = (u32)(i32)(i16)ext;
+            abs_addr &= 0xFFFFFFu;             /* mac_mem's 24-bit mask */
+
+            u32 ram_size = cpu->mem ? cpu->mem->ram_size : 0;
+            bool overlay = cpu->mem ? cpu->mem->overlay : true;
+            bool ram_pow2 = ram_size > 0 && (ram_size & (ram_size - 1)) == 0;
+            bool addr_in_ram = !overlay && ram_pow2 && abs_addr < ram_size;
+
+            if (addr_in_ram) {
+                emit_advance_flush(&e);
+                emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                             entry_off + e.len);
+                /* Add abs_addr to a9. */
+                if ((i32)abs_addr >= -128 && (i32)abs_addr <= 127) {
+                    xt_addi(&e, 9, 9, (i32)abs_addr);
+                } else if ((i32)abs_addr >= -2048 && (i32)abs_addr <= 2047) {
+                    xt_movi(&e, 10, (i32)abs_addr);
+                    xt_add (&e, 9, 9, 10);
+                } else {
+                    emit_load_imm(&e, 10, 11, abs_addr);
+                    xt_add (&e, 9, 9, 10);
+                }
+                xt_l8ui(&e, 10, 9, 0);          /* a10 = byte */
+                if (!flags_dead[i]) {
+                    /* Shift byte to bit 31 so emit_logic_flags sees the
+                     * .B sign bit at the same position it would for a 32-
+                     * bit value, and Z is preserved (zero-shifted-zero). */
+                    xt_slli(&e, 10, 10, 24);
+                    emit_logic_flags(&e, 10);
+                }
+                emit_advance(&e, 4, 4);          /* len 4 (op+ext), 4 cyc */
+                inline_ops++; done = true;
+            }
+            /* else: fall through to the generic helper-step path below. */
         } else if (top == 0x4 && ((w >> 8) & 0xF) == 0x4 && szf == 2 && mode == 0) {
             /* NEG.L Dn — bench-warm 0x4480-0x4487 at ~1500 helpers in 20M cyc
              * (M6.73). r = 0 - Dn; full CCR via the existing SUB-style flag
