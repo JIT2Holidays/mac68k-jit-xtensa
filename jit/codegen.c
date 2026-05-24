@@ -1689,7 +1689,18 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             if (g_src >= 0 && g_src != g_dst) use[g_src]++;
             /* Bcc/BRA/MOVEQ/CMP all touch D/A too — but the per-arm
              * decoding above is rough; under-counting here only means
-             * "this register won't be cached", which is safe. */
+             * "this register won't be cached", which is safe.
+             *
+             * M6.89 attempt: tried a per-top-precise destination counter
+             * (CMP.W's true Dn dst, ADDQ's true dst at sm/sr, LEA's An
+             * dst at dr). Cache match rate IMPROVED (3.3 % → 4.8 %),
+             * BUT bench regressed +1.6 % — the "more accurate" picks
+             * evicted A4 / A3 (heavily read by MOVEA/ADDA emits in
+             * bench's 0x03DF40 hot block) in favour of D5 / D6 (counted
+             * twice each by the fix). The runtime savings from extra
+             * cache matches (~16 K LX7) were eclipsed by ~400 K LX7 of
+             * uncached load/stores. Conservative under-counting at the
+             * destination side is empirically the better default. */
             u32 cls = classify_op(w);
             bool inline_likely = (cls != (1u | 2u));  /* SET|CONS is helper-conservative */
             (void)top; (void)inline_likely;
