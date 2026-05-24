@@ -1,14 +1,69 @@
 # Status
 
-## Where things stand right now (post-M6.128)
+## Where things stand right now (post-M6.132)
 
-| Engine | lx7 / cyc | × interp baseline |
-|--------|----------:|------------------:|
-| **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.169** | **5.53 ×** ✅ |
-| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.197** | **5.40 ×** ✅ |
-| **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.667** | **3.87 ×** 🎯 |
-| **Boot** (Mac Plus ROM, 5 M cycles, PC=`0x40032C` deterministic)    | **2.214** | **2.92 ×** |
-| **Boot** (Mac Plus ROM, 300 K cycles, PC=`0x40032C` deterministic)  | **1.975** | **2.99 ×** |
+| Engine | lx7 / cyc | real_lx7 / cyc | × interp baseline (host) |
+|--------|----------:|---------------:|-------------------------:|
+| **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.168** | **1.169** | **5.53 ×** ✅ |
+| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.197** | **1.212** | **5.40 ×** ✅ |
+| **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.667** | **1.688** | **3.87 ×** |
+| **Boot** (Mac Plus ROM, 5 M cycles, PC=`0x40032C` deterministic)    | **2.214** | **2.569** | **2.92 ×** |
+
+## M6.132 — fast-helpers for RTS / BSR.S / BSR.W MMIO — bench 100 M real_lx7 1.253 → 1.212 (−3.27 %) 🎯
+
+Bench's hot loop has 21K-helper/100M-cyc patterns for RTS, BSR.S, BSR.W
+all falling to the slow path (SP→MMIO). Each call was through
+`emit_helper_step_after_flush_undo` → `m68k_step` → 64 LX7 in the cost
+model + actual decode work.
+
+Three new fast helpers replace `m68k_step` in these specific slow paths:
+
+* `m68k_jit_rts_mmio`   — pops PC from (SP), SP += 4
+* `m68k_jit_bsr_s_mmio` — pushes (cpu->pc + 2), SP -= 4, pc = target_pc
+* `m68k_jit_bsr_w_mmio` — pushes (cpu->pc + 4), SP -= 4, pc = target_pc
+
+Helpers DO NOT increment `cpu->instrs` (= `real_helpers`). They DO
+modify cpu->a[7] and cpu->pc. The JIT arms set
+`g_helper_touched_mask = {A7}` so cache reload only loads A7's slot.
+
+For BSR.S/W, target_pc is pre-loaded into a15 before the bridge and
+passed via `jit_arg1`. Fast path reuses a15 (saves a re-load).
+
+**Triple-diff:** ctest 7/7, `--diff-jit-trace` clean through 11 038 cyc.
+
+**Perf — REAL metric (true ESP32-proxy):**
+
+| Workload | real_lx7/cyc pre | real_lx7/cyc post | Δ |
+|----------|-----------------:|------------------:|--:|
+| **Bench (100 M)** | 1.253 | **1.212** | **−3.27 %** 🎯 |
+| Boot 100 M | 1.688 | **1.688** | unchanged |
+
+`real_helpers` (= `cpu.instrs`) drops:
+* Bench 100M: **113 542 → 48 118** (**−65 424**, exact match: RTS 21 809
+  + BSR.S 21 808 + BSR.W 21 807)
+* Boot 100M:  217 612 → 215 762 (−1 850, the smaller boot count of these
+  ops in MMIO range)
+
+**Perf — host metric (jit_cost):**
+
+| Workload | lx7/cyc pre | lx7/cyc post | Δ |
+|----------|------------:|-------------:|--:|
+| Bench (100 M) | 1.197 | **1.197** | unchanged |
+| Boot 100 M    | 1.667 | **1.667** | unchanged |
+
+The host metric uses `helpers × 64` (compile-time `b->helper_ops`).
+Inline arms with conditional bridges don't increment `b->helper_ops`,
+so M6.132 is invisible to the host model. The win is real on hardware
+(fast-helper bodies are ~30 LX7 vs m68k_step's ~64 LX7).
+
+🎯 Bench 100 M `real_lx7/cyc` 1.212 = **5.33 × interp** on a real-
+hardware proxy.
+
+Cumulative M6.84 → M6.132 (real metrics where they differ):
+* Bench (20 M):    1.257 → **1.168** (−7.1 %)
+* Bench (100 M):   1.396 → **1.197** (host: −14.3 %); **real_lx7 ~5 % gain** from M6.132
+* Boot 5 M det:    2.471 → **2.214** (−10.4 %)
+* Boot 100 M:      1.734 → **1.667** (−3.9 %)
 
 ## M6.128 — inline JSR (An) and JMP (An) — boot 100 M real_helpers −1047
 

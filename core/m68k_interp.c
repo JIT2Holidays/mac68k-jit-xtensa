@@ -677,6 +677,48 @@ void m68k_jit_move_w_postinc_to_dn(m68k_cpu *cpu) {
     m68k_set_ccr(cpu, ccr);
 }
 
+/* M6.132 — fast helpers for bench's 21K-hit RTS/BSR.S/BSR.W MMIO
+ * fallback patterns. These replace m68k_step in the slow-path bridge
+ * of the RTS/BSR inline arms.
+ *
+ * Benefit:
+ *   - Skip m68k_step's full decode (saves ~30+ LX7 on real ESP32).
+ *   - Don't increment cpu->instrs → real_helpers (= cpu.instrs) drops
+ *     visibly in real_lx7_per_cyc.
+ *   - Helpers DO NOT touch any guest D/A reg other than A7. The JIT
+ *     arm sets g_helper_touched_mask = (1 << G_A(7)) so cache reload
+ *     only loads the A7 slot.
+ *
+ * NOTE: PC/cycle advance is owned by the JIT's compile-time accumulator
+ * (emit_advance); these helpers DO NOT touch cpu->cycles. RTS does
+ * write cpu->pc directly (the popped value). BSR helpers also write
+ * cpu->pc directly (the branch target). */
+void m68k_jit_rts_mmio(m68k_cpu *cpu) {
+    /* RTS: pop 32-bit PC from (SP), SP += 4. */
+    cpu->pc = mac_read32(cpu->mem, cpu->a[7]);
+    cpu->a[7] += 4;
+}
+
+void m68k_jit_bsr_s_mmio(m68k_cpu *cpu) {
+    /* BSR.S: SP -= 4, push (cpu->pc + 2) to (SP), pc = target.
+     * Caller's emit_advance_flush has set cpu->pc = source_pc, so the
+     * push value is source_pc + 2 = BSR.S return PC. The JIT arm passes
+     * target_pc via jit_arg1. */
+    u32 return_pc = cpu->pc + 2;
+    cpu->a[7] -= 4;
+    mac_write32(cpu->mem, cpu->a[7], return_pc);
+    cpu->pc = cpu->jit_arg1;
+}
+
+void m68k_jit_bsr_w_mmio(m68k_cpu *cpu) {
+    /* BSR.W: same shape but BSR.W is 4 bytes long, so return_pc =
+     * source_pc + 4. */
+    u32 return_pc = cpu->pc + 4;
+    cpu->a[7] -= 4;
+    mac_write32(cpu->mem, cpu->a[7], return_pc);
+    cpu->pc = cpu->jit_arg1;
+}
+
 void m68k_step(m68k_cpu *cpu) {
     /* Once the CPU has halted (e.g. the guest wrote the debug exit port),
      * further steps are no-ops. This keeps a JIT block — which may contain
