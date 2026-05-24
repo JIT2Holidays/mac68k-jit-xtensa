@@ -1471,8 +1471,25 @@ static u32 classify_op(u16 w) {
         return SET;                        /* OR / CMP / AND / shifts / fp */
     case 0x9: case 0xD:                    /* SUB/ADD family — SUBA/ADDA no flags */
         if (szf == 3) return 0u;
-        /* ADDX/SUBX (mode 0 with reg-form bit 4 = 0/1): consume X. */
-        return SET | CONS;
+        /* M6.114 — refine: only ADDX/SUBX consume X (and Z, sticky).
+         * Plain ADD/SUB just SET — they don't read CCR.
+         *
+         * ADDX/SUBX shape: bit 8 = 1 (to_ea direction) AND mode in {0, 1}
+         * (mode 0 = Dn,Dn form; mode 1 = -(An),-(An) form). Plain ADD/SUB
+         * with bit 8 = 1 has mode in {2..7} (memory destination).
+         *
+         * Previously all top=9/D returned SET|CONS — overly conservative,
+         * marking the prior op's flag-emit as live even though plain ADD
+         * doesn't read CCR. Refinement turns SET|CONS into SET for ~all
+         * arithmetic, letting more prior-op flag emits be marked dead. */
+        {
+            bool addx_to_ea = (w >> 8) & 1;
+            int  addx_mode  = (w >> 3) & 7;
+            if (addx_to_ea && (addx_mode == 0 || addx_mode == 1)) {
+                return SET | CONS;          /* ADDX/SUBX */
+            }
+            return SET;                     /* plain ADD/SUB */
+        }
     case 0xA: return SET | CONS;           /* line-A trap */
     }
     return SET | CONS;

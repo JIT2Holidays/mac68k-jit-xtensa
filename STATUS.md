@@ -1,5 +1,52 @@
 # Status
 
+## Where things stand right now (post-M6.114)
+
+| Engine | lx7 / cyc | × interp baseline |
+|--------|----------:|------------------:|
+| **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.176** | **5.49 ×** ✅ |
+| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.223** | **5.28 ×** ✅ |
+| **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.715** | **3.45 ×** |
+| **Boot** (Mac Plus ROM, 5 M cycles, PC=`0x40032C` deterministic)    | **2.223** | **2.66 ×** |
+| **Boot** (Mac Plus ROM, 300 K cycles, PC=`0x40032C` deterministic)  | **1.975** | **2.99 ×** |
+
+## M6.114 — refine classify_op: plain ADD/SUB don't consume CCR
+
+Lazy-CC classifier was over-conservative for top=9 (SUB) and top=D (ADD)
+families: returned SET|CONS for ALL non-ADDA/SUBA forms. But plain ADD/SUB
+don't read CCR — only ADDX/SUBX do (they consume X and have sticky Z).
+
+Refined to return SET-only for plain ADD/SUB; SET|CONS only for ADDX/SUBX
+(bit 8 = 1 to-ea direction AND mode in {0, 1} register/predec form, with
+szf != 3 ruling out ADDA).
+
+Effect: prior op's `emit_logic_flags` is now marked dead when the next
+op is plain ADD or SUB, saving 6–7 LX7 ops per execution of the prior op.
+
+**Triple-diff workflow:** ctest 7/7, `--diff-jit-trace` clean through
+11 038 cycles, boot 100 M byte-identical helper counts (185 089), boot 5 M
+det same cycles.
+
+**Perf:**
+
+| Workload | M6.113 | **M6.114** | Δ |
+|----------|------:|----------:|--:|
+| Bench (20 M)        | 1.176 | **1.176** | xt −18 K |
+| Bench (100 M)       | 1.223 | **1.223** | xt −49 K |
+| **Boot 5 M det**    | 2.236 | **2.223** | **−0.58 %** ✅ |
+| Boot 100 M          | 1.716 | **1.715** | −0.04 % |
+
+Boot wins most because boot has more `MOVE.x ... ; ADD/SUB ... ; ...`
+sequences where the MOVE's emit_logic_flags is now dead. Bench's hot
+loop is the same set of ops as before so its xt count barely shifts.
+
+Cumulative M6.84 → M6.114:
+* Bench (20 M): 1.257 → **1.176** (−6.4 %)
+* Bench (100 M): 1.396 → **1.223** (**−12.4 %**)
+* Boot 300 K det: 2.170 → **1.975** (−9.0 %)
+* Boot 5 M det:   2.471 → **2.223** (**−10.0 %**) 🎯
+* Boot 100 M:     1.734 → **1.715** (−1.1 %)
+
 ## M6.113 — BTST/BCHG/BCLR/BSET #imm,(xxx).W — bench 100 M crosses 5.28 × interp
 
 Static bit-op #imm with `(xxx).W` absolute-addressing destination.
@@ -1353,16 +1400,6 @@ them each iteration.
    pairs/triples of 68k ops as a single LX7 sequence, eliminating the
    intermediate register writeback. See M6.85 below for the first
    fusion lever in this class.
-
-## Where things stand right now (post-M6.113)
-
-| Engine | lx7 / cyc | × interp baseline |
-|--------|----------:|------------------:|
-| **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.176** | **5.49 ×** ✅ |
-| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.223** | **5.28 ×** ✅ |
-| **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.716** | **3.45 ×** |
-| **Boot** (Mac Plus ROM, 5 M cycles, PC=`0x40032C` deterministic)    | **2.236** | **2.64 ×** |
-| **Boot** (Mac Plus ROM, 300 K cycles, PC=`0x40032C` deterministic)  | **1.975** | **2.99 ×** |
 
 **Important note — M6.77 reset.** The bench numbers in this table
 are the **first correct measurements** of the milestone in many
