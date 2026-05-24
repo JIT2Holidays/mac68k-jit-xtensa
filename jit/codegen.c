@@ -2024,6 +2024,14 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
         int szf  = (w >> 6) & 3;
         int mode = (w >> 3) & 7;
 
+        /* M6.131 — reset g_helper_touched_mask at start of each iteration.
+         * Lets arms that fall through to the default-helper path (without
+         * setting `done = true`) set the mask narrow first, knowing it
+         * will be reset on the next iteration. The default-helper case
+         * below picks up the mask without further resets. Each arm with
+         * an internal bridge still sets+resets locally as before. */
+        g_helper_touched_mask = 0xFFFFu;
+
         if (top == 0x7) {                  /* MOVEQ */
             emit_moveq(&e, w, flags_dead[i], &rc);
             inline_ops++; done = true;
@@ -2757,8 +2765,10 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                 if (!flags_dead[i]) emit_logic_flags(&e, 10);
                 emit_advance(&e, 4, 8);
                 inline_ops++; done = true;
+            } else {
+                /* M6.131 — MOVE.L (xxx).W,Dn modifies only Dn. */
+                g_helper_touched_mask = (u16)(1u << G_D(dn));
             }
-            /* else: fall through to helper. */
         } else if (top == 0x2 && ((w >> 6) & 7) == 1 && mode == 7 && (w & 7) == 0) {
             /* M6.108 — MOVEA.L (xxx).W,Am — sibling of MOVE.L (xxx).W,Dn
              * but writes to An (MOVEA never touches CCR). Bench-warm
@@ -2803,8 +2813,10 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                 /* MOVEA — no flags. */
                 emit_advance(&e, 4, 8);
                 inline_ops++; done = true;
+            } else {
+                /* M6.131 — MOVEA.L (xxx).W,Am modifies only An. */
+                g_helper_touched_mask = (u16)(1u << G_A(an));
             }
-            /* else: fall through to helper. */
         } else if (top == 0x2 && ((w >> 6) & 7) == 1 && mode == 2) {
             /* M6.103 — MOVEA.L (An),Am — boot-warm 0x2050 (MOVEA.L (A0),A0)
              * at 390 helpers / 100 M cyc. Sibling of M6.101's
@@ -4805,8 +4817,10 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                 }
                 emit_advance(&e, 4, 8);
                 inline_ops++; done = true;
+            } else {
+                /* M6.131 — MOVE.W (xxx).W,Dn modifies only Dn. */
+                g_helper_touched_mask = (u16)(1u << G_D(dn));
             }
-            /* else: fall through to helper. */
         } else if (top == 0x1 && ((w >> 6) & 7) == 0 && mode == 7 && (w & 7) == 0) {
             /* M6.109 — MOVE.B (xxx).W,Dn. Bench-hot 0x1638 at 21 K helpers /
              * 100 M cyc. Compile-time RAM check; on RAM hit, read 1 byte
@@ -4857,6 +4871,9 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                 }
                 emit_advance(&e, 4, 8);
                 inline_ops++; done = true;
+            } else {
+                /* M6.131 — MOVE.B (xxx).W,Dn modifies only Dn. */
+                g_helper_touched_mask = (u16)(1u << G_D(dn));
             }
         } else if (top == 0x3 && ((w >> 6) & 7) == 0 && mode == 2) {
             /* MOVE.W (An),Dn — guest-RAM fast path with helper fallback.
@@ -5905,8 +5922,12 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                     emit_advance(&e, 4, 4);
                 }
                 inline_ops++; done = true;
+            } else {
+                /* M6.131 — TST.B (xxx).W is flag-only; default helper
+                 * modifies no D/A reg. Set narrow touched_mask before
+                 * falling through. M6.131 reset at iter start cleans up. */
+                g_helper_touched_mask = 0u;
             }
-            /* else: fall through to the generic helper-step path below. */
         } else if (top == 0x4 && ((w >> 8) & 0xF) == 0x4 && szf == 2 && mode == 0) {
             /* NEG.L Dn — bench-warm 0x4480-0x4487 at ~1500 helpers in 20M cyc
              * (M6.73). r = 0 - Dn; full CCR via the existing SUB-style flag
