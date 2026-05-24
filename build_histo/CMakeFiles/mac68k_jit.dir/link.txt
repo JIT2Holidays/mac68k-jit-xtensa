@@ -1,2 +1,0 @@
-/usr/bin/ar qc libmac68k_jit.a CMakeFiles/mac68k_jit.dir/jit/emit_xtensa.c.o CMakeFiles/mac68k_jit.dir/jit/codecache.c.o CMakeFiles/mac68k_jit.dir/jit/codegen.c.o CMakeFiles/mac68k_jit.dir/jit/dispatcher.c.o CMakeFiles/mac68k_jit.dir/jit/xtensa_sim.c.o
-/usr/bin/ranlib libmac68k_jit.a

@@ -1,1 +1,0 @@
-/usr/bin/cc -DJIT_HELPER_HISTO=1 -O3 -DNDEBUG -arch arm64 -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/test_encoder.dir/test_encoder.c.o -o test_encoder  ../libmac68k_jit.a ../libmac68k_core.a

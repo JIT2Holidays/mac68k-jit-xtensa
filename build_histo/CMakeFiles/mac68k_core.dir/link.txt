@@ -1,2 +1,0 @@
-/usr/bin/ar qc libmac68k_core.a CMakeFiles/mac68k_core.dir/core/m68k_interp.c.o CMakeFiles/mac68k_core.dir/core/mac_mem.c.o CMakeFiles/mac68k_core.dir/core/mac_iwm.c.o CMakeFiles/mac68k_core.dir/core/mac_input.c.o CMakeFiles/mac68k_core.dir/core/sony.c.o CMakeFiles/mac68k_core.dir/core/demo_rom.c.o
-/usr/bin/ranlib libmac68k_core.a

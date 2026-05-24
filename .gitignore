@@ -1,5 +1,6 @@
 # Host build
 /build/
+/build_*/
 
 # ESP-IDF build artifacts
 /port/esp32s3/build/
