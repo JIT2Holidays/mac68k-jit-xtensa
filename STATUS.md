@@ -1,5 +1,54 @@
 # Status
 
+## M6.92 — MOVE.B (An),Dn + MOVE.B Dn,(An) inline (delivered)
+
+Continuation of the M6.91 MOVE.B class. Two more arms covering the
+boot helper-histo's next-tier entries:
+
+* `MOVE.B (An),Dn` (top=0x1, dst_mode=0, src_mode=2) — bench-warm
+  `0x1211` (MOVE.B (A1),D1) at 6 K boot helpers; `0x1411` (MOVE.B
+  (A1),D2) at 3 K; etc. Same shape as M6.91's `(d16,An),Dn` but
+  without the d16 displacement add. Source admits RAM-or-ROM byte;
+  destination is Dn[7:0] with the existing srli/slli/or merge.
+* `MOVE.B Dn,(An)` (top=0x1, dst_mode=2, src_mode=0) — `0x1082`
+  (MOVE.B D2,(A0)) at 3 K boot helpers. Source is Dn (no bounds
+  check), destination is (An) with RAM-only byte bounds (writes
+  can't go to ROM). xt_extui extracts Dn[7:0], xt_s8i stores.
+
+**Triple-diff workflow:**
+
+* ctest: 7/7
+* `--diff-jit-trace`: clean through 11 038 cycles
+* Boot 300 K det: 896 → 187 helpers (**−709**, ~21 % of pre-M6.91 count)
+* Boot 5 M det: 14 288 → 2 923 helpers (**−11 365**, **−79 %** of pre-M6.91 count)
+* Boot 100 M: 210 844 → 195 104 compile-time helpers (−15 740)
+
+**Perf:**
+
+| Workload | M6.91 | **M6.92** | Δ |
+|----------|------:|----------:|--:|
+| Bench @ 5 M / 20 M / 100 M | unchanged | unchanged | (no MOVE.B in bench hot loop) |
+| Boot @ 300 K det  | 2.116 lx7/cyc | **1.995 lx7/cyc** | **−5.7 %** lx7 |
+| Boot @ 5 M det    | 11 881 871 lx7 | **11 328 607 lx7** | **−4.6 %** lx7 |
+| Boot @ 100 M cyc  | 1.729 lx7/cyc | **1.721 lx7/cyc** | **−0.5 %** lx7 |
+
+**Cumulative M6.90 → M6.92 on boot:**
+
+| Workload | M6.90 | M6.92 | Δ |
+|----------|------:|------:|--:|
+| Boot 300 K det | 2.158 | **1.995** | **−7.6 %** lx7 |
+| Boot 5 M det   | 2.468 | **2.266** | **−8.2 %** lx7 |
+| Boot 100 M     | 1.734 | **1.721** | **−0.8 %** lx7 |
+
+**Boot is now 1.721 lx7/cyc @ 100 M = 3.43 × interp baseline** (was
+3.40 × at M6.90). The deterministic windows show the dramatic gains
+because early-init code is MOVE.B-dominated; 100 M includes more of
+the post-divergence MMIO-heavy paths where MOVE.B is less central.
+
+The MOVE.B class is largely "complete" now — adding more variants
+(MOVE.B (An)+,Dn, MOVE.B -(An),Dn, MOVE.B (An),(Am) mem-to-mem, etc.)
+would yield diminishing returns on the boot histogram.
+
 ## M6.91 — MOVE.B (d16,An),Dn + MOVE.B (d16,An),(Am) inline (delivered)
 
 Boot's top helper-histogram entry was `0x10A8` at 12 136 hits / 100 M cyc,
@@ -391,15 +440,15 @@ them each iteration.
    intermediate register writeback. See M6.85 below for the first
    fusion lever in this class.
 
-## Where things stand right now (post-M6.91)
+## Where things stand right now (post-M6.92)
 
 | Engine | lx7 / cyc | × interp baseline |
 |--------|----------:|------------------:|
 | **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.184** | **5.46 ×** ✅ |
 | **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.328** | **4.87 ×** |
-| **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.729** | **3.41 ×** |
-| **Boot** (Mac Plus ROM, 5 M cycles, PC=`0x40032C` deterministic)    | **2.376** | **2.49 ×** |
-| **Boot** (Mac Plus ROM, 300 K cycles, PC=`0x40032C` deterministic)  | **2.116** | **2.79 ×** |
+| **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.721** | **3.43 ×** |
+| **Boot** (Mac Plus ROM, 5 M cycles, PC=`0x40032C` deterministic)    | **2.266** | **2.61 ×** |
+| **Boot** (Mac Plus ROM, 300 K cycles, PC=`0x40032C` deterministic)  | **1.995** | **2.96 ×** |
 
 **Important note — M6.77 reset.** The bench numbers in this table
 are the **first correct measurements** of the milestone in many

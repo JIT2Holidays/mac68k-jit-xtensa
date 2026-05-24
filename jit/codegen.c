@@ -3028,6 +3028,108 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + jmb2_pos + 2] = (u8)(jw_mb2 >> 16);
 
             inline_ops++; done = true;
+        } else if (top == 0x1 && ((w >> 6) & 7) == 0 && mode == 2) {
+            /* M6.92 — MOVE.B (An),Dn — boot-warm 0x1211 (MOVE.B (A1),D1)
+             * at 6 K helpers / 100 M cyc, plus 0x1411 (MOVE.B (A1),D2)
+             * at 3 K. Same shape as the M6.91 (d16,An),Dn arm but with
+             * no displacement to add. Src admits RAM or ROM byte; flags
+             * from .B sign bit. Length 2, cycles 8. */
+            int dn = (w >> 9) & 7;
+            int an = w & 7;
+
+            emit_advance_flush(&e);
+            u8 an_reg = emit_read_g_in(&e, &rc, G_A(an), 8);
+
+            /* Unified RAM-or-ROM byte bounds. a12 == 0 iff src RAM-or-ROM. */
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS_BYTE],
+                         entry_off + e.len);
+            xt_and  (&e, 10, an_reg, 9);
+            emit_l32r_at(&e, 9, lit_off[LITERAL_ROM_BOUNDS_BYTE],
+                         entry_off + e.len);
+            xt_and  (&e, 11, an_reg, 9);
+            emit_l32r_at(&e, 9, lit_off[LITERAL_ROM_BASE],
+                         entry_off + e.len);
+            xt_xor  (&e, 11, 11, 9);
+            xt_and  (&e, 12, 10, 11);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_b1 = 2, op_cyc_b1 = 8;
+            xt_beqz (&e, 12, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_b1, op_cyc_b1)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_b1, op_cyc_b1);
+            u32 jb1_pos = e.len;
+            xt_j    (&e, 4);
+
+            /* Fast path: src host ptr via a10, load byte, merge into Dn[7:0]. */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_beqz (&e, 10, 6);
+            emit_l32r_at(&e, 9, lit_off[ADDR_ROM_HOST_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, an_reg);
+            xt_l8ui (&e, 10, 9, 0);
+            emit_read_g(&e, &rc, G_D(dn), 11);
+            xt_srli (&e, 11, 11, 8);
+            xt_slli (&e, 11, 11, 8);
+            xt_or   (&e, 11, 11, 10);
+            emit_write_g(&e, &rc, G_D(dn), 11);
+            if (!flags_dead[i]) {
+                xt_slli (&e, 8, 10, 24);
+                emit_logic_flags(&e, 8);
+            }
+            emit_advance(&e, op_pc_b1, op_cyc_b1);
+
+            u32 here_b1 = e.len;
+            i32 jo_b1 = (i32)(here_b1 - jb1_pos) - 4;
+            u32 jw_b1 = ((u32)((u32)jo_b1 & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jb1_pos    ] = (u8)jw_b1;
+            base[entry_off + jb1_pos + 1] = (u8)(jw_b1 >> 8);
+            base[entry_off + jb1_pos + 2] = (u8)(jw_b1 >> 16);
+
+            inline_ops++; done = true;
+        } else if (top == 0x1 && ((w >> 6) & 7) == 2 && mode == 0) {
+            /* M6.92 — MOVE.B Dn,(An) — boot-warm 0x1082 (MOVE.B D2,(A0))
+             * at 3 K helpers / 100 M cyc. Sibling of MOVE.B (An),Dn but
+             * with the directions swapped — src is Dn (no bounds check),
+             * dst is (An) (RAM byte bounds). Flags from byte value. */
+            int dst_an = (w >> 9) & 7;
+            int dn = w & 7;
+
+            emit_advance_flush(&e);
+            u8 an_reg = emit_read_g_in(&e, &rc, G_A(dst_an), 8);
+
+            /* Dst bounds: RAM byte only (writes can't go to ROM). */
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS_BYTE],
+                         entry_off + e.len);
+            xt_and  (&e, 10, an_reg, 9);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_b2 = 2, op_cyc_b2 = 8;
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_b2, op_cyc_b2)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_b2, op_cyc_b2);
+            u32 jb2_pos = e.len;
+            xt_j    (&e, 4);
+
+            /* Fast path: dst host ptr, read Dn byte, store. */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, an_reg);
+            emit_read_g(&e, &rc, G_D(dn), 10);       /* a10 = Dn */
+            xt_extui(&e, 11, 10, 0, 7);              /* a11 = Dn[7:0] */
+            xt_s8i  (&e, 11, 9, 0);
+            if (!flags_dead[i]) {
+                xt_slli (&e, 8, 11, 24);             /* byte at bit 31 */
+                emit_logic_flags(&e, 8);
+            }
+            emit_advance(&e, op_pc_b2, op_cyc_b2);
+
+            u32 here_b2 = e.len;
+            i32 jo_b2 = (i32)(here_b2 - jb2_pos) - 4;
+            u32 jw_b2 = ((u32)((u32)jo_b2 & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jb2_pos    ] = (u8)jw_b2;
+            base[entry_off + jb2_pos + 1] = (u8)(jw_b2 >> 8);
+            base[entry_off + jb2_pos + 2] = (u8)(jw_b2 >> 16);
+
+            inline_ops++; done = true;
         } else if (top == 0x2 && ((w >> 6) & 7) == 1 && mode == 5) {
             /* MOVEA.L (d16,An),Am — bench-warm 0x246F (MOVEA.L (d16,SP),A3)
              * at ~13 K helpers in 20M cyc (M6.75). Sibling of the M6.73
