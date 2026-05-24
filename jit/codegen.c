@@ -6601,6 +6601,50 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             if (!flags_dead[i]) emit_logic_flags(&e, 11);
             emit_advance(&e, 4, 74);
             inline_ops++; done = true;
+        } else if (top == 0xC && szf == 3 && mode == 0) {
+            /* M6.159 — MULS.W / MULU.W Dm,Dn — register-source variant
+             * of M6.81's #imm16 and (d16,An) arms. Bench's 0xC4C0
+             * (MULU.W D0,D2) at 54 hits / 100M cyc — the highest-fire
+             * remaining inlinable MUL form. Pure register-op, no bridge.
+             *
+             * Bit-field decode:
+             *   bits 11-9 = Dn (destination)
+             *   bit 8     = 0 (MULU) / 1 (MULS)
+             *   bits 7-6  = 11 (.W, szf=3)
+             *   bits 5-3  = 000 (mode 0 = Dn source)
+             *   bits 2-0  = Dm (source)
+             *
+             * Semantics (per m68k_interp's case 0xC szf==3 path at line
+             * 1483-1493): zero/sign-extend both Dm.W and Dn.W to 32-bit,
+             * multiply, write full 32-bit product to Dn. CCR via the
+             * standard MOVE-family emit_logic_flags (N from bit 31, Z
+             * from product==0, V=C=0, X preserved).
+             *
+             * Cycles: 74 (m68k_step base 4 + handler 70 — same as the
+             * other MUL.W arms). Length 2. */
+            bool sgn = (w >> 8) & 1;
+            int dn  = (w >> 9) & 7;
+            int dm  = w & 7;
+
+            emit_read_g(&e, &rc, G_D(dm), 8);
+            if (sgn) {
+                xt_slli (&e, 9, 8, 16);
+                xt_srai (&e, 9, 9, 16);     /* a9 = sext(Dm.W) */
+            } else {
+                xt_extui(&e, 9, 8, 0, 15);  /* a9 = zext(Dm.W) */
+            }
+            emit_read_g(&e, &rc, G_D(dn), 10);
+            if (sgn) {
+                xt_slli (&e, 11, 10, 16);
+                xt_srai (&e, 11, 11, 16);   /* a11 = sext(Dn.W) */
+            } else {
+                xt_extui(&e, 11, 10, 0, 15);/* a11 = zext(Dn.W) */
+            }
+            xt_mull (&e, 12, 9, 11);         /* a12 = .L product */
+            emit_write_g(&e, &rc, G_D(dn), 12);
+            if (!flags_dead[i]) emit_logic_flags(&e, 12);
+            emit_advance(&e, 2, 74);
+            inline_ops++; done = true;
         } else if (top == 0xC && szf == 3 && mode == 5) {
             /* MULS.W / MULU.W (d16,An), Dn — bench-hot 0xC1ED (MULS.W
              * (d16,A5),D0) at 1000 hits/20 M cyc (M6.81). Sibling of the
