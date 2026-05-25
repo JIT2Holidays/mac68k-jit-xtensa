@@ -19,8 +19,8 @@ is currently exercised against:
 | 5 | **boot 100M** (live Mac Plus boot, no snapshot) | **1.656** | 175 726 | ✅ active |
 | 6 | **boot-rom-init** (boot ROM memory test) | **1.662** | 232 106 | ✅ active |
 | 7 | **boot-system-load** (post-System-load ROM phase) | **1.786** | **0** | ✅ active |
+| 8 | **thinkc-bullseye** (THINK C 5.0 IDE running Bullseye demo) | **2.222** | 2 096 071 | ✅ active 🆕 |
 | — | **MacBench 4.0** (Mac compatibility benchmark) | — | — | **🚫 incompatible — see below** |
-| — | THINK C 5.0 IDE running | — | — | 🚧 blocked at folder-open → app-launch navigation |
 
 All seven active targets have ctest diff_jit_trace coverage (11K
 cycles for speedo, 100K for boot snaps after M6.201) — see
@@ -41,8 +41,44 @@ will refuse to start regardless of how it's launched. The InfiniteHD6
 also doesn't include older MacBench versions (3.0 / 2.0 / etc.) that
 would be compatible.
 
-### THINK C IDE running — partial progress (trap-trace confirmed)
+### THINK C IDE — full end-to-end DONE 🎯
 
+User directive completed: THINK C IDE now runs the built-in Bullseye
+demo with a captured snapshot in the bench rotation (target #8 at
+2.222 lx7/cyc, 2.1M real_helpers/100M — the highest-helper-rate target
+in the rotation, exercising a rich opcode mix: variable LSR.L (210K),
+MOVE.W (d8,An,Xn),Dn (170K combined), MOVE.B (An)+,Dn (111K), JSR
+through indirection (49K), and 30+ more opcodes at >5K fires each).
+
+Navigation recipe (codified in `scripts/snap-thinkc-bullseye.sh`):
+1. Boot Mac Plus from System6.dsk + InfiniteHD6.dsk.
+2. Finder navigation: Infinite HD → Developer → scroll → THINK C 8.
+3. View menu → by Name (list view, much more reliable than icon view
+   for coordinate-based clicking).
+4. Double-click THINK C 5.0 to launch the IDE.
+5. THINK C's Open Project dialog opens. Drill THINK Demos → Bullseye
+   Folder → bullseye π.
+6. Cmd-R to compile + link + run the demo.
+7. Snapshot at cycle 9.5B (post-run, bullseye target drawn).
+
+The accumulated learnings (from previous attempts that stalled at
+folder-open → app-launch):
+* **List view is essential** for reliable coord-based navigation —
+  icon view's row positions shift based on file count and aren't
+  scriptable.
+* **File dialog list-item Y coords** are 105px for row 1, growing
+  by ~15-17px per row. The visible "highlighted row" pulls the
+  cursor; double-click the SAME row that's already highlighted to
+  enter a folder.
+* **Cmd-R** triggers Project → Run, which compiles+links+runs in
+  one shot — much simpler than navigating the Project menu.
+* The captured snapshot, like thinkc8-folder-open, is NOT diff_jit_
+  trace-deterministic past a few hundred cycles (the demo polls VIA
+  for animation timing).
+
+### THINK C IDE running — partial progress (trap-trace confirmed) — superseded by #8
+
+(Historical entry — preserved for reference.)
 The `thinkc8-folder-open` snapshot captures the Finder steady-state
 with the THINK C 8 folder window open — this is already in the bench
 rotation as target #3 at 1.389 lx7/cyc.
