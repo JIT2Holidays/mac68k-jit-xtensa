@@ -6361,6 +6361,122 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             }
 
             inline_ops++; done = true;
+        } else if (top == 0xB && szf == 1 && ((w >> 8) & 1) == 0 && mode == 3) {
+            /* M6.210 — CMP.W (An)+,Dn. Sibling of M6.196 CMP.W (d16,An),Dn
+             * for mode=3 (post-increment) addressing. Speedo bench has
+             * 0xB258 (CMP.W (A0)+,D1), 0xB458, 0xB658, 0xB858 at 13 fires
+             * each = 52 cumulative. Absent from boot 100M / cycle100m /
+             * rom-init / cycle30m top-40 helper histos.
+             *
+             * Includes the M6.196 Bcc.S/Bcc.W fusion pattern (cc ∈
+             * {NE/EQ/BLT/BLE}). Length 2 (just opword); cycles 8 (CMP.W
+             * base 4 + handler 4). Fused with Bcc.S: 8+12=20 fold.
+             *
+             * Differences from M6.196 mode-5 arm:
+             *  • No d16 fetch (length 2 not 4)
+             *  • Post-increment An by 2 (write to cache after the read,
+             *    before flag emit / fusion tail)
+             *  • Bridge's touched_mask includes G_A(an) — m68k_step's
+             *    ea_decode increments cpu->a[an], so cache must reload */
+            int dn = (w >> 9) & 7;
+            int an = w & 7;
+
+            /* Fusion eligibility — same pattern as M6.196. */
+            bool fuse = false;
+            bool fuse_w = false;
+            int  fuse_cc = 0;
+            i32  fuse_disp = 0;
+            u32  fuse_ft = 0;
+            if (i + 1 < n_ops) {
+                u16 nw = op_word[i + 1];
+                if ((nw >> 12) == 0x6) {
+                    int cc = (nw >> 8) & 0xF;
+                    if (cc == 6 || cc == 7 || cc == 13 || cc == 15) {
+                        u8 disp8 = nw & 0xFFu;
+                        if (disp8 == 0) {
+                            i32 disp16 = (i16)mac_read16(cpu->mem,
+                                                         op_pc[i + 1] + 2);
+                            fuse = true; fuse_w = true;
+                            fuse_cc = cc; fuse_disp = disp16;
+                            fuse_ft = op_pc[i + 1] + 4;
+                        } else if (disp8 != 0xFF) {
+                            i32 disp = (i8)disp8;
+                            if (disp != 0 && disp != -1) {
+                                fuse = true; fuse_w = false;
+                                fuse_cc = cc; fuse_disp = disp;
+                                fuse_ft = op_pc[i + 1] + 2;
+                            }
+                        }
+                    }
+                }
+            }
+
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(an), 8);            /* a8 = An */
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_cwp = 2, op_cyc_cwp = 8;
+            /* CMP.W (An)+ modifies CCR + An (postinc by 2). */
+            g_helper_touched_mask = (u16)(1u << G_A(an));
+            u32 helper_skip_cwp = helper_step_after_flush_undo_size(&rc, op_pc_cwp, op_cyc_cwp);
+            u32 helper_tail_cwp = fuse ? fused_helper_bcc_tail_size(fuse_cc) : 0u;
+            xt_beqz (&e, 10, (i32)(6u + helper_skip_cwp + helper_tail_cwp));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_cwp, op_cyc_cwp);
+            g_helper_touched_mask = 0xFFFFu;
+            if (fuse) {
+                u32 before = e.len;
+                emit_cond(&e, fuse_cc);
+                i32 tail_disp = fuse_w ? (fuse_disp - 2) : fuse_disp;
+                emit_bcc_branchless_tail(&e, fuse_ft, tail_disp, 20);
+                if (e.len - before != helper_tail_cwp) {
+                    e.overflow = true;
+                }
+            }
+            u32 jcwp_pos = e.len;
+            xt_j    (&e, 4);
+
+            /* Fast path: read .W BE bytes, post-inc An, compute CMP. */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);                      /* a9 = ram + old An */
+            xt_l8ui (&e, 11, 9, 0);
+            xt_l8ui (&e, 12, 9, 1);
+            xt_slli (&e, 11, 11, 8);
+            xt_or   (&e, 11, 11, 12);                   /* a11 = .W src */
+            /* Post-increment An by 2 — done BEFORE the flag emit. */
+            xt_addi (&e, 12, 8, 2);
+            emit_write_g(&e, &rc, G_A(an), 12);
+            /* CMP setup with operands shifted to high 16. */
+            xt_slli (&e, 8, 11, 16);                    /* a8 = src << 16 */
+            emit_read_g(&e, &rc, G_D(dn), 11);
+            xt_slli (&e, 9, 11, 16);                    /* a9 = Dn << 16 */
+            xt_sub  (&e, 10, 9, 8);                     /* a10 = d - s */
+            if (fuse) {
+                emit_cmp_cond_fused(&e, fuse_cc, 8, 9, 10);
+                i32 tail_disp = fuse_w ? (fuse_disp - 2) : fuse_disp;
+                emit_bcc_branchless_tail(&e, fuse_ft, tail_disp, 20);
+            } else {
+                emit_addsub_flags_long_masked(&e, true, true, 8, 9, 10, flags_needed[i]);
+                emit_advance(&e, op_pc_cwp, op_cyc_cwp);
+            }
+
+            u32 here_cwp = e.len;
+            i32 jo_cwp = (i32)(here_cwp - jcwp_pos) - 4;
+            u32 jw_cwp = ((u32)((u32)jo_cwp & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jcwp_pos    ] = (u8)jw_cwp;
+            base[entry_off + jcwp_pos + 1] = (u8)(jw_cwp >> 8);
+            base[entry_off + jcwp_pos + 2] = (u8)(jw_cwp >> 16);
+
+            if (fuse) {
+                g_pc_acc = 0;
+                g_cyc_acc = 0;
+                i++;
+            }
+
+            inline_ops++; done = true;
         } else if (top == 0xB && szf == 1 && ((w >> 8) & 1) == 0 && mode == 5) {
             /* CMP.W (d16,An),Dn — bench-hot 0xBC6D (~6.8 %).
              *   EA = a[an] + sext16(d16); read .W; sext to 32; compare
