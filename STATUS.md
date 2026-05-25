@@ -93,6 +93,66 @@ produced a sub-window (1.36% diff). Then iterate inside.
 
 These tools are reusable for any future Mac-Plus interactive scripting.
 
+## M6.225 — MOVE.L (xxx).W,(An) MMIO fast helper — boot-system-load 2.140 → 2.070 lx7/cyc (−3.27 %), −114,679 helpers 🎯
+
+Boot-system-load's #1 remaining hotspot. Helper-histo top-3 had:
+```
+22b8  114679  pc=410f62   ← MOVE.L (xxx).W,(A1), src abs.W → MMIO
+4ef0  114679  pc=41713a
+d0bc  114679  pc=a001b686
+```
+All firing in lock-step at 114,679 per 100 M cycles. The 0x22B8 opcode
+reads a long from a compile-time-known abs.W address and writes it to
+`(A1)`; in this workload the src abs.W consistently resolves to MMIO,
+so every fire took the default `m68k_step` bridge.
+
+`memory/mmio-fast-helper-pattern.md` applies cleanly: skip
+`m68k_step`'s decode + `cpu->instrs++` by emitting a custom helper
+that just does `mac_read32(src) + mac_write32(a[an]) + MOVE-family
+CCR`. Because `mac_read/write32` handle both RAM and MMIO transparently,
+the helper works for either source — no compile-time RAM-vs-MMIO split
+needed.
+
+Wiring:
+* `core/m68k_interp.c` — `m68k_jit_move_l_xxxw_to_an_mmio(cpu)` reads
+  `cpu->jit_arg1` = abs_addr (sext16) and `cpu->jit_arg2` = dst An reg
+  index. Sets N/Z from .L value, preserves X.
+* `jit/codegen.h` — `HELPER_JIT_MOVE_L_XXXW_TO_AN_MMIO` enum slot.
+* `jit/dispatcher.c` — three wiring sites (ESP32 helper_addr, host
+  sim_addr, host sim_call).
+* `jit/codegen.c` — new arm at predicate `top == 0x2 && ((w >> 6) & 7)
+  == 2 && mode == 7 && (w & 7) == 0` (between the existing
+  `MOVEA.L (xxx).W,Am` and `MOVEA.L (An),Am` arms). Loads abs_addr into
+  a8, sets `g_helper_touched_mask = 1u << G_A(an)`, then `emit_jit_fast_helper`
+  with arg1=a8, arg2=an. Length 4, cycles 8.
+
+Bench impact:
+| Bench | Baseline | M6.225 | Δ helpers | Δ lx7/cyc |
+|---|---:|---:|---:|---:|
+| boot-system-load | 802,753 / 2.140 | 688,074 / 2.070 | **−114,679** | **−3.27 %** |
+| speedo | 1293 / 1.179 | 1293 / 1.179 | 0 | 0 |
+| boot 100M | 1428 / 1.634 | 1428 / 1.634 | 0 | 0 |
+| boot-cycle30m | 8 / 1.334 | 8 / 1.334 | 0 | 0 |
+| boot-rom-init | 232,107 / 1.662 | 232,066 / 1.662 | −41 | 0 |
+| thinkc8 | 0 / 1.389 | 0 / 1.389 | 0 | 0 |
+| boot 5M det | 54 / 1.952 | 54 / 1.952 | 0 | 0 |
+
+Every non-target bench is byte-stable (the 41-helper drop on
+boot-rom-init is the same MOVE.L (xxx).W,(An) pattern incidentally
+firing on a few low-volume blocks there).
+
+ctest 11/11; `scripts/diff.sh` matches 321 blocks / 11,038 cycles.
+
+Three reverts in this iteration before landing the right pattern:
+1. **M6.225-first (ADD.L/SUB.L #imm32,Dn)** — diff_jit_boot_system_load
+   failed at step 4 (JIT PC 2 bytes behind interp). Root cause undiagnosed.
+2. **M6.225-second (MOVEA.L (xxx).W,Am MMIO fast helper)** — implemented
+   but system-load helpers didn't drop. Mis-decode: 0x22B8 is `MOVE.L
+   (xxx).W,(An)` (mode 2), NOT `MOVEA.L (xxx).W,Am` (mode 1). The
+   M6.208-class "verify decode bit-exactly with python3" rule applies
+   to MMIO fast helpers too.
+3. The third attempt (this commit) targets `MOVE.L (xxx).W,(An)` directly.
+
 ## M6.158 — per-helper SR mask (structural item 2) 🎯
 
 First concrete delivery on the high-gain backlog's **Item 2** (lazy-CC

@@ -3959,6 +3959,48 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                 /* M6.131 — MOVEA.L (xxx).W,Am modifies only An. */
                 g_helper_touched_mask = (u16)(1u << G_A(an));
             }
+        } else if (top == 0x2 && ((w >> 6) & 7) == 2 && mode == 7 && (w & 7) == 0) {
+            /* M6.225 — MOVE.L (xxx).W,(An) MMIO fast helper.
+             * boot-system-load bench's 0x22B8 (MOVE.L (xxx).W,(A1))
+             * at PC=0x410F62 fires 114,679 times — 100 % via the
+             * default m68k_step bridge (src abs.W resolves to MMIO).
+             * Absent from speedo, thinkc8, and the boot ROM-init /
+             * cycle30M / cycle100M snapshots, so trajectory-safe.
+             *
+             * Sibling of M6.108 MOVE.L (xxx).W,Dn but dst is (An)
+             * indirect — the destination address itself can be RAM
+             * or MMIO, but the m68k_jit_move_l_xxxw_to_an_mmio helper
+             * routes through mac_read32/mac_write32 which handle
+             * both transparently. Skips m68k_step decode + instrs++.
+             *
+             * Length 4 (op + abs.W ext), cycles 8. Helper args:
+             *   jit_arg1 = abs_addr (sext16 of ext word)
+             *   jit_arg2 = dst An reg index (0..7).
+             * Touches a[an] only; default SR flush/reload (helper
+             * preserves X, writes N/Z). */
+            int dst_an_mxn = (w >> 9) & 7;
+            u16 src_ext_mxn = mac_read16(cpu->mem, op_pc[i] + 2);
+            u32 abs_addr_mxn = (u32)(i32)(i16)src_ext_mxn;
+            abs_addr_mxn &= 0xFFFFFFu;
+
+            emit_advance_flush(&e);
+            emit_cache_flush(&e, &rc);
+            /* Load abs_addr into a8 (the helper-arg1 register). */
+            if ((i32)abs_addr_mxn >= -2048 && (i32)abs_addr_mxn <= 2047) {
+                xt_movi(&e, 8, (i32)abs_addr_mxn);
+            } else {
+                emit_load_imm(&e, 8, 9, abs_addr_mxn);
+            }
+            g_helper_touched_mask = (u16)(1u << G_A(dst_an_mxn));
+            g_helper_arg_mask = 3u;       /* arg1=addr (a8), arg2=an */
+            emit_jit_fast_helper(&e, 8, dst_an_mxn,
+                                 lit_off[HELPER_JIT_MOVE_L_XXXW_TO_AN_MMIO],
+                                 entry_off, &rc);
+            g_helper_touched_mask = 0xFFFFu;
+            g_helper_arg_mask = 3u;
+            emit_advance(&e, 4, 8);
+            sext_memo_invalidate();
+            inline_ops++; done = true;
         } else if (top == 0x2 && ((w >> 6) & 7) == 1 && mode == 2) {
             /* M6.103 — MOVEA.L (An),Am — boot-warm 0x2050 (MOVEA.L (A0),A0)
              * at 390 helpers / 100 M cyc. Sibling of M6.101's

@@ -815,6 +815,27 @@ void m68k_jit_bitop_dn_an_mmio(m68k_cpu *cpu) {
     }
 }
 
+/* M6.225 — MOVE.L (xxx).W,(An) MMIO fast helper. boot-system-load
+ * fires 0x22B8 (MOVE.L (xxx).W,(A1)) at PC=0xA001B6?? 114,679 times
+ * where default helper bridges to m68k_step.
+ *
+ * Args:
+ *   jit_arg1 = src abs addr (compile-time-known imm.W, sign-extended)
+ *   jit_arg2 = dst An register index (0..7)
+ *
+ * Reads 4 BE bytes from abs, writes to (a[an]). Sets MOVE-family CCR
+ * (N/Z from value, V=C=0, X preserved). */
+void m68k_jit_move_l_xxxw_to_an_mmio(m68k_cpu *cpu) {
+    u32 src_addr = cpu->jit_arg1;
+    int an = (int)(cpu->jit_arg2 & 7);
+    u32 v = mac_read32(cpu->mem, src_addr);
+    mac_write32(cpu->mem, cpu->a[an], v);
+    u8 ccr = m68k_get_ccr(cpu) & CCR_X;
+    if (v == 0)          ccr |= CCR_Z;
+    if (v & 0x80000000u) ccr |= CCR_N;
+    m68k_set_ccr(cpu, ccr);
+}
+
 /* M6.193 — MOVE (An)+,SR fast helper. thinkc8-folder-open bench's
  * 0x46DF (MOVE (A7)+,SR) at PC=0x4027E0 ~25K hits/100 M (critical-
  * section SR-restore pattern). Skips m68k_step's decode + cpu->instrs
