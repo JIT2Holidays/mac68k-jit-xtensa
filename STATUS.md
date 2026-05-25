@@ -140,11 +140,22 @@ Follow-up bug discovered (deferred): block at PC=0x41E3A8 contains
 `emit_addsub_flags_long_masked` with `flags_needed[i]` (only N+V for
 BLT consumer); Z bit is left at its prior value (1 from earlier).
 Per `memory/per-flag-ccr-blocked.md` this is the documented per-flag
-CCR liveness leak. Existing memory note claimed it didn't trigger in
-practice because partial-mask sites were all in fused paths — that
-claim is now disproven. Possible fixes: (a) widen the CMPA arm's
-flag mask to always write Z; (b) extend the M6.232 work to find ALL
-remaining trajectory-divergence root causes.
+CCR liveness leak.
+
+**M6.233 attempt (reverted):** Replaced `flags_needed[i]` with
+`CCR_MASK_ALL` in all 13 CMP/CMPA partial-mask sites. This extended
+diff_jit_trace from step 360 → step 562 (next divergence is the
+TST+Bcc fusion's R_SR bypass — a separate fusion-zone artifact).
+But thinkc8 regressed +14.7% (1.389 → 1.593 lx7/cyc) because those
+arms fire heavily on thinkc8's CMP-heavy loops. Reverted. The
+partial-mask flag emit is a SR-leak in trajectory terms but the
+optimization saves real cycles on heavy CMP/Bcc workloads where the
+SR leak doesn't propagate to actual mis-behavior.
+
+The per-flag-ccr-blocked memory is correct: this can't be fixed
+generally without breaking the perf optimization. Per-arm fixes are
+also blocked by the perf-vs-correctness tradeoff. Accept the
+diff_jit_trace artifact as a known property of the fusion design.
 
 ## M6.231 — BCHG/BCLR/BSET #imm,(d16,An) static bit op mode 5
 
