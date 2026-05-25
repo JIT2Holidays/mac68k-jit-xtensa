@@ -64,12 +64,28 @@ endif()
 #
 # Both snapshots are 1.18 MB and gitignored (regenerate via the
 # scripts/snap-extra-bench.sh script in this directory).
+# M6.201 — extended deterministic windows. Empirical max-deterministic
+# survey showed three boot snapshots stay JIT-identical to interp for
+# WELL OVER the 11K-cycle window:
+#
+#   * speedo-bench:      diverges at ~11898 cycles (M6.66 VIA-tick).
+#                        Must stay at 11000.
+#   * boot-rom-init:     deterministic to ~3.6M cycles (138K blocks).
+#                        Now run 100K cycles (≈ 4.5K blocks of coverage).
+#   * boot-system-load:  deterministic to ≥10M cycles (217K blocks)!
+#                        Now run 100K cycles (2.2K blocks).
+#   * boot-cycle100m:    deterministic to ≥10M cycles (133K blocks).
+#                        Now run 100K cycles (1.4K blocks).
+#
+# The 100K window broadens differential coverage by ~10× over 11K.
+# Each test still completes in <0.05s.
+
 if(EXISTS "${CMAKE_SOURCE_DIR}/roms/disks/boot-rom-init.snap")
     add_test(NAME diff_jit_boot_rom_init_lockstep
              COMMAND $<TARGET_FILE:mac68k_host>
                      --diff-jit-trace --no-irq
                      --load-snapshot ${CMAKE_SOURCE_DIR}/roms/disks/boot-rom-init.snap
-                     --max-cycles 11000
+                     --max-cycles 100000
              WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endif()
 
@@ -78,7 +94,7 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/roms/disks/boot-system-load.snap")
              COMMAND $<TARGET_FILE:mac68k_host>
                      --diff-jit-trace --no-irq
                      --load-snapshot ${CMAKE_SOURCE_DIR}/roms/disks/boot-system-load.snap
-                     --max-cycles 11000
+                     --max-cycles 100000
              WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endif()
 
@@ -86,13 +102,13 @@ endif()
 # and the thinkc8 Finder-steady-state=1.9B). Captures the INIT/extension
 # load phase. Hot opcodes include BCHG D4,(A1), MOVE.L (A0)+,(A0), and
 # MOVE.L (A0)+,(A4)+ — distinct mix from the other three snapshots.
-# Passes the full 11K --diff-jit-trace --no-irq window (150 blocks).
-# Regenerate via scripts/snap-cycle100m.sh.
+# Deterministic to ≥10M cycles. Now run 100K cycles. Regenerate via
+# scripts/snap-cycle100m.sh.
 if(EXISTS "${CMAKE_SOURCE_DIR}/roms/disks/boot-cycle100m.snap")
     add_test(NAME diff_jit_boot_cycle100m_lockstep
              COMMAND $<TARGET_FILE:mac68k_host>
                      --diff-jit-trace --no-irq
                      --load-snapshot ${CMAKE_SOURCE_DIR}/roms/disks/boot-cycle100m.snap
-                     --max-cycles 11000
+                     --max-cycles 100000
              WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endif()
