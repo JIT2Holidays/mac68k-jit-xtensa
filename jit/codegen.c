@@ -6590,6 +6590,75 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                 /* M6.131 — MOVE.W (xxx).W,Dn modifies only Dn. */
                 g_helper_touched_mask = (u16)(1u << G_D(dn));
             }
+        } else if (top == 0x1 && ((w >> 6) & 7) == 0 && mode == 7 && (w & 7) == 1) {
+            /* M6.200 — MOVE.B (xxx).L,Dn. Boot 100M's 0x1439 (MOVE.B
+             * (xxx).L,D2) at PC=0x401B56 fires 195 times — all targeting
+             * MMIO (abs_addr=0xEFE1FE, in the VIA range). Absent from
+             * speedo, thinkc8, cycle100m. Sibling of M6.109 MOVE.B
+             * (xxx).W,Dn but with 32-bit abs addr.
+             *
+             * Uses the M6.133 m68k_jit_move_b_addr_to_dn_mmio fast
+             * helper for MMIO targets (skips m68k_step decode). For
+             * RAM targets, inline a byte read + merge into Dn[7:0].
+             *
+             * Length 6 (op + abs.L 4 bytes), cycles 8. */
+            int dn = (w >> 9) & 7;
+            u32 abs_addr = mac_read32(cpu->mem, op_pc[i] + 2);
+            abs_addr &= 0xFFFFFFu;
+
+            u32 ram_size_mbL = cpu->mem ? cpu->mem->ram_size : 0;
+            bool overlay_mbL = cpu->mem ? cpu->mem->overlay : true;
+            bool ram_pow2_mbL = ram_size_mbL > 0 && (ram_size_mbL & (ram_size_mbL - 1)) == 0;
+            bool addr_in_ram_mbL = !overlay_mbL && ram_pow2_mbL && abs_addr < ram_size_mbL;
+
+            if (addr_in_ram_mbL) {
+                /* Compile-time RAM: read byte, merge into Dn[7:0]. */
+                emit_advance_flush(&e);
+                emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                             entry_off + e.len);
+                if ((i32)abs_addr >= -128 && (i32)abs_addr <= 127) {
+                    xt_addi(&e, 9, 9, (i32)abs_addr);
+                } else if ((i32)abs_addr >= -2048 && (i32)abs_addr <= 2047) {
+                    xt_movi(&e, 10, (i32)abs_addr);
+                    xt_add (&e, 9, 9, 10);
+                } else {
+                    emit_load_imm(&e, 10, 11, abs_addr);
+                    xt_add (&e, 9, 9, 10);
+                }
+                xt_l8ui (&e, 10, 9, 0);
+
+                int dn_xt = cache_lookup(&rc, G_D(dn));
+                u8 dn_reg = (dn_xt >= 0) ? (u8)dn_xt : 11;
+                if (dn_xt < 0) emit_read_g(&e, &rc, G_D(dn), 11);
+                xt_srli(&e, dn_reg, dn_reg, 8);
+                xt_slli(&e, dn_reg, dn_reg, 8);
+                xt_or  (&e, dn_reg, dn_reg, 10);
+                if (dn_xt >= 0) {
+                    for (int s = 0; s < rc.active; s++)
+                        if (rc.guest[s] == (u8)G_D(dn)) { rc.dirty |= (u16)(1u << s); break; }
+                } else {
+                    emit_write_g(&e, &rc, G_D(dn), 11);
+                }
+                if (!flags_dead[i]) {
+                    xt_slli(&e, 8, 10, 24);
+                    emit_logic_flags(&e, 8);
+                }
+                emit_advance(&e, 6, 8);
+                inline_ops++; done = true;
+            } else {
+                /* Compile-time MMIO: load abs_addr into a8, call fast
+                 * helper. Helper sets CCR; touched_mask = Dn. */
+                emit_advance_flush(&e);
+                emit_cache_flush(&e, &rc);
+                emit_load_imm(&e, 8, 9, abs_addr);
+                g_helper_touched_mask = (u16)(1u << G_D(dn));
+                emit_jit_fast_helper(&e, 8, dn,
+                                     lit_off[HELPER_JIT_MOVE_B_ADDR_TO_DN_MMIO],
+                                     entry_off, &rc);
+                g_helper_touched_mask = 0xFFFFu;
+                emit_advance(&e, 6, 8);
+                inline_ops++; done = true;
+            }
         } else if (top == 0x1 && ((w >> 6) & 7) == 0 && mode == 7 && (w & 7) == 0) {
             /* M6.109 — MOVE.B (xxx).W,Dn. Bench-hot 0x1638 at 21 K helpers /
              * 100 M cyc. Compile-time RAM check; on RAM hit, read 1 byte
