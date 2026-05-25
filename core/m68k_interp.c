@@ -750,6 +750,24 @@ void m68k_jit_tst_b_mmio(m68k_cpu *cpu) {
     m68k_set_ccr(cpu, ccr);
 }
 
+/* M6.193 — MOVE (An)+,SR fast helper. thinkc8-folder-open bench's
+ * 0x46DF (MOVE (A7)+,SR) at PC=0x4027E0 ~25K hits/100 M (critical-
+ * section SR-restore pattern). Skips m68k_step's decode + cpu->instrs
+ * increment.
+ *
+ * Args: jit_arg2 = An register index (0..7); jit_arg1 unused.
+ * The full m68k_sync_sp is called so S-bit changes are handled
+ * correctly. */
+void m68k_jit_move_anpi_to_sr(m68k_cpu *cpu) {
+    int an = (int)(cpu->jit_arg2 & 7);
+    u32 addr = cpu->a[an];
+    u16 val = mac_read16(cpu->mem, addr);
+    cpu->a[an] = addr + 2;
+    bool was = m68k_is_super(cpu);
+    cpu->sr = val;
+    m68k_sync_sp(cpu, was);
+}
+
 /* M6.190 — A-line trap fast helper. thinkc8-folder-open bench's
  * 0xA000-0xAFFF range fires ~25 K times/100 M cyc (Toolbox trap
  * dispatch). Sibling of m68k_jit_fline_trap below — just calls

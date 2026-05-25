@@ -2169,6 +2169,35 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
         if (top == 0x7) {                  /* MOVEQ */
             emit_moveq(&e, w, flags_dead[i], &rc);
             inline_ops++; done = true;
+        } else if ((w & 0xFFF8) == 0x46D8) {
+            /* M6.193 — MOVE (An)+,SR. thinkc8-folder-open bench's
+             * 0x46DF (MOVE (A7)+,SR) at PC=0x4027E0 ~25K hits/100 M
+             * (critical-section SR-restore pattern, paired with M6.192
+             * MOVE SR,-(An)). Absent from boot 100 M and speedo.
+             *
+             * Uses a custom fast helper m68k_jit_move_anpi_to_sr that
+             * skips m68k_step's decode + cpu->instrs++. The helper
+             * does mac_read16 + a[an]+=2 + m68k_sync_sp to handle a
+             * possible S-bit change in the popped SR value.
+             *
+             * Length 2, cycles 4 (interp returns early). Touched
+             * regs: a[an] and a[7] (sync_sp may swap). */
+            int an = w & 7;
+
+            emit_advance_flush(&e);
+            emit_cache_flush(&e, &rc);
+            g_helper_touched_mask = (u16)((1u << G_A(an)) | (1u << G_A(7)));
+            /* Helper reads cpu->sr (for m68k_is_super check) and writes
+             * cpu->sr. Default sr_mask = 3u (flush+reload) is correct. */
+            g_helper_arg_mask = 2u;       /* uses jit_arg2=an, not arg1 */
+            emit_jit_fast_helper(&e, 8, an,
+                                 lit_off[HELPER_JIT_MOVE_ANPI_TO_SR],
+                                 entry_off, &rc);
+            g_helper_touched_mask = 0xFFFFu;
+            g_helper_arg_mask = 3u;
+            emit_advance(&e, 2, 4);
+            sext_memo_invalidate();
+            inline_ops++; done = true;
         } else if ((w & 0xFFF8) == 0x40E0) {
             /* M6.192 — MOVE SR,-(An). thinkc8-folder-open bench's
              * 0x40E7 (MOVE SR,-(A7)) at PC=0x402768 ~25K hits/100 M
