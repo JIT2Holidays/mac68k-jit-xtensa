@@ -5,7 +5,28 @@
 > across the 68000 ISA, plus the trajectory-safety-aware shopping list
 > for further inline arms.
 
-## MacBench 4.0 — infeasible on Mac Plus 🚫
+## Performance evaluation — bench targets table
+
+The full bench rotation (post-M6.205) covering every workload the JIT
+is currently exercised against:
+
+| # | Bench target | lx7/cyc | real_helpers/100M | Status |
+|---|--------------|--------:|------------------:|--------|
+| 1 | **speedo-bench** (Speedometer 4.0 mid-run) | **1.179** | 1 993 | ✅ active |
+| 2 | **boot-cycle30m** (boot ROM Toolbox init) | **1.334** | 8 | ✅ active |
+| 3 | **thinkc8-folder-open** (Finder mid-state at THINK C 8 folder) | **1.389** | 0 | ✅ active |
+| 4 | **boot-cycle100m** (boot mid INIT/extension load) | **1.634** | 1 436 | ✅ active |
+| 5 | **boot 100M** (live Mac Plus boot, no snapshot) | **1.656** | 175 861 | ✅ active |
+| 6 | **boot-rom-init** (boot ROM memory test) | **1.662** | 232 115 | ✅ active |
+| 7 | **boot-system-load** (post-System-load ROM phase) | **2.280** | 1 146 790 | ✅ active |
+| — | **MacBench 4.0** (Mac compatibility benchmark) | — | — | **🚫 incompatible — see below** |
+| — | THINK C 5.0 IDE running | — | — | 🚧 blocked at folder-open → app-launch navigation |
+
+All seven active targets have ctest diff_jit_trace coverage (11K
+cycles for speedo, 100K for boot snaps after M6.201) — see
+`tests/CMakeLists.txt`.
+
+### MacBench 4.0 — infeasible on Mac Plus 🚫
 
 The "make MacBench 4.0 work end-to-end" directive runs into a hard
 compatibility wall. From the InfiniteHD6 disk's own About-MacBench text:
@@ -20,10 +41,32 @@ will refuse to start regardless of how it's launched. The InfiniteHD6
 also doesn't include older MacBench versions (3.0 / 2.0 / etc.) that
 would be compatible.
 
-**THINK C** says "Sorry, THINK C requires System version 4.2 or newer."
-— System 6 is past that, so THINK C *is* potentially feasible to
-launch. M6.67's app-launch wall still applies (folder-open works,
-app-launch on Mac-Plus Finder needs specific Finder-state setup).
+### THINK C IDE running — partial progress
+
+The `thinkc8-folder-open` snapshot captures the Finder steady-state
+with the THINK C 8 folder window open — this is already in the bench
+rotation as target #3 at 1.389 lx7/cyc.
+
+Extending to **THINK C 5.0 IDE actively running** (compile or edit
+state) was attempted this iteration. Key findings:
+
+1. **Window activation prerequisite.** Clicks inside the THINK C 8
+   folder's content area don't register until ANY one click first
+   "activates" the window. Empirically: a single click on the
+   THINK C Debugger 5.0 icon at (435, 305) at cycle ~1.5B activates
+   subsequent clicks within the window.
+2. **THINK C 5.0 icon at (335, 305).** Single-clicks select it
+   reliably (1.67% framebuffer diff = selection highlight).
+3. **Double-click and File→Open both produce a sub-window, not an
+   app launch.** Indicates the "THINK C 5.0" item inside THINK C 8
+   is actually a *folder* (or alias to a folder), not the IDE
+   executable itself. The real IDE is presumably one level deeper
+   in the folder hierarchy.
+4. **Deeper navigation needs more scripted clicks.** Each level of
+   Finder navigation adds ~300-400M cycles of OS work to the snap
+   recipe, and trajectory chaos compounds across levels. A full
+   THINK C running snap is feasible but needs an iteration budget
+   for the navigation sweep.
 
 **Infrastructure built during this directive attempt (kept):**
 * `scripts/framediff.sh` — byte-level BMP diff for click-effect detection
@@ -31,6 +74,8 @@ app-launch on Mac-Plus Finder needs specific Finder-state setup).
 * `MAC68K_TRACE_FROM/_TO` env vars in `port/host/main.c` — log Toolbox
   traps in a cycle window (caught the "no `_Launch` fires" pattern that
   confirmed Cmd-O on empty-space is a no-op)
+* `scripts/snap-thinkc8.sh` — the navigation recipe to capture the
+  current THINK C 8 folder-open snap; basis for future deeper variants
 
 These tools are reusable for any future Mac-Plus interactive scripting.
 
