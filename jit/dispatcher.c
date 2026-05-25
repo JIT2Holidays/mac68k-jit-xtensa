@@ -392,20 +392,26 @@ void m68k_dispatcher_shutdown(m68k_dispatcher *d) {
     {
         extern u32 m68k_helper_histo[65536];
         extern u32 m68k_helper_first_pc[65536];
+        /* M6.205 — widened from top-20 to top-40 to better surface
+         * slow-path-conversion candidates (M6.204 left 0x09D1 absent
+         * from top-20, but lower-fire candidates were also hidden).
+         * The full 65536-entry sweep is unchanged; this only affects
+         * the displayed cutoff. */
         typedef struct { u32 op; u32 cnt; } he_t;
-        he_t top[20] = {0};
+        enum { HISTO_TOP_N = 40 };
+        he_t top[HISTO_TOP_N] = {0};
         for (u32 op = 0; op < 65536; op++) {
             u32 c = m68k_helper_histo[op];
             if (c == 0) continue;
-            for (int i = 0; i < 20; i++) {
+            for (int i = 0; i < HISTO_TOP_N; i++) {
                 if (c > top[i].cnt) {
-                    for (int j = 19; j > i; j--) top[j] = top[j-1];
+                    for (int j = HISTO_TOP_N - 1; j > i; j--) top[j] = top[j-1];
                     top[i].op = op; top[i].cnt = c; break;
                 }
             }
         }
         fprintf(stderr, "[helper-histo] top opcodes (op  count  first-pc):\n");
-        for (int i = 0; i < 20 && top[i].cnt > 0; i++)
+        for (int i = 0; i < HISTO_TOP_N && top[i].cnt > 0; i++)
             fprintf(stderr, "  %04x  %8u  pc=%06x\n",
                     top[i].op, top[i].cnt, m68k_helper_first_pc[top[i].op]);
     }
