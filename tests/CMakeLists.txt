@@ -81,3 +81,18 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/roms/disks/boot-system-load.snap")
                      --max-cycles 11000
              WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endif()
+
+# M6.197 — mid-boot snapshot at cycle 100M (between boot-system-load=60M
+# and the thinkc8 Finder-steady-state=1.9B). Captures the INIT/extension
+# load phase. Hot opcodes include BCHG D4,(A1), MOVE.L (A0)+,(A0), and
+# MOVE.L (A0)+,(A4)+ — distinct mix from the other three snapshots.
+# Passes the full 11K --diff-jit-trace --no-irq window (150 blocks).
+# Regenerate via scripts/snap-cycle100m.sh.
+if(EXISTS "${CMAKE_SOURCE_DIR}/roms/disks/boot-cycle100m.snap")
+    add_test(NAME diff_jit_boot_cycle100m_lockstep
+             COMMAND $<TARGET_FILE:mac68k_host>
+                     --diff-jit-trace --no-irq
+                     --load-snapshot ${CMAKE_SOURCE_DIR}/roms/disks/boot-cycle100m.snap
+                     --max-cycles 11000
+             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+endif()
