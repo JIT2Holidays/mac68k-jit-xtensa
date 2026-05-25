@@ -5053,6 +5053,123 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + jmb2_pos + 2] = (u8)(jw_mb2 >> 16);
 
             inline_ops++; done = true;
+        } else if (top == 0x1 && ((w >> 6) & 7) == 5 && mode == 5) {
+            /* M6.228 — MOVE.B (d16,An),(d16,Am) mem-to-mem.
+             * boot-system-load's 0x1F6B (MOVE.B (d16,A3),(d16,A7))
+             * at PC=0x41716E fires 229,358 times via default
+             * m68k_step bridge (src EA in MMIO). Speedo's 0x1169 fires
+             * 12 times (below trajectory-shift threshold). Absent from
+             * the four boot snapshots and thinkc8 → category 4b safe
+             * per [[bridge-only-arms-trajectory-shift]].
+             *
+             * Two-register-arg custom helper:
+             *   jit_arg1 = src addr (a[src_an] + d16_src)
+             *   jit_arg2 = dst addr (a[dst_an] + d16_dst)
+             * The helper m68k_jit_move_b_addr_to_addr_mmio routes
+             * through mac_read8 + mac_write8 (RAM/MMIO transparent),
+             * skipping m68k_step's decode + cpu->instrs++.
+             *
+             * Manual bridge — emit_jit_fast_helper only handles
+             * a8+imm, but here both args are register-computed.
+             *
+             * Length 6 (op + 2 ext words), cycles 8 (m68k_step base
+             * 4 + MOVE handler 4 at core/m68k_interp.c:1120). */
+            int src_an_mb228 = w & 7;
+            int dst_an_mb228 = (w >> 9) & 7;
+            u16 src_ext_mb228 = mac_read16(cpu->mem, op_pc[i] + 2);
+            u16 dst_ext_mb228 = mac_read16(cpu->mem, op_pc[i] + 4);
+            i32 src_d16_mb228 = (i16)src_ext_mb228;
+            i32 dst_d16_mb228 = (i16)dst_ext_mb228;
+
+            emit_advance_flush(&e);
+            /* Compute src EA into a8. */
+            emit_read_g(&e, &rc, G_A(src_an_mb228), 8);
+            if (src_d16_mb228 >= -128 && src_d16_mb228 <= 127) {
+                if (src_d16_mb228 != 0) xt_addi(&e, 8, 8, src_d16_mb228);
+            } else {
+                emit_load_imm(&e, 11, 12, (u32)src_d16_mb228);
+                xt_add (&e, 8, 8, 11);
+            }
+            /* Compute dst EA into a15 (preserved across the bounds
+             * checks below — a9..a12 are used as scratch). */
+            emit_read_g(&e, &rc, G_A(dst_an_mb228), 15);
+            if (dst_d16_mb228 >= -128 && dst_d16_mb228 <= 127) {
+                if (dst_d16_mb228 != 0) xt_addi(&e, 15, 15, dst_d16_mb228);
+            } else {
+                emit_load_imm(&e, 11, 12, (u32)dst_d16_mb228);
+                xt_add (&e, 15, 15, 11);
+            }
+
+            /* Src bounds: RAM or ROM byte. a12 == 0 iff src RAM-or-ROM. */
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS_BYTE],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_l32r_at(&e, 9, lit_off[LITERAL_ROM_BOUNDS_BYTE],
+                         entry_off + e.len);
+            xt_and  (&e, 11, 8, 9);
+            emit_l32r_at(&e, 9, lit_off[LITERAL_ROM_BASE],
+                         entry_off + e.len);
+            xt_xor  (&e, 11, 11, 9);
+            xt_and  (&e, 12, 10, 11);
+
+            /* Dst bounds: RAM byte only. */
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS_BYTE],
+                         entry_off + e.len);
+            xt_and  (&e, 9, 15, 9);
+            xt_or   (&e, 12, 12, 9);
+
+            emit_cache_flush(&e, &rc);
+
+            /* --- Manual helper bridge (mirror M6.135 + 2-reg args) --- */
+            u32 mb228_bridge_size = 3u*5u;  /* s32i, s32i, mov, l32r, callx0 */
+            mb228_bridge_size += 3u;        /* emit_sr_reload */
+            if (g_sr_dirty) mb228_bridge_size += 3u;  /* emit_sr_flush */
+            xt_beqz (&e, 12, (i32)(6u + mb228_bridge_size));
+            sext_memo_invalidate();
+            if (g_sr_dirty) emit_sr_flush(&e);
+            xt_s32i(&e, 8,  R_CPU, OFF_JIT_ARG1);   /* src addr */
+            xt_s32i(&e, 15, R_CPU, OFF_JIT_ARG2);   /* dst addr */
+            xt_mov (&e, R_ARG, R_CPU);
+            emit_l32r_at(&e, R_HELP,
+                         lit_off[HELPER_JIT_MOVE_B_ADDR_TO_ADDR_MMIO],
+                         entry_off + e.len);
+            xt_callx0(&e, R_HELP);
+            g_block_emitted_callx0 = true;
+            emit_sr_reload(&e);
+            /* No cache_reload — helper doesn't touch D/A. */
+            u32 jmb228_pos = e.len;
+            xt_j    (&e, 4);
+
+            /* Fast path: src host ptr via a10 (RAM_BASE if a10==0 from
+             * the src-bounds calculation above, else ROM). */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_beqz (&e, 10, 6);
+            emit_l32r_at(&e, 9, lit_off[ADDR_ROM_HOST_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);
+            xt_l8ui (&e, 10, 9, 0);                  /* a10 = byte */
+
+            /* Dst host ptr: always RAM. */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 15);
+            xt_s8i  (&e, 10, 9, 0);
+
+            if (!flags_dead[i]) {
+                xt_slli (&e, 8, 10, 24);
+                emit_logic_flags(&e, 8);
+            }
+            emit_advance(&e, 6, 8);
+
+            u32 here_mb228 = e.len;
+            i32 jo_mb228 = (i32)(here_mb228 - jmb228_pos) - 4;
+            u32 jw_mb228 = ((u32)((u32)jo_mb228 & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jmb228_pos    ] = (u8)jw_mb228;
+            base[entry_off + jmb228_pos + 1] = (u8)(jw_mb228 >> 8);
+            base[entry_off + jmb228_pos + 2] = (u8)(jw_mb228 >> 16);
+
+            inline_ops++; done = true;
         } else if (top == 0x1 && ((w >> 6) & 7) == 0 && mode == 2) {
             /* M6.92 — MOVE.B (An),Dn — boot-warm 0x1211 (MOVE.B (A1),D1)
              * at 6 K helpers / 100 M cyc, plus 0x1411 (MOVE.B (A1),D2)

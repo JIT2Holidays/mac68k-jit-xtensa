@@ -815,6 +815,31 @@ void m68k_jit_bitop_dn_an_mmio(m68k_cpu *cpu) {
     }
 }
 
+/* M6.228 — MOVE.B (d16,An),(d16,Am) mem-to-mem MMIO fast helper.
+ * boot-system-load 0x1F6B (MOVE.B (d16,A3),(d16,A7)) fires 229,358 times
+ * via default m68k_step bridge — src EA resolves to MMIO each time.
+ *
+ * Both args are RUNTIME-computed in the inline arm (not compile-time
+ * imm), so the bridge stores both via xt_s32i instead of going through
+ * emit_jit_fast_helper (which only handles a8+imm).
+ *
+ * Args:
+ *   jit_arg1 = src addr (a[src_an] + d16_src)
+ *   jit_arg2 = dst addr (a[dst_an] + d16_dst)
+ *
+ * Reads 1 BE byte from src, writes to dst. MOVE-family CCR (N/Z from
+ * byte, V=C=0, X preserved). */
+void m68k_jit_move_b_addr_to_addr_mmio(m68k_cpu *cpu) {
+    u32 src = cpu->jit_arg1;
+    u32 dst = cpu->jit_arg2;
+    u8 v = mac_read8(cpu->mem, src);
+    mac_write8(cpu->mem, dst, v);
+    u8 ccr = m68k_get_ccr(cpu) & CCR_X;
+    if (v == 0)   ccr |= CCR_Z;
+    if (v & 0x80) ccr |= CCR_N;
+    m68k_set_ccr(cpu, ccr);
+}
+
 /* M6.225 — MOVE.L (xxx).W,(An) MMIO fast helper. boot-system-load
  * fires 0x22B8 (MOVE.L (xxx).W,(A1)) at PC=0xA001B6?? 114,679 times
  * where default helper bridges to m68k_step.

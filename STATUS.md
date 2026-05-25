@@ -93,6 +93,45 @@ produced a sub-window (1.36% diff). Then iterate inside.
 
 These tools are reusable for any future Mac-Plus interactive scripting.
 
+## M6.228 — MOVE.B (d16,An),(d16,Am) mem-to-mem MMIO fast helper — boot-system-load 1.955 → 1.854 lx7/cyc (−5.17 %), −229,358 helpers 🎯🎯
+
+The biggest single-arm win of this iteration. boot-system-load's
+0x1F6B (MOVE.B (d16,A3),(d16,A7)) at PC=0x41716E fires **229,358** times
+(half of all remaining helpers!) via the default m68k_step bridge.
+src EA in MMIO each time; dst is A7 (system stack, always RAM).
+
+Two technical firsts this round:
+* **Two-register-arg custom helper** — first arm using
+  m68k_jit_move_b_addr_to_addr_mmio with BOTH `jit_arg1` and
+  `jit_arg2` carrying RUNTIME-computed values (not compile-time imm).
+  emit_jit_fast_helper only supports a8+imm; here a manual bridge
+  stores both register values to OFF_JIT_ARG1/2.
+* **Mem-to-mem with full bounds check** — sibling of M6.91 MOVE.B
+  (d16,An),(Am) but extends dst from (Am) to (d16,Am). Src bounds:
+  RAM-or-ROM byte. Dst bounds: RAM byte only (writes can't go to ROM).
+
+Bench impact:
+| Bench | M6.227 baseline | M6.228 | Δ |
+|---|---:|---:|---:|
+| boot-system-load | 458,716 / 1.955 | 229,358 / 1.854 | **−229,358 / −5.17 %** |
+| speedo | 1293 / 1.179 | 1281 / 1.179 | −12 (12 fires of 0x1169 absorbed) |
+| boot-rom-init | 232,066 / 1.662 | 232,275 / 1.662 | +209 (M6.66 RAM-detect noise) |
+| all others | unchanged | unchanged | 0 |
+
+boot-rom-init's +209 is entirely in the M6.66 phantom region (PCs at
+0x12C03C01 / 0x12C01A05 / 0x12C03E01 — the RAM-detection probe phase),
+documented as ±3% trajectory tolerance per
+`memory/m6.66-trajectory-traps.md`. lx7/cyc rounded unchanged at 1.662.
+
+ctest 11/11; diff.sh 321 blocks match.
+
+**Cumulative M6.225-M6.228 boot-system-load delta:** 802,753 → 229,358
+helpers (**−71.4 %**), 2.140 → 1.854 lx7/cyc (**−13.4 %**). Four arms
+landed in one /loop iteration. Remaining major hotspot: 0x2F72
+(MOVE.L (d8,A2,Xn),(d16,A7), 229K) — the sibling pattern with .L size
+and indexed src; deferred for next iteration since the brief-ext +
+d16 EA decode is more involved than M6.228's two-d16.
+
 ## M6.227 — JMP (d8,An,Xn) inline — boot-system-load 2.022 → 1.955 lx7/cyc (−3.31 %), −114,679 helpers 🎯
 
 Third boot-system-load hotspot landed: 0x4EF0 (`JMP (d8,A0,Xn)`) at
