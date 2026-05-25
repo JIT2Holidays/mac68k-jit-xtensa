@@ -5147,6 +5147,77 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + jmAd_pos + 2] = (u8)(jw_mAd >> 16);
 
             inline_ops++; done = true;
+        } else if (top == 0x2 && ((w >> 6) & 7) == 0 && mode == 6) {
+            /* M6.215 — MOVE.L (d8,An,Xn),Dn. Speedo bench's 0x2830
+             * (MOVE.L (d8,A0,Xn),D4) at PC=0x40926C fires 26 times/100M.
+             * Absent from boot 100M / cycle100m / rom-init / cycle30m
+             * top-40 helper histos.
+             *
+             * Sibling of M6.186 MOVEA.L (d8,An,Xn),Am — same (d8,An,Xn)
+             * EA decode, but writes the .L value to Dn (not Am) and
+             * sets logic flags. Length 4 (op + brief ext), cycles 8.
+             *
+             * Bridge's touched_mask = (1u << G_D(dn)). */
+            int dn      = (w >> 9) & 7;
+            int src_an  = w & 7;
+            u16 ext     = mac_read16(cpu->mem, op_pc[i] + 2);
+            int  ireg    = (ext >> 12) & 7;
+            bool is_an   = (ext & 0x8000) != 0;
+            bool is_long = (ext & 0x0800) != 0;
+            i32  d8      = (i8)(ext & 0xFF);
+
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(src_an), 8);
+            emit_read_g(&e, &rc, is_an ? G_A(ireg) : G_D(ireg), 9);
+            if (!is_long) {
+                xt_slli(&e, 9, 9, 16);
+                xt_srai(&e, 9, 9, 16);
+            }
+            xt_add(&e, 8, 8, 9);
+            if (d8 != 0) xt_addi(&e, 8, 8, d8);
+
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_mxL = 4, op_cyc_mxL = 8;
+            g_helper_touched_mask = (u16)(1u << G_D(dn));
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_mxL, op_cyc_mxL)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_mxL, op_cyc_mxL);
+            g_helper_touched_mask = 0xFFFFu;
+            u32 jmxL_pos = e.len;
+            xt_j    (&e, 4);
+
+            /* Fast path: 4 BE byte loads → a10 (.L). Write to Dn, set flags. */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);
+            xt_l8ui (&e, 11, 9, 0);
+            xt_l8ui (&e, 12, 9, 1);
+            xt_slli (&e, 10, 11, 24);
+            xt_slli (&e, 12, 12, 16);
+            xt_or   (&e, 10, 10, 12);
+            xt_l8ui (&e, 11, 9, 2);
+            xt_l8ui (&e, 12, 9, 3);
+            xt_slli (&e, 11, 11, 8);
+            xt_or   (&e, 10, 10, 11);
+            xt_or   (&e, 10, 10, 12);                  /* a10 = .L */
+            emit_write_g(&e, &rc, G_D(dn), 10);
+            if (!flags_dead[i]) {
+                emit_logic_flags(&e, 10);
+            }
+            sext_memo_invalidate();
+            emit_advance(&e, op_pc_mxL, op_cyc_mxL);
+
+            u32 here_mxL = e.len;
+            i32 jo_mxL = (i32)(here_mxL - jmxL_pos) - 4;
+            u32 jw_mxL = ((u32)((u32)jo_mxL & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jmxL_pos    ] = (u8)jw_mxL;
+            base[entry_off + jmxL_pos + 1] = (u8)(jw_mxL >> 8);
+            base[entry_off + jmxL_pos + 2] = (u8)(jw_mxL >> 16);
+
+            inline_ops++; done = true;
         } else if (top == 0x2 && ((w >> 6) & 7) == 1 && mode == 6) {
             /* M6.186 — MOVEA.L (d8,An,Xn),Am. thinkc8-folder-open
              * bench's 0x2472 (MOVEA.L (d8,A2,Xn),A2) at PC=0x401F94
