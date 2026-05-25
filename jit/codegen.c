@@ -5365,6 +5365,76 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + jcmpaL_pos + 2] = (u8)(cwL >> 16);
 
             inline_ops++; done = true;
+        } else if (top == 0xC && szf == 1 && ((w >> 8) & 1) == 0
+                   && mode == 7 && (w & 7) == 0) {
+            /* M6.183 — AND.W (xxx).W,Dn. thinkc8-folder-open bench's
+             * 0xC078 at PC=0x402782 ~25K hits/100 M. Absent from boot
+             * 100 M and speedo. Sibling of M6.108 MOVE.W (xxx).W with
+             * the merge-into-Dn-low-16 pattern; AND with Dn[15:0] and
+             * preserve Dn[31:16]; logic flags from .W result.
+             *
+             * Length 4, cycles 8 (base 4 + handler 4). */
+            int dn = (w >> 9) & 7;
+            u16 ext = mac_read16(cpu->mem, op_pc[i] + 2);
+            u32 abs_addr = (u32)(i32)(i16)ext;
+            abs_addr &= 0xFFFFFFu;
+
+            u32 ram_size_aw = cpu->mem ? cpu->mem->ram_size : 0;
+            bool overlay_aw = cpu->mem ? cpu->mem->overlay : true;
+            bool ram_pow2_aw = ram_size_aw > 0 && (ram_size_aw & (ram_size_aw - 1)) == 0;
+            bool addr_in_ram_aw = !overlay_aw && ram_pow2_aw
+                                  && abs_addr < ram_size_aw
+                                  && (abs_addr & 1) == 0;
+
+            if (addr_in_ram_aw) {
+                emit_advance_flush(&e);
+                emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                             entry_off + e.len);
+                if ((i32)abs_addr >= -128 && (i32)abs_addr <= 127) {
+                    xt_addi(&e, 9, 9, (i32)abs_addr);
+                } else if ((i32)abs_addr >= -2048 && (i32)abs_addr <= 2047) {
+                    xt_movi(&e, 10, (i32)abs_addr);
+                    xt_add (&e, 9, 9, 10);
+                } else {
+                    emit_load_imm(&e, 10, 11, abs_addr);
+                    xt_add (&e, 9, 9, 10);
+                }
+                xt_l8ui (&e, 11, 9, 0);
+                xt_l8ui (&e, 12, 9, 1);
+                xt_slli (&e, 8, 11, 8);
+                xt_or   (&e, 8, 8, 12);              /* a8 = .W src (zero-ext) */
+
+                /* AND Dn[15:0] with .W src, preserve Dn[31:16]. Use cache-
+                 * direct merge pattern (M6.109 sibling). */
+                int dn_xt = cache_lookup(&rc, G_D(dn));
+                u8 dn_reg = (dn_xt >= 0) ? (u8)dn_xt : 11;
+                if (dn_xt < 0) emit_read_g(&e, &rc, G_D(dn), 11);
+
+                /* a10 = Dn[15:0] AND a8 (= .W result, low 16 bits). */
+                xt_extui(&e, 10, dn_reg, 0, 15);    /* a10 = Dn[15:0] */
+                xt_and  (&e, 10, 10, 8);
+
+                /* dn_reg = (Dn & ~0xFFFF) | a10. */
+                xt_srli(&e, dn_reg, dn_reg, 16);
+                xt_slli(&e, dn_reg, dn_reg, 16);
+                xt_or  (&e, dn_reg, dn_reg, 10);
+
+                if (dn_xt >= 0) {
+                    for (int s = 0; s < rc.active; s++)
+                        if (rc.guest[s] == (u8)G_D(dn)) { rc.dirty |= (u16)(1u << s); break; }
+                } else {
+                    emit_write_g(&e, &rc, G_D(dn), 11);
+                }
+                if (!flags_dead[i]) {
+                    xt_slli(&e, 9, 10, 16);          /* .W sign at bit 31 */
+                    emit_logic_flags(&e, 9);
+                }
+                emit_advance(&e, 4, 8);
+                inline_ops++; done = true;
+            } else {
+                /* MMIO src — touches only Dn. */
+                g_helper_touched_mask = (u16)(1u << G_D(dn));
+            }
         } else if (top == 0xB && szf == 2 && ((w >> 8) & 1) == 0
                    && mode == 7 && (w & 7) == 0) {
             /* M6.180 — CMP.L (xxx).W,Dn. thinkc8-folder-open bench's
