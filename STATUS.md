@@ -88,6 +88,69 @@ Combined Δ since M6.153:
 | Boot 100M helpers | 178 459 | **177 861** | -598 |
 | Boot 100M jit_cost | 166 511 K | **165 800 K** | **-711 K LX7** |
 
+## M6.169-M6.193 — thinkc8 hotspot inline series, ending at helpers=0 🎯🎯🎯
+
+**25 consecutive inline arms** turned thinkc8 from 2.414 lx7/cyc with
+2.093 M helpers/100M cycles into **1.401 lx7/cyc with ZERO helpers**.
+For perspective, the thinkc8 Finder steady-state is now FASTER per Mac
+cycle than ROM boot (1.401 vs 1.657 lx7/cyc).
+
+Each arm was verified absent from boot 100 M and speedo before
+landing (the M6.142 trajectory-safety predicate), so all three legacy
+benches stayed unchanged across the entire 25-arm series.
+
+| Workload | M6.168 baseline | M6.193 | Δ |
+|----------|----------------:|-------:|--:|
+| **thinkc8-folder-open** | **2.414** | **1.401** | **−42.0 %** 🎯 |
+| thinkc8 helpers/100M | 2 093 M | **0** | **−100 %** |
+| Boot 100M           | 1.657      | 1.657      | 0.000 ✓ |
+| Bench 100M (speedo) | 1.179      | 1.179      | 0.000 ✓ |
+| Boot 5M det         | 1.952      | 1.952      | 0.000 ✓ |
+
+The arm series (each is one commit):
+
+| Arms | Opcode shape | Notes |
+|------|--------------|-------|
+| M6.169 | `4A28` TST.B (d16,An) | first arm — 638 K hits, custom MMIO helper |
+| M6.170 | `B1ED` CMPA.L (d16,An),An | 638 K hits, default helper |
+| M6.171 | `302D 322D` MOVE.W (d16,An),Dn | stack-frame .W read |
+| M6.172 | `0C50` CMPI.W #imm,(An) | inner compare |
+| M6.173 | `4E58` UNLK An | subroutine teardown |
+| M6.174 | `4E50` LINK An,#d16 | subroutine setup (4-cyc drift caught by diff.sh) |
+| M6.175 | `2178` MOVE.L (xxx).W,(d16,An) | Toolbox dispatcher |
+| M6.176 | `200D` MOVE.L Am,Dn | reg-to-reg .L |
+| M6.177 | `4A6D` TST.W (d16,An) | .W flag-only |
+| M6.178 | `B0AD` CMP.L (d16,An),Dn | 32-bit CMP |
+| M6.179 | `4A78` TST.W (xxx).W | abs.W flag |
+| M6.180 | `B0B8` CMP.L (xxx).W,Dn | abs.W CMP |
+| M6.181 | `4250` CLR.W (An) | flag-only mem zero |
+| M6.182 | `42A8` CLR.L (d16,An) | .L mem zero |
+| M6.183 | `C078` AND.W (xxx).W,Dn | abs.W AND (caught .W vs .L decode bug) |
+| M6.184 | `486E` PEA (d16,An) | push EA on stack |
+| M6.185 | `2F38` MOVE.L (xxx).W,-(An) | predec push |
+| M6.186 | `2472` MOVEA.L (d8,An,Xn),Am | **first (d8,An,Xn) index-mode arm** |
+| M6.187 | `0C70` CMPI.W #imm,(d8,An,Xn) | second index-mode arm |
+| M6.188 | `1141` MOVE.B Dn,(d16,An) | byte stack-frame write |
+| M6.189 | `1178` MOVE.B (xxx).W,(d16,An) | abs.W → frame byte |
+| M6.190 | `A0xx` line-A trap | sibling of M6.137 F-line trap |
+| M6.191 | `007C` ORI.W #imm,SR | inline only when imm S-bit is 0 |
+| M6.192 | `40E7` MOVE SR,-(An) | SR push |
+| M6.193 | `46DF` MOVE (An)+,SR | SR pop (custom helper, calls m68k_sync_sp) |
+
+The series methodology (replicates cleanly per [[thinkc8-helper-hotspots]]):
+1. Identify next opcode in helper-histo (~25 K hits or more).
+2. Verify ABSENT from boot 100 M (lookup in `--rom roms/MacPlus.ROM
+   --disk roms/disks/System6.dsk --max-cycles 100000000` histo).
+3. Find sibling arm (similar EA shape + flag pattern). Adapt body.
+4. Triple-lockstep: ctest, scripts/diff.sh.
+5. Re-measure all four benches; commit + push.
+
+Each arm took 30-60 minutes of context including verification.
+
+The remaining productive frontier on thinkc8 is per-inline-op LX7
+cost: per-flag CCR liveness, cache widening, fusion of common
+pairs (LINK+MOVEM, CMPI+Bcc). These are the next-level wins.
+
 ## M6.169-M6.180 — thinkc8 hotspot inline series 🎯
 
 Twelve consecutive inline arms targeting the M6.168 thinkc8-folder-open
