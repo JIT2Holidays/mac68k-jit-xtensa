@@ -19,7 +19,7 @@ is currently exercised against:
 | 5 | **boot 100M** (live Mac Plus boot, no snapshot) | **1.656** | 175 726 | ✅ active |
 | 6 | **boot-rom-init** (boot ROM memory test) | **1.662** | 232 106 | ✅ active |
 | 7 | **boot-system-load** (post-System-load ROM phase) | **1.786** | **0** | ✅ active |
-| 8 | **thinkc-bullseye** (THINK C 5.0 IDE running Bullseye demo) | **2.161** | 1 103 341 | ✅ active 🆕 |
+| 8 | **thinkc-bullseye** (THINK C 5.0 IDE running Bullseye demo) | **2.155** | 984 959 | ✅ active 🆕 |
 | — | **MacBench 4.0** (Mac compatibility benchmark) | — | — | **🚫 incompatible — see below** |
 
 All seven active targets have ctest diff_jit_trace coverage (11K
@@ -62,91 +62,114 @@ genuinely running Mac code.
 
 ### THINK C IDE — full end-to-end DONE 🎯
 
-User directive completed: THINK C IDE now runs the built-in Bullseye
-demo with a captured snapshot in the bench rotation (target #8 at
-2.222 lx7/cyc, 2.1M real_helpers/100M — the highest-helper-rate target
-in the rotation, exercising a rich opcode mix: variable LSR.L (210K),
-MOVE.W (d8,An,Xn),Dn (170K combined), MOVE.B (An)+,Dn (111K), JSR
-through indirection (49K), and 30+ more opcodes at >5K fires each).
+User directive completed at M6.235: the THINK C 5.0 IDE now runs its
+built-in Bullseye demo with a captured snapshot in the bench rotation
+(target #8). See the M6.235 milestone log below for the navigation
+recipe and bench-target details. Reusable Mac-Plus scripting
+infrastructure built along the way:
 
-Navigation recipe (codified in `scripts/snap-thinkc-bullseye.sh`):
+* `scripts/framediff.sh` — byte-level BMP diff for click-effect detection
+* `scripts/bmp2png_grid.py` — pure-stdlib BMP→PNG with red 50-px coord grid
+* `MAC68K_TRACE_FROM/_TO` env vars in `port/host/main.c` — log Toolbox
+  traps in a cycle window
+* `scripts/snap-thinkc8.sh` / `scripts/snap-thinkc-bullseye.sh` — the
+  recorded Finder + IDE navigation flows
+
+## M6.241-M6.243 — thinkc-bullseye MMIO sweep continuation 🎯
+
+Three more conversions in the thinkc-bullseye MMIO fast-helper sweep
+(continuing M6.236-M6.240d). Cumulative across all 12 conversions
+(M6.236-M6.243): bullseye real_helpers **2 096 071 → 984 959 (−53.0 %)**,
+real_lx7/cyc **3.206 → 2.446 (−23.7 %)**, lx7/cyc **2.222 → 2.155 (−3.0 %)**.
+
+| MS | Opcode | Helper added | bullseye Δ real_helpers |
+|----|--------|--------------|------------------------:|
+| M6.241 | CMP.W (d16,An),Dn MMIO | `m68k_jit_cmp_w_addr_dn_mmio` | −53 673 (−4.9 %) |
+| M6.242 | MOVE.W (d16,An),(Am)+ MMIO | `m68k_jit_move_w_addr_to_postinc_mmio` | −27 108 (−2.6 %) |
+| M6.243 | MOVEA.W (d16,An),Am MMIO | `m68k_jit_movea_w_addr_to_am_mmio` (CCR-mask=0) | −37 601 (−3.7 %) |
+
+M6.241 also computes `set_flags_cmp()` for sz=2 directly in the helper
+(reads X, writes N/Z/V/C) so the fusion-with-Bcc path remains valid
+through the slow path. M6.242 was a retry of the abandoned M6.237
+attempt — M6.237's inline-with-RAM-fast-path added compile bytes
+without runtime benefit (bullseye always hits MMIO at that PC); M6.242
+uses a custom MMIO helper directly. M6.243 sign-extends the .W read to
+32 bits before writing to An (MOVEA semantics) and is paired with
+M6.240d's .L sibling.
+
+ctest 11/11; diff.sh 321 blocks match (all three). All other benches
+unchanged.
+
+## M6.236-M6.240d — thinkc-bullseye MMIO fast-helper conversion sweep 🎯🎯
+
+Following M6.235's addition of the **thinkc-bullseye** bench target
+(2 096 071 real_helpers/100M — the highest in the rotation), this
+session converted 9 m68k_step-bridge slow paths to custom MMIO fast
+helpers, applying the established [[mmio-fast-helper-pattern]].
+
+| MS | Opcode shape | Helper | bullseye Δ real_helpers |
+|----|--------------|--------|------------------------:|
+| M6.236 | MOVE.L (d16,An),(d16,Am) mem-to-mem inline | inline-only | −47 K (−2.2 %) |
+| M6.238 | JSR (An) MMIO slow path | reuse BSR.S helper from M6.132 | −37 K |
+| M6.238b | JSR (d16,PC) MMIO slow path | reuse BSR.W helper | −35 K (−1.7 %) |
+| M6.239 | MOVE.W (d16,An),Dn MMIO | `m68k_jit_move_w_addr_to_dn_mmio` | −181 K (−9.2 %) |
+| M6.239b | MOVE.W (d8,An,Xn),Dn MMIO | shares M6.239 helper | −223 K (−12.4 %) |
+| M6.240 | MOVE.B (An)+,Dn MMIO | `m68k_jit_move_b_postinc_to_dn_mmio` | −132 K (−8.4 %) |
+| M6.240b | MOVE.L (d8,An,Xn),Dn MMIO | reuse M6.144 helper | −98 K (−6.8 %) |
+| M6.240c | MOVE.L (d16,An),Dn MMIO | reuse M6.144 helper | −79 K (−5.9 %) |
+| M6.240d | MOVEA.L (d16,An),Am MMIO | `m68k_jit_movea_l_addr_to_am_mmio` (CCR-mask=0) | −161 K (−12.7 %) |
+
+Cumulative for the 9-conversion subset: bullseye real_helpers
+**2 096 071 → 1 103 341 (−47.4 %)**, real_lx7/cyc **3.206 → 2.529
+(−21.1 %)**, lx7/cyc **2.222 → 2.161 (−2.7 %)**.
+
+Pattern: introduce a two-register-arg helper bridge when the helper
+needs both `jit_arg1` (src EA) and `jit_arg2` (dst EA or An/Dn pack),
+since `emit_jit_fast_helper`'s a8+imm signature only handles one
+runtime-variable argument. The slow path's m68k_step bridge is
+replaced with a manual `xt_s32i` to `OFF_JIT_ARG1`/`OFF_JIT_ARG2` plus
+a `CALLX0` to the new helper. Helpers compute CCR inline where
+applicable (M6.239 / M6.241 do MOVE / CMP-family flags) and skip
+`m68k_step`'s decode + `cpu->instrs++`. MOVEA helpers (M6.240d /
+M6.243) set per-helper `sr_mask = 0u` since MOVEA never touches CCR,
+shrinking the bridge by an `emit_sr_flush` + `emit_sr_reload` pair
+(per-helper SR mask infrastructure from M6.158).
+
+All other benches unchanged across the 9 conversions; ctest 11/11;
+diff.sh 321 blocks match.
+
+## M6.235 — Add thinkc-bullseye bench target (THINK C 5.0 + Bullseye demo)
+
+New bench target #8 added to the rotation: the THINK C 5.0 IDE running
+its built-in Bullseye demo. At landing: 2.222 lx7/cyc / 2 096 071
+real_helpers/100M — the highest-helper-rate target in the rotation,
+exercising a rich opcode mix (variable LSR.L 210K, MOVE.W (d8,An,Xn),Dn
+170K combined, MOVE.B (An)+,Dn 111K, JSR through indirection 49K, plus
+30+ other opcodes at >5K fires each).
+
+The MacBench 4.0 directive was concluded **infeasible** during this
+work — MacBench 4.0 requires 68030+ / System 7.5+ / 12 MB RAM; the
+Mac Plus emulation is 68000 / System 6.0.8 / max 4 MB RAM. Confirmed
+empirically: the OS rejects the launch with "9,500K needed, 3,621K
+available" before MacBench's own CPU/System version checks fire.
+
+Navigation recipe codified in `scripts/snap-thinkc-bullseye.sh`:
 1. Boot Mac Plus from System6.dsk + InfiniteHD6.dsk.
 2. Finder navigation: Infinite HD → Developer → scroll → THINK C 8.
-3. View menu → by Name (list view, much more reliable than icon view
-   for coordinate-based clicking).
+3. View menu → by Name (list view, much more reliable than icon view).
 4. Double-click THINK C 5.0 to launch the IDE.
 5. THINK C's Open Project dialog opens. Drill THINK Demos → Bullseye
    Folder → bullseye π.
 6. Cmd-R to compile + link + run the demo.
 7. Snapshot at cycle 9.5B (post-run, bullseye target drawn).
 
-The accumulated learnings (from previous attempts that stalled at
-folder-open → app-launch):
+Learnings (see `memory/thinkc-bullseye-bench.md`):
 * **List view is essential** for reliable coord-based navigation —
-  icon view's row positions shift based on file count and aren't
-  scriptable.
-* **File dialog list-item Y coords** are 105px for row 1, growing
-  by ~15-17px per row. The visible "highlighted row" pulls the
-  cursor; double-click the SAME row that's already highlighted to
-  enter a folder.
-* **Cmd-R** triggers Project → Run, which compiles+links+runs in
-  one shot — much simpler than navigating the Project menu.
-* The captured snapshot, like thinkc8-folder-open, is NOT diff_jit_
-  trace-deterministic past a few hundred cycles (the demo polls VIA
-  for animation timing).
-
-### THINK C IDE running — partial progress (trap-trace confirmed) — superseded by #8
-
-(Historical entry — preserved for reference.)
-The `thinkc8-folder-open` snapshot captures the Finder steady-state
-with the THINK C 8 folder window open — this is already in the bench
-rotation as target #3 at 1.389 lx7/cyc.
-
-Extending to **THINK C IDE actively running** (compile or edit
-state) is in progress. Key findings (trap-trace verified):
-
-1. **Window activation prerequisite.** Clicks inside the THINK C 8
-   folder's content area don't register until ANY one click first
-   "activates" the window. Empirically: a single click on the
-   THINK C Debugger 5.0 icon at (435, 305) at cycle ~1.5B activates
-   subsequent clicks within the window.
-2. **The icon at (335, 305) is named "THINK C" (not "THINK C 5.0")
-   and IS A FOLDER**, not the IDE executable. Confirmed via Cmd-I
-   Get Info — dialog reports `Kind: folder, Size: 5,003,396 bytes
-   used, 6,120K on disk for 263 files`. The IDE is inside this
-   folder (one level deeper).
-3. **Cmd-key shortcuts trigger `_MenuSelect` (0xA938)**, not
-   `_MenuKey` (0xA93D) as expected. Verified working: Cmd-W (close
-   window, 12.15% diff), Cmd-N (new folder, 1.61% diff + visible
-   new folder), Cmd-I (Get Info dialog, 8.84% diff). All worked
-   with 5M-cycle inter-event spacing (Cmd-down, +5M key-down, +5M
-   key-up, +5M Cmd-up).
-4. **Cmd-O does NOT visibly open the THINK C folder** even when it
-   IS selected and active. Selection is confirmed valid (Cmd-I
-   works on same state). Hypothesis: Cmd-O is opening the folder
-   into a new Finder window that's drawn off-screen or behind
-   existing windows. Earlier File→Open via menu drag showed a
-   1.36% diff that might have been a new sub-window in middle of
-   screen. Future iteration: scroll/move sub-window to verify.
-5. **Trap-trace shows _GetNextEvent alternating between mouse-only
-   (mask=2) and all-events (mask=0xFFFFFFFF) polling.** Key events
-   delivered after several poll cycles — typical Mac OS event-loop
-   pattern. No anomaly here.
-
-Future iteration: drag/move the THINK C folder sub-window to a
-visible area after Cmd-O, or use the existing File→Open path that
-produced a sub-window (1.36% diff). Then iterate inside.
-
-**Infrastructure built during this directive attempt (kept):**
-* `scripts/framediff.sh` — byte-level BMP diff for click-effect detection
-* `scripts/bmp2png_grid.py` — pure-stdlib BMP→PNG with red 50-px coord grid
-* `MAC68K_TRACE_FROM/_TO` env vars in `port/host/main.c` — log Toolbox
-  traps in a cycle window (caught the "no `_Launch` fires" pattern that
-  confirmed Cmd-O on empty-space is a no-op)
-* `scripts/snap-thinkc8.sh` — the navigation recipe to capture the
-  current THINK C 8 folder-open snap; basis for future deeper variants
-
-These tools are reusable for any future Mac-Plus interactive scripting.
+  icon view's row positions shift with file count.
+* **File dialog list-item Y coords**: 105px row 1, +15-17px per row.
+* **Cmd-R** triggers Project → Run (compile + link + run in one shot).
+* The captured snapshot is NOT diff_jit_trace-deterministic past a
+  few hundred cycles (the demo polls VIA for animation timing).
 
 ## M6.232 — Fix ROXR.L / ROXL.L #imm,Dn silent 16-bit truncation 🎯 (M6.66 root cause, partial)
 

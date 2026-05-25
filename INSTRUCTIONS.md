@@ -1,14 +1,17 @@
 # 68000 Instruction Coverage in the JIT
 
-Reflects coverage through **M6.204**. Bulk-tabular state was captured
+Reflects coverage through **M6.243**. Bulk-tabular state was captured
 at M6.161; subsequent inline series (M6.169-M6.193 thinkc8 hotspots,
-M6.196 fusion, M6.198-M6.204 boot tuning) are summarized in the
-"M6.169+ delta" section at the bottom rather than re-flowed through
-every row. This document inventories every 68000 instruction class
-the JIT recognises in `jit/codegen.c` and the translation strategy
-used. The Mac Plus is plain MC68000 — no 68010/020+ extensions
-(BFEXTU, MOVES, divs.l etc.) — so the table below is the complete
-ISA target.
+M6.196 fusion, M6.198-M6.204 boot tuning, M6.206-M6.220 boot/bench
+broadening, M6.221-M6.229 boot-system-load → helpers=0, M6.230-M6.231
+static-bit-op modes 2/5, M6.232 ROXR/L .L correctness fix, M6.235
+thinkc-bullseye bench target, M6.236-M6.243 MMIO fast-helper sweep)
+are summarized in the "M6.169+ delta" section at the bottom rather
+than re-flowed through every row. This document inventories every
+68000 instruction class the JIT recognises in `jit/codegen.c` and the
+translation strategy used. The Mac Plus is plain MC68000 — no
+68010/020+ extensions (BFEXTU, MOVES, divs.l etc.) — so the table
+below is the complete ISA target.
 
 > If you're hunting for a hot helper to inline, **search this file first**:
 > the "m68k_step" rows are the remaining opportunities. The "inline-pure"
@@ -28,6 +31,10 @@ ISA target.
 
 ## Coverage at a glance
 
+Counts captured at M6.161; post-M6.161 inline/helper additions are
+tracked in the "M6.169+ delta" section at the bottom rather than
+re-flowed through every cell.
+
 | Group | Inline pure | Inline + helper | Fusion / Analysis | m68k_step |
 |-------|:-----------:|:---------------:|:-----------------:|:---------:|
 | Data movement | 16 | 22 | 4 | 1 |
@@ -38,11 +45,19 @@ ISA target.
 | Compare | 5 | 4 | 0 | 4 |
 | Control flow | 11 | 3 | 1 | 4 |
 | System | 1 | 2 | 0 | 10 |
-| **Totals** | **76** | **46** | **5** | **36** |
+| **Totals** (M6.161) | **76** | **46** | **5** | **36** |
+
+Post-M6.243 the inline/helper columns are ~+30 from M6.206-M6.243
+additions (see delta section); about a third of those are slow-path
+conversions that move a row's style from 🪝 to ⚡ rather than adding
+a new row.
 
 The bare numbers undersell the inline coverage on hot paths. The ~21K-fire
-opcodes that drive bench's `lx7/cyc` metric are all inline; the remaining
-m68k_step rows are mostly rare-fire system / exception ops.
+opcodes that drive bench's `lx7/cyc` metric are all inline. The
+**thinkc8-folder-open** and **boot-system-load** snapshots reached
+**helpers=0** at M6.193 and M6.229 respectively; the remaining
+m68k_step rows are mostly rare-fire system / exception ops or the
+dynamic-Dm shift family.
 
 ---
 
@@ -283,23 +298,26 @@ D5,D0` 190 bench fires), multi-step fusion, and the structural items
 
 | Candidate | Notes |
 |-----------|-------|
-| `CMPI #imm,Dn + Bcc.S` | Sibling of M6.95 TST.L+Bcc fusion |
+| ~~`CMPI #imm,Dn + Bcc.S`~~ | ✅ M6.195 (CMPI.W #imm,(An)+Bcc), M6.196 (CMP.L (d16,An),Dn+Bcc) |
 | `EXT.L + Bcc.S` | Sets N from bit 31 — same fusion shape |
 
 ### Slow-path bridge conversion (safe — existing arm, swap helper)
 
+Mostly drained by the M6.225-M6.229 and M6.236-M6.243 sweeps. The
+boot-system-load snapshot is at helpers=0; the remaining target for
+this category is **thinkc-bullseye** (985K real_helpers/100M).
+
 | Candidate | Notes |
 |-----------|-------|
-| `MOVE.W (An)+,Dn` MMIO | Existing arm has m68k_step bridge; converting to fast helper is M6.144-shape |
+| Variable-Dm shift count (LSR.L Dm,Dn, etc.) | bullseye's largest single helper at ~210K fires; not yet inline (encoder needs runtime-variable sa) |
+| MOVE.B (An)+,(Am)+ MMIO | bullseye fires similar postinc-mem patterns |
 | `CLR.L (An)+` MMIO | M6.130 has the fast path; bridge can be tightened |
 
 ### Risky (bridge-structure) — not recommended
 
 | Candidate | Why it's risky |
 |-----------|----------------|
-| `OR.W Dn,(An)` | M6.145 attempt regressed boot 100M +2.2% (strictly-absent pattern still shifted trajectory) |
-| `TST.B (An)` | M6.148 attempt regressed boot 100M +32% (new arm with bridge structure) |
-| Any **brand-new arm with bounds-check + slow-path bridge** | See `memory/bridge-only-arms-trajectory-shift.md` |
+| Any **brand-new arm with bounds-check + slow-path bridge** in boot's top-N | See `memory/bridge-only-arms-trajectory-shift.md` — M6.145 OR.W +2.2 %, M6.148 TST.B +32 % regressions both reverted on this rule |
 
 ### Structural items (the big ones)
 
@@ -327,11 +345,14 @@ not just a static report.
 
 ## M6.169+ delta (summary)
 
-Twenty-five thinkc8 inline arms (M6.169-M6.193) plus seven boot-tuning
-arms (M6.196, M6.198-M6.200, M6.202, M6.204) and tooling (M6.197, M6.201,
-M6.203, M6.205) landed since the M6.161 bulk-table state. Rather than
-re-flow every row, this section catalogs which opcode rows above are
-now updated.
+Since the M6.161 bulk-table state: 25 thinkc8 inline arms
+(M6.169-M6.193), 7 boot-tuning arms (M6.196, M6.198-M6.200, M6.202,
+M6.204), 1 CMPA.L sibling (M6.206), 13 boot/bench broadening arms
+(M6.208-M6.220), 9 boot-system-load → helpers=0 arms (M6.221-M6.229),
+2 static-bit-op mode 2/5 extensions (M6.230-M6.231), 1 ROXR/L .L
+correctness fix (M6.232), and 13 thinkc-bullseye MMIO slow-path
+conversions (M6.236-M6.243). Plus tooling (M6.197, M6.201, M6.203,
+M6.205, M6.235).
 
 ### Thinkc8 series (M6.169-M6.193)
 
@@ -381,7 +402,85 @@ unchanged.
 | M6.202 | BTST/BCHG/BCLR/BSET Dn,(An) variable-shift mask | boot 100M helpers −893 |
 | M6.204 | M6.202 MMIO slow-path → m68k_jit_bitop_dn_an_mmio | boot 100M real_helpers −831 |
 
-### Tooling (M6.197 / M6.201 / M6.203 / M6.205)
+### Boot / bench broadening series (M6.206-M6.220)
+
+Inline arms targeting bench helpers absent from boot 100M, the
+trajectory-safe category per [[bridge-only-arms-trajectory-shift]].
+
+| MS | Opcode shape | Replaces "🐢" row |
+|----|--------------|-------------------|
+| M6.206 | CMPA.L (An),An | extends CMPA.L ✅ |
+| M6.208 | OR.W Dn,(An) | (new ⚡) |
+| M6.209 | OR.W Dn,(An)+ | (new ⚡) |
+| M6.210 | CMP.W (An)+,Dn | (new ⚡) |
+| M6.211 | AND.W (An),Dn | (new ⚡) |
+| M6.213 | MOVE.W An,Dn | (new ✅) |
+| M6.214 | MOVE.W Dn,(An)+ | (new ⚡) |
+| M6.215 | MOVE.L (d8,An,Xn),Dn | (new ⚡) |
+| M6.216 | ADD.L (d8,An,Xn),Dn | (new ⚡) |
+| M6.217 | MOVE.W (d16,An),(Am)+ | (new ⚡) |
+| M6.218 | MOVEA.W (d16,An),Am | (new ⚡) |
+| M6.219 | MOVE.L (d16,An),-(Am) predec push | (new ⚡) |
+| M6.220 | ADD.B/SUB.B (d16,An),Dn | (new 🪝) |
+
+### boot-system-load → helpers=0 series (M6.221-M6.229)
+
+Closes the boot-system-load snapshot to 0 helpers via 5 conversions
+(boot-system-load → helpers=0 at M6.229) using the two-register-arg
+helper-bridge pattern from [[boot-system-load-zero-helpers]].
+
+| MS | Opcode shape | Notes |
+|----|--------------|-------|
+| M6.221 | CLR.W (d16,An) | sibling of M6.182 |
+| M6.222 | MOVE.W #imm,-(An) | sibling of M6.78 |
+| M6.223 | CMP.L (An)+,Dn with Bcc fusion | |
+| M6.224 | AND.W (An)+,Dn | .W postinc sibling of M6.211 |
+| M6.225 | MOVE.L (xxx).W,(An) MMIO fast helper | boot-system-load 2.140 → 2.070 (-3.3 %) |
+| M6.226 | ADD.L #imm32,Dn inline | boot-system-load 2.070 → 2.022 (-2.3 %) |
+| M6.227 | JMP (d8,An,Xn) inline | boot-system-load 2.022 → 1.955 (-3.3 %) |
+| M6.228 | MOVE.B (d16,An),(d16,Am) mem-to-mem MMIO | boot-system-load 1.955 → 1.854 (-5.2 %) |
+| M6.229 | MOVE.L (d8,An,Xn),(d16,Am) mem-to-mem | **boot-system-load → helpers=0 🎯** |
+
+### Static bit-op modes 2/5 (M6.230-M6.231)
+
+| MS | Opcode shape | Notes |
+|----|--------------|-------|
+| M6.230 | BTST/BCHG/BCLR/BSET #imm,(An) | extends mode-2 family ⚡ |
+| M6.231 | BCHG/BCLR/BSET #imm,(d16,An) | extends mode-5 family ⚡ |
+
+### M6.232 — ROXR.L / ROXL.L #imm,Dn .L truncation fix
+
+Correctness fix: `xt_extui(rt, src, 0, 31)` silently encoded
+`maskimm = 15` (4-bit field wrap) in release builds, extracting low
+16 bits instead of 32. M6.143 ROXR.L + M6.149 ROXL.L + M6.150
+ROR/ROL.L all fixed by special-casing `size_bits == 32`. Was the
+M6.66 divergence root cause; diff_jit_trace step now 360 (was 350).
+See [[xt-extui-32-bit-truncation]] for the LX7 encoder pitfall.
+
+### thinkc-bullseye MMIO sweep (M6.235-M6.243)
+
+Added the THINK C 5.0 IDE running Bullseye demo as bench target #8
+(M6.235, 2.222 lx7/cyc / 2.10 M real_helpers/100M at landing). The
+M6.236-M6.243 series then converted 13 m68k_step-bridge slow paths
+to custom MMIO fast helpers, dropping bullseye real_helpers 2.10 M
+→ 0.98 M (-53 %), lx7/cyc 2.222 → 2.155 (-3.0 %).
+
+| MS | Opcode shape | Helper added |
+|----|--------------|--------------|
+| M6.236 | MOVE.L (d16,An),(d16,Am) mem-to-mem inline | inline only |
+| M6.238 | JSR (An) MMIO slow path → BSR.S helper | reuse M6.132 |
+| M6.238b | JSR (d16,PC) MMIO slow path → BSR.W helper | reuse M6.132 |
+| M6.239 | MOVE.W (d16,An),Dn MMIO slow path | `m68k_jit_move_w_addr_to_dn_mmio` |
+| M6.239b | MOVE.W (d8,An,Xn),Dn MMIO slow path | shares M6.239 helper |
+| M6.240 | MOVE.B (An)+,Dn MMIO slow path | `m68k_jit_move_b_postinc_to_dn_mmio` |
+| M6.240b | MOVE.L (d8,An,Xn),Dn MMIO slow path | reuse M6.144 |
+| M6.240c | MOVE.L (d16,An),Dn MMIO slow path | reuse M6.144 |
+| M6.240d | MOVEA.L (d16,An),Am MMIO slow path | `m68k_jit_movea_l_addr_to_am_mmio` (CCR-mask=0) |
+| M6.241 | CMP.W (addr),Dn MMIO slow path | `m68k_jit_cmp_w_addr_dn_mmio` |
+| M6.242 | MOVE.W (d16,An),(Am)+ MMIO | `m68k_jit_move_w_addr_to_postinc_mmio` |
+| M6.243 | MOVEA.W (d16,An),Am MMIO slow path | `m68k_jit_movea_w_addr_to_am_mmio` (.W sext-to-32) |
+
+### Tooling (M6.197 / M6.201 / M6.203 / M6.205 / M6.235)
 
 | MS | What |
 |----|------|
@@ -389,10 +488,15 @@ unchanged.
 | M6.201 | Extend boot-snap diff_jit_trace window 11K → 100K cycles |
 | M6.203 | Add boot-cycle30m.snap (6th bench target) |
 | M6.205 | Widen helper-histo dump 20 → 40 entries |
+| M6.235 | Add thinkc-bullseye.snap (8th bench target — THINK C 5.0 + Bullseye demo) |
 
-### Current saturation state (post-M6.205)
+### Current state (post-M6.243)
 
-See `memory/host-perf-saturation.md` for the saturation analysis. The
-host-measurable frontier is genuinely saturated; further wins require
-deeper architectural moves (variable-count shifts in the encoder,
-native ESP32 chain measurement, or M6.66 root-cause fix).
+Two of the eight bench targets at **helpers = 0** (thinkc8-folder-open
+since M6.193, boot-system-load since M6.229). Speedo bench
+1.179 lx7/cyc (5.48 × interp). The host-measurable optimization
+frontier is genuinely saturated for the remaining six targets;
+further wins on those require deeper architectural moves
+(variable-count shifts, native ESP32 chain measurement, M6.66
+root-cause fix, per-flag-CCR liveness, trampoline-preserve-a4..a7).
+See `memory/host-perf-saturation.md`.

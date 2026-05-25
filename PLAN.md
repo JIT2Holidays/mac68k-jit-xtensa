@@ -62,23 +62,28 @@ cpu_state base — it survives helper calls** (the trampoline preserves
 the windowed-callee-safe `a0..a7` range), `a8..a15` inline scratch.
 
 ### 4.4 Inline vs fallback
-The JIT emits native Xtensa for ~120 opcode classes — every MOVE /
-MOVEQ / MOVEA / MOVEM variant the boot + bench hit, the full immediate /
-register / `(d16,An)` / `(d8,An,Xn)` / `(xxx).W` ADD / ADDQ / ADDA /
-SUB / SUBQ / SUBA / CMP / CMPI / CMPM / CMPA forms, NEG / TST / CLR,
-ADDX / SUBX / NEGX / NOT (Dn forms; .L done), EXT, BCD, the static-imm
-bit ops to Dn / `(xxx).W` / MMIO, every `#imm,Dn` ASR / ASL / LSR / LSL /
-ROR / ROL / ROXR / ROXL across .B / .W / .L sizes, Scc, JSR / JMP / RTS
-(with in-RAM fast paths that read 4 BE bytes inline instead of bridging),
-Bcc.S / Bcc.W / DBcc, fused-TST+Bcc / MOVE+Bcc / CMP+Bcc terminators,
-MOVE.L push / pop patterns, MOVEM predec / postinc inlined under a size
-threshold, plus 18 custom `m68k_jit_*` fast helpers for the MMIO and
-exception slow paths (RTS / BSR / MOVE.L (An)+,Dn / MOVE.B address forms /
-ORI.B / BTST / MOVEM / line-F trap). Full X / N / Z / V / C computation
-derived from the standard carry / overflow bit identities; lazy-CC
-liveness skips materialising flags that no downstream op reads. Every
-other instruction becomes a `CALLX0` into the reference interpreter's
-`m68k_step`.
+The JIT emits native Xtensa for ~150 opcode classes — every MOVE /
+MOVEQ / MOVEA / MOVEM / LEA / PEA / LINK / UNLK variant the boot + bench
+hit, the full immediate / register / `(d16,An)` / `(d8,An,Xn)` /
+`(xxx).W` ADD / ADDQ / ADDA / SUB / SUBQ / SUBA / CMP / CMPI / CMPM /
+CMPA forms, NEG / TST / CLR, ADDX / SUBX / NEGX / NOT (Dn forms; .L
+done), EXT, BCD, MUL.W, the full static-imm bit ops to Dn / `(An)` /
+`(d16,An)` / `(xxx).W` plus dynamic-Dm bit ops to `(An)`, every
+`#imm,Dn` ASR / ASL / LSR / LSL / ROR / ROL / ROXR / ROXL across .B /
+.W / .L sizes, Scc, JSR / JMP / RTS / RTE / DBcc (with in-RAM fast
+paths that read 4 BE bytes inline instead of bridging), Bcc.S /
+Bcc.W / BRA.W, fused-TST+Bcc / MOVE+Bcc / CMP+Bcc / CMPI+Bcc / EXT+Bcc
+terminators, MOVE.L push / pop patterns, MOVEM predec / postinc inlined
+under a size threshold, plus ~30 custom `m68k_jit_*` fast helpers for
+the MMIO and exception slow paths (RTS / BSR.S / BSR.W / JSR
+(An)+(d16,PC) / MOVE-L address-form family / MOVE-W address-form
+family / MOVE-B address-form family / mem-to-mem .B+.W+.L /
+MOVEA-L+W (d16,An),Am / CMP.W (addr),Dn / CLR.W (An)+ / line-A +
+line-F traps / RTE / ORI.B / BTST / MOVEM / …). Full X / N / Z / V /
+C computation derived from the standard carry / overflow bit
+identities; lazy-CC liveness skips materialising flags that no
+downstream op reads. Every other instruction becomes a `CALLX0` into
+the reference interpreter's `m68k_step`.
 
 See [`INSTRUCTIONS.md`](INSTRUCTIONS.md) for the per-instruction map.
 
@@ -217,19 +222,36 @@ A 512×342 1bpp framebuffer is carved from the top of RAM.
      (M6.141 Scc, M6.142 ADDX, M6.143 ROXR, M6.144 MOVE.L bridge swap,
      M6.146 LSL, M6.149 ROXL, M6.150 ROR/ROL, M6.151 ASL, M6.152
      ADDA.L).
-   - **M6.153** — extra-bench snapshots `boot-rom-init.snap` (cycle
-     4 M, PC=0x40032C) and `boot-system-load.snap` (cycle 60 M,
-     PC=0x401F6E) added to ctest. 9 tests total. The originally-
-     planned MacBench 4.0 / THINK C targets remain blocked on the
-     M6.67 Finder app-launch wall; the boot-phase snapshots cover the
-     same broadened-differential value (distinct opcode mix from the
-     Speedometer ALU loop) without that wall.
+   - **M6.153 / M6.197 / M6.203** — extra-bench snapshots: `boot-rom-init`
+     (cycle 4 M, ROM memory test), `boot-system-load` (cycle 60 M, post-
+     System-load), `boot-cycle100m` (mid INIT/extension load), and
+     `boot-cycle30m` (Toolbox init) added to ctest. 11 tests total.
+   - **M6.169–M6.193** — thinkc8 hotspot inline series: 25 inline arms
+     targeting THINK C 8 folder-open helpers (TST.B / CMPA.L / CMP.L /
+     MOVE.W / CMPI.W (d16,An) family, LINK / UNLK, PEA (d16,An), line-A
+     trap fast helper, ORI.W #imm,SR, MOVE-from/to-SR mem forms).
+     thinkc8 reached **helpers = 0** — every opcode in the snapshot is
+     inline (M6.193).
+   - **M6.225–M6.229** — boot-system-load slow-path conversion: 5 arms
+     converted to two-register-arg helper bridges (MOVE.L (xxx).W,(An),
+     ADD.L #imm32,Dn, JMP (d8,An,Xn), MOVE-mem-to-mem .B and .L
+     indexed). boot-system-load reached **helpers = 0** (M6.229).
+   - **M6.230–M6.243** — bit-op coverage extension (BTST/BCHG/BCLR/BSET
+     static-imm to (An) and (d16,An)) plus the M6.236–M6.243 thinkc-
+     bullseye MMIO sweep: 12 slow-path conversions of MOVE-W/L address-
+     form arms to custom MMIO fast helpers, dropping bullseye real
+     helpers 2.10 M → 0.98 M (−53 %).
+   - **M6.232** — ROXR.L / ROXL.L .L silent 16-bit truncation fix
+     (`xt_extui maskimm=31` wrapped to 15 in release). The
+     long-standing M6.66 divergence trigger; diff_jit_trace now reaches
+     step 360 (was 350).
 
-   Current state: **bench 100 M `lx7/cyc` = 1.183, boot 100 M = 1.664**.
-   See `STATUS.md` for the full progression and `INSTRUCTIONS.md` for
-   the per-instruction map. Triple-differential (JIT vs interp vs mini
-   vMac) is SOP after any JIT-affecting change — see
-   `memory/triple-differential.md`.
+   Current state: **speedo 100 M `lx7/cyc` = 1.179, boot 100 M = 1.656,
+   thinkc-bullseye = 2.155**. Two snapshots (thinkc8-folder-open,
+   boot-system-load) at **helpers = 0**. See `STATUS.md` for the full
+   progression and `INSTRUCTIONS.md` for the per-instruction map.
+   Triple-differential (JIT vs interp vs mini vMac) is SOP after any
+   JIT-affecting change — see `memory/triple-differential.md`.
 
 ## 7. What's left
 
@@ -271,6 +293,9 @@ Smaller plate items:
   `memory/bridge-only-arms-trajectory-shift.md` apply: pure-register-
   op extensions and slow-path bridge conversions land cleanly; new
   arms with bounds-check + bridge structure are risky.
+- Dynamic-Dm shift count (`LSR.L Dm,Dn` etc.) — the largest single
+  remaining bench hotspot the JIT doesn't recognise (`0xEAA8` LSR.L
+  D5,D0 at 190 fires/bench, 210K fires/thinkc-bullseye).
 - Inline simple helper bodies (avoid CALLX0 overhead).
 - Address-error trap on odd PC (could short-circuit a ~6 % boot
   excursion through unmapped memory, with behavioural risk).
@@ -278,6 +303,8 @@ Smaller plate items:
   the interpreter (would extend `--diff-jit` reach past ~12 K
   cycles but at significant perf cost). The M6.66 chaotic-trajectory
   problem reduces to "fix this".
-- MacBench / THINK C bench snapshots: the Finder app-launch wall
-  (M6.67 §2809) still stands; the M6.153 boot-phase snapshots cover
-  the equivalent broadened-coverage goal.
+- MacBench 4.0 is **infeasible** on Mac Plus (requires 68030+ /
+  System 7.5+ / 12 MB RAM; concrete blocker confirmed empirically
+  in STATUS.md). The `thinkc-bullseye` bench target (THINK C 5.0 IDE
+  running the built-in Bullseye demo, 2.155 lx7/cyc, 985K
+  real_helpers/100M) covers the same "rich opcode mix" goal.

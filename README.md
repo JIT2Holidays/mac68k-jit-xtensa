@@ -12,19 +12,25 @@ simulator.
 
 ## Headline numbers (host, JIT vs interp)
 
-State at **M6.164**.
+State at **M6.243**. Eight bench targets exercise distinct opcode mixes
+(see the full table at the top of `STATUS.md`):
 
-| Workload | interp lx7/cyc | JIT lx7/cyc | speedup |
-|---|---:|---:|---:|
-| Speedometer 20 M cycles (frozen snapshot) | 6.462 | **1.162** | **5.56 ×** |
-| Speedometer 100 M cycles | 6.462 | **1.179** | 5.48 × |
-| Mac Plus ROM boot (100 M cyc) | 5.895 | **1.657** | 3.89 × |
-| Mac Plus ROM boot (5 M cyc, det) | 5.895 | **2.195** | 2.94 × |
+| Workload | JIT lx7/cyc | real_helpers/100M |
+|---|---:|---:|
+| Speedometer 100 M (frozen snapshot) | **1.179** | 1 237 |
+| boot-cycle30m (Toolbox init) | **1.334** | 8 |
+| thinkc8-folder-open (Finder w/ THINK C 8 folder) | **1.389** | 0 |
+| boot-cycle100m (mid INIT/extension load) | **1.634** | 1 422 |
+| Mac Plus ROM boot 100 M (live) | **1.656** | 175 726 |
+| boot-rom-init (ROM memory test) | **1.662** | 232 106 |
+| boot-system-load (post-System-load) | **1.786** | **0** |
+| thinkc-bullseye (THINK C 5.0 IDE, Bullseye demo) | **2.155** | 984 959 |
 
-The bench exceeds the original "5 × interp" goal (M6.31, M6.51) and has
-since moved another ~9 % faster across the M6.91–M6.152 inline rounds.
-The boot number is path-dependent on VIA-tick timing — see `STATUS.md`
-and `memory/m6.66-trajectory-traps.md`.
+Interp baseline is ~6 lx7/cyc; the bench is **5.48 × interp**, well past
+the original 5 × goal (M6.31, M6.51). Two snapshots (`thinkc8-folder-open`,
+`boot-system-load`) reached **helpers = 0** — every opcode in those frozen
+windows is inline. Boot numbers are path-dependent on VIA-tick timing —
+see `STATUS.md` and `memory/m6.66-trajectory-traps.md`.
 
 For a per-instruction view of what's inline vs what still falls to
 `m68k_step`, see [`INSTRUCTIONS.md`](INSTRUCTIONS.md).
@@ -84,20 +90,23 @@ JIT-tuning flags:
   EXT / SWAP / LINK / UNLK, NEG / NEGX / NOT / CLR / TST / TAS, TRAP,
   exceptions, autovector interrupts. It is the correctness oracle.
 - **Inline-heavy JIT** (`jit/codegen.c`, `jit/dispatcher.c`) — discovers
-  basic blocks and emits native Xtensa for **~120 opcode classes** across
-  the MOVE / MOVEA / MOVEM / MOVEQ / LEA, ADD / ADDA / ADDI / ADDQ / ADDX,
-  SUB / SUBA / SUBI / SUBQ / SUBX, MUL, NEG / NEGX, EXT, CMP / CMPI / CMPM,
-  AND / OR / EOR / NOT / CLR / TST, BTST and (#imm to abs.W) bit family,
-  ASR / ASL / LSR / LSL / ROR / ROL / ROXR / ROXL #imm shift family,
-  ABCD / SBCD / NBCD BCD chain, Bcc / BRA / BSR / JMP / JSR / RTS / DBcc /
-  Scc control family, and the line-F + MOVE-to-SR system family. Eighteen
-  bench / boot patterns (RTS-to-MMIO, BSR-to-MMIO, MOVE.L (An)+,Dn-to-MMIO,
-  MOVE.B address forms, ORI.B / BTST MMIO, MOVEM predec / postinc / mem,
-  MOVE.W (An)+,Dn MMIO, MOVE.L (An),Dn MMIO, line-F trap …) take a custom `m68k_jit_*` fast helper instead of
-  `m68k_step`. Everything still uncovered (PEA, LINK, UNLK, DIV, EXG,
-  full Bxxx-Dn, full shift-by-Dm, line-A traps, MMIO mem-EA bit ops, …)
-  falls back to a `CALLX0` into `m68k_step`. Full X / N / Z / V / C
-  computation with lazy-CC liveness. See [`INSTRUCTIONS.md`](INSTRUCTIONS.md)
+  basic blocks and emits native Xtensa for **~150 opcode classes** across
+  the MOVE / MOVEA / MOVEM / MOVEQ / LEA / PEA / LINK / UNLK, ADD / ADDA /
+  ADDI / ADDQ / ADDX, SUB / SUBA / SUBI / SUBQ / SUBX, MUL, NEG / NEGX,
+  EXT, CMP / CMPI / CMPM / CMPA, AND / OR / EOR / NOT / CLR / TST, full
+  static-imm BTST / BCHG / BCLR / BSET to Dn / (An) / (d16,An) / (xxx).W
+  plus dynamic-Dm bit ops to (An), ASR / ASL / LSR / LSL / ROR / ROL /
+  ROXR / ROXL #imm shift family, ABCD / SBCD / NBCD BCD chain, Bcc /
+  BRA / BSR / JMP / JSR / RTS / RTE / DBcc / Scc control family, line-A
+  + line-F traps, MOVE-SR / MOVE-from-SR / ORI-to-SR system family.
+  **About 30 custom `m68k_jit_*` fast helpers** cover bench/boot MMIO
+  patterns (RTS / BSR / JSR / MOVEM (An)+ / MOVE-L address forms / MOVE-W
+  address forms / MOVE-B address forms / MOVE-mem-to-mem .L+.W+.B /
+  MOVEA-L+W / CMP.W (addr),Dn / CLR.W (An)+ / line-A + line-F traps / …)
+  in place of `m68k_step`. Everything still uncovered (DIV, EXG, full
+  Bxxx-Dm dynamic-source, full shift-by-Dm count, address-error trap,
+  RTR …) falls back to a `CALLX0` into `m68k_step`. Full X / N / Z / V /
+  C computation with lazy-CC liveness. See [`INSTRUCTIONS.md`](INSTRUCTIONS.md)
   for the per-instruction map.
 - **Within-block + cross-block register caching** — hot D / A regs
   are cached in `a4..a7` for the lifetime of a block (M6.10), and
@@ -163,9 +172,9 @@ port/host/      host CLI driver — mac68k_host
 port/esp32s3/   ESP-IDF v6 project (component + app + trampolines)
 gui/            SDL2 GUI front-end (mac_gui) — talks to host over a pipe
 tests/          ctest cases (interp / encoder / jit_differential /
-                prefetch / diff_jit lockstep — 3 snapshots × {plain,
-                prefetch static, prefetch chain} for the bench, +1 each
-                for the two boot-phase snapshots)
+                prefetch / diff_jit lockstep — speedo bench × {plain,
+                prefetch static, prefetch chain} + four boot-phase
+                snapshots)
 scripts/        build / test / gui / boot / bench / diff helpers plus
                 QEMU runner and IDF environment helper
 third_party/    minivmac submodule (source of the .Sony driver patch)
@@ -184,17 +193,17 @@ $ ctest --test-dir build
                                               guard). Conditional on the snapshot's presence.
     diff_jit_bench_lockstep_prefetch        — same lockstep with --prefetch static (M6.71)
     diff_jit_bench_lockstep_prefetch_chain  — same lockstep with --prefetch chain (M6.72)
-    diff_jit_boot_rom_init_lockstep         — lockstep on boot-rom-init.snap (BTST-heavy ROM
-                                              memory-test loop, M6.153)
-    diff_jit_boot_system_load_lockstep      — lockstep on boot-system-load.snap (MOVE.L stack
-                                              args in ROM trap handlers, M6.153)
+    diff_jit_boot_rom_init_lockstep         — lockstep on boot-rom-init.snap (M6.153)
+    diff_jit_boot_system_load_lockstep      — lockstep on boot-system-load.snap (M6.153)
+    diff_jit_boot_cycle100m_lockstep        — lockstep on boot-cycle100m.snap (M6.197)
+    diff_jit_boot_cycle30m_lockstep         — lockstep on boot-cycle30m.snap (M6.203)
 ```
 
-The three `*.snap` lockstep tests are conditional on the snapshot files
+The `*.snap` lockstep tests are conditional on the snapshot files
 existing in `roms/disks/`. The snapshots are gitignored (copyrighted
 ROM bytes); regenerate them with `scripts/snap-extra-bench.sh` (for the
-two boot-phase snaps) — the Speedometer snap is captured manually under
-the GUI via `MAC68K_SNAP`.
+boot-phase snaps) — the Speedometer / thinkc8 / thinkc-bullseye snaps
+are captured under the GUI via `MAC68K_SNAP`.
 
 ## Workflow notes
 
