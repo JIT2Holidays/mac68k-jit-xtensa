@@ -9008,6 +9008,116 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + jci_pos + 2] = (u8)(jw_ci >> 16);
 
             inline_ops++; done = true;
+        } else if (top == 0x0 && ((w >> 8) & 1) == 1 && mode == 2) {
+            /* M6.202 — BTST / BCHG / BCLR / BSET Dn,(An). Register-
+             * source bit op against memory byte at (An). Boot 100M's
+             * 0x09D1 (BCHG D4,(A1)) at PC=0x40025E fires 696 times,
+             * 0x08D1 (BSET D4,(A1)) 62 times; boot-cycle100m fires
+             * 0x09D1 688 and 0x08D1 61. Combined 1500+ fires across
+             * the two snapshots.
+             *
+             * `which = (w >> 6) & 3`: 0=BTST, 1=BCHG, 2=BCLR, 3=BSET.
+             * Bit number from Dn[0..2] (byte EA uses low 3 bits per
+             * m68k_interp.c:489).
+             *
+             * Variable shift workaround: Xtensa LX7 has no SLL with
+             * variable count, so we synthesise `mask = 1 << (Dn & 7)`
+             * via three conditional immediate shifts (test bit 0/1/2
+             * of bit_num, conditionally shift by 1/2/4). 10 ops, plus
+             * ~15 ops for byte read/Z/modify/write/bounds = ~25 ops
+             * total per inline fire vs ~64 LX7 for the helper path.
+             *
+             * Length 2, cycles 8 (m68k_step base 4 + handler 4 per
+             * m68k_interp.c:982). MMIO falls through to default
+             * m68k_step helper. */
+            int which = (w >> 6) & 3;
+            int dn    = (w >> 9) & 7;
+            int an    = w & 7;
+
+            emit_advance_flush(&e);
+            /* a8 = bit_num & 7. */
+            emit_read_g(&e, &rc, G_D(dn), 11);
+            xt_extui(&e, 8, 11, 0, 2);
+
+            /* a9 = 1 << (a8 & 7). Build via 3 conditional immediate
+             * shifts. xt_beqz(reg, 3) skips one narrow-encoded instr. */
+            xt_movi(&e, 9, 1);
+            /* bit 0 of bit_num: shift mask by 1 if set. */
+            xt_extui(&e, 10, 8, 0, 0);
+            xt_beqz (&e, 10, 3);
+            xt_slli (&e, 9, 9, 1);
+            /* bit 1: shift by 2. */
+            xt_extui(&e, 10, 8, 1, 0);
+            xt_beqz (&e, 10, 3);
+            xt_slli (&e, 9, 9, 2);
+            /* bit 2: shift by 4. */
+            xt_extui(&e, 10, 8, 2, 0);
+            xt_beqz (&e, 10, 3);
+            xt_slli (&e, 9, 9, 4);
+            /* Now a9 = 1 << (bit_num & 7), in {1, 2, 4, 8, 16, 32, 64, 128}. */
+
+            /* a8 = An (EA). */
+            emit_read_g(&e, &rc, G_A(an), 8);
+            /* Bounds check. */
+            emit_l32r_at(&e, 11, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 11);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_bch = 2, op_cyc_bch = 8;
+            /* Helper path: m68k_step writes byte (BCHG/BCLR/BSET) +
+             * CCR. touched_mask=0u — no D/A reg modified. */
+            g_helper_touched_mask = 0u;
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_bch, op_cyc_bch)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_bch, op_cyc_bch);
+            g_helper_touched_mask = 0xFFFFu;
+            u32 jbch_pos = e.len;
+            xt_j    (&e, 4);
+
+            /* Fast path: read byte, test bit, set Z, optionally
+             * modify and write back. */
+            emit_l32r_at(&e, 11, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 11, 11, 8);              /* a11 = ram + An */
+            xt_l8ui (&e, 8, 11, 0);                /* a8 = byte */
+
+            /* a10 = byte & mask = old bit value (0 or mask). */
+            xt_and  (&e, 10, 8, 9);
+
+            /* Update Z bit: clear bit 2 of R_SR, then OR 0x04 if a10==0. */
+            xt_movi (&e, 12, -5);                  /* ~0x04 */
+            xt_and  (&e, R_SR, R_SR, 12);
+            xt_movi (&e, 12, 0x04);
+            xt_bnez (&e, 10, 6);                   /* skip OR if bit was set */
+            xt_or   (&e, R_SR, R_SR, 12);
+            g_sr_dirty = true;
+
+            if (which != 0) {
+                /* Modify byte: BCHG (1) = xor, BCLR (2) = and ~mask,
+                 * BSET (3) = or. */
+                if (which == 1) {
+                    xt_xor(&e, 8, 8, 9);
+                } else if (which == 2) {
+                    xt_movi(&e, 12, -1);
+                    xt_xor (&e, 9, 9, 12);          /* a9 = ~mask */
+                    xt_and (&e, 8, 8, 9);
+                } else {
+                    xt_or (&e, 8, 8, 9);
+                }
+                xt_s8i(&e, 8, 11, 0);              /* write byte back */
+            }
+
+            sext_memo_invalidate();
+            emit_advance(&e, op_pc_bch, op_cyc_bch);
+
+            u32 here_bch = e.len;
+            i32 jo_bch = (i32)(here_bch - jbch_pos) - 4;
+            u32 jw_bch = ((u32)((u32)jo_bch & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jbch_pos    ] = (u8)jw_bch;
+            base[entry_off + jbch_pos + 1] = (u8)(jw_bch >> 8);
+            base[entry_off + jbch_pos + 2] = (u8)(jw_bch >> 16);
+
+            inline_ops++; done = true;
         } else if (top == 0x0 && !((w >> 8) & 1) && ((w >> 9) & 7) == 4
                    && mode == 0) {
             /* M6.154 — BTST / BCHG / BCLR / BSET #imm,Dn — static-imm
