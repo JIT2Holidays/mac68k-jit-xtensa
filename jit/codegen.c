@@ -11471,8 +11471,21 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             u8 src_reg = (dn_xt >= 0) ? (u8)dn_xt : 8;
             if (dn_xt < 0) emit_read_g(&e, &rc, G_D(dn), 8);
 
-            /* a9 = src.size (low size_bits zero-extended). */
-            xt_extui(&e, 9, src_reg, 0, size_bits - 1);
+            /* a9 = src.size (low size_bits zero-extended).
+             * M6.232 fix: Xtensa EXTUI's maskimm is 4 bits (extracts
+             * 1..16 bits). For size_bits == 32, the original
+             * `xt_extui(0, 31)` silently encoded as maskimm=15 in
+             * release builds, extracting only the low 16 bits of
+             * src_reg. This was the M6.66 trajectory divergence root
+             * cause — ROXR.L #1 produced wrong upper-16 bits for D4
+             * and D5 in speedo's main loop at PC=0x41E6C4 (block
+             * containing 0xE294 ROXR.L #1,D4 and 0xE295 ROXR.L #1,D5).
+             * For .L just copy the full 32 bits; for .B/.W use extui. */
+            if (size_bits == 32) {
+                xt_mov(&e, 9, src_reg);
+            } else {
+                xt_extui(&e, 9, src_reg, 0, size_bits - 1);
+            }
             /* a10 = current X bit (will be updated per iteration). */
             xt_extui(&e, 10, R_SR, 4, 0);
 
@@ -11485,11 +11498,18 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                 xt_mov  (&e, 10, 11);                    /* X = last_out */
             }
 
-            /* Merge: clear low size_bits of src_reg, OR in result.size. */
-            xt_srli (&e, 12, src_reg, size_bits);
-            xt_slli (&e, 12, 12, size_bits);
             u8 dst_reg = (dn_xt >= 0) ? (u8)dn_xt : 8;
-            xt_or   (&e, dst_reg, 12, 9);
+            if (size_bits == 32) {
+                /* M6.232 fix: for .L the merge would do xt_srli/slli
+                 * with sa=32 (out of LX7 1..31 range). a9 already
+                 * holds the full result — just copy. */
+                xt_mov(&e, dst_reg, 9);
+            } else {
+                /* Merge: clear low size_bits of src_reg, OR in result.size. */
+                xt_srli (&e, 12, src_reg, size_bits);
+                xt_slli (&e, 12, 12, size_bits);
+                xt_or   (&e, dst_reg, 12, 9);
+            }
 
             if (dn_xt >= 0) {
                 for (int s = 0; s < rc.active; s++)
@@ -11558,8 +11578,17 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             u8 src_reg = (dn_xt >= 0) ? (u8)dn_xt : 8;
             if (dn_xt < 0) emit_read_g(&e, &rc, G_D(dn), 8);
 
-            /* a9 = src.size (low size_bits zero-extended). */
-            xt_extui(&e, 9, src_reg, 0, size_bits - 1);
+            /* a9 = src.size (low size_bits zero-extended).
+             * M6.232 fix: see same fix in M6.143 above — for size_bits
+             * == 32 the original `xt_extui(0, 31)` silently encoded as
+             * maskimm=15, extracting only the low 16 bits. ROXL.L would
+             * be wrong if it ever fires (not seen in current snapshots
+             * but applying the same fix for safety). */
+            if (size_bits == 32) {
+                xt_mov(&e, 9, src_reg);
+            } else {
+                xt_extui(&e, 9, src_reg, 0, size_bits - 1);
+            }
             /* a10 = current X bit (will be updated per iteration). */
             xt_extui(&e, 10, R_SR, 4, 0);
 
@@ -11567,16 +11596,28 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             for (int k = 0; k < imm; k++) {
                 xt_extui(&e, 11, 9, size_bits - 1, 0);   /* a11 = bit (size-1) of val = new_X */
                 xt_slli (&e, 9, 9, 1);                    /* val <<= 1 */
-                xt_extui(&e, 9, 9, 0, size_bits - 1);     /* mask to size_bits */
+                if (size_bits == 32) {
+                    /* For .L, the shift overflow already drops bit 32,
+                     * so no mask needed. Skip the extui (which would
+                     * truncate to 16 bits). */
+                } else {
+                    xt_extui(&e, 9, 9, 0, size_bits - 1); /* mask to size_bits */
+                }
                 xt_or   (&e, 9, 9, 10);                   /* val |= inb (old X) */
                 xt_mov  (&e, 10, 11);                     /* X = new_X = last_out */
             }
 
-            /* Merge: clear low size_bits of src_reg, OR in result.size. */
-            xt_srli (&e, 12, src_reg, size_bits);
-            xt_slli (&e, 12, 12, size_bits);
             u8 dst_reg = (dn_xt >= 0) ? (u8)dn_xt : 8;
-            xt_or   (&e, dst_reg, 12, 9);
+            if (size_bits == 32) {
+                /* M6.232 fix: same as M6.143 — sa=32 is out of LX7
+                 * range. a9 already has the full result. */
+                xt_mov(&e, dst_reg, 9);
+            } else {
+                /* Merge: clear low size_bits of src_reg, OR in result.size. */
+                xt_srli (&e, 12, src_reg, size_bits);
+                xt_slli (&e, 12, 12, size_bits);
+                xt_or   (&e, dst_reg, 12, 9);
+            }
 
             if (dn_xt >= 0) {
                 for (int s = 0; s < rc.active; s++)

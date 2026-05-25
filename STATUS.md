@@ -93,6 +93,59 @@ produced a sub-window (1.36% diff). Then iterate inside.
 
 These tools are reusable for any future Mac-Plus interactive scripting.
 
+## M6.232 — Fix ROXR.L / ROXL.L #imm,Dn silent 16-bit truncation 🎯 (M6.66 root cause, partial)
+
+**Correctness fix.** M6.143's ROXR.L #imm,Dn inline arm (and its
+M6.149 sibling for ROXL) called `xt_extui(rt, src_reg, 0, size_bits-1)`
+to extract the low `size_bits` bits. For `.B`/`.W` that's
+`size_bits-1 = 7` or `15` — fine. For **`.L` that's `size_bits-1 = 31`**,
+but Xtensa LX7's EXTUI maskimm is 4 bits (extracts 1..16 bits). In
+release builds the assert is compiled out and `31 & 0xF = 15`
+silently encodes a 16-bit extract.
+
+**Effect:** ROXR.L #imm,Dn read only the low 16 bits of Dn. Iteration
+rotated those, then the merge step (which also used `xt_srli/xt_slli`
+with sa=32 — also out-of-range) joined the rotated low-16 with bits
+that should have been the upper-16. **Net: D4 and D5 in speedo's
+0x41E6C4 block had wrong upper-16 bits**, which was the long-standing
+M6.66 divergence trigger at cycle 11898 (step 350 of diff_jit_trace).
+
+After fix: diff_jit_trace divergence moves from **step 350 → step 360**
+(cycles 11898 → 12202). The new divergence is a *separate*,
+preexisting per-flag-CCR-mask issue (CMPA.L A4,A3 leaves Z=1 from a
+prior op when it should write Z=0) that was previously masked by the
+ROXR bug.
+
+Both M6.143 and M6.149 fixed by special-casing `size_bits == 32`:
+copy `src_reg` directly into a9 (no extui), and skip the merge step
+(dst_reg = a9 since all 32 bits are the result).
+
+Bench rotation (M6.232 vs M6.231):
+| Bench | M6.231 | M6.232 |
+|---|---:|---:|
+| speedo | 1237 / 1.179 | 1248 / 1.179 |
+| all others | unchanged | unchanged |
+
+Speedo's +11 real_helpers is because the corrected execution now
+takes the *real* control-flow path (the previous wrong-result path
+skipped some helper-firing branches). Net lx7/cyc rounded unchanged.
+boot 100M live, boot 5M det, boot-cycle100m all unchanged — M6.143
+was STRICTLY ABSENT from boot per its original docstring, so the
+.L bug never affected boot.
+
+ctest 11/11; diff.sh 321 blocks match (same as before).
+
+Follow-up bug discovered (deferred): block at PC=0x41E3A8 contains
+`CMPA.L A4,A3; BLT.S +4`. The CMPA.L inline arm uses
+`emit_addsub_flags_long_masked` with `flags_needed[i]` (only N+V for
+BLT consumer); Z bit is left at its prior value (1 from earlier).
+Per `memory/per-flag-ccr-blocked.md` this is the documented per-flag
+CCR liveness leak. Existing memory note claimed it didn't trigger in
+practice because partial-mask sites were all in fused paths — that
+claim is now disproven. Possible fixes: (a) widen the CMPA arm's
+flag mask to always write Z; (b) extend the M6.232 work to find ALL
+remaining trajectory-divergence root causes.
+
 ## M6.231 — BCHG/BCLR/BSET #imm,(d16,An) static bit op mode 5
 
 Sibling of M6.230 with d16 EA addition. boot 100M live + boot-cycle100m
