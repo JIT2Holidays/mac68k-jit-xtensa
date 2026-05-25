@@ -815,6 +815,30 @@ void m68k_jit_bitop_dn_an_mmio(m68k_cpu *cpu) {
     }
 }
 
+/* M6.239 — MOVE.W src,Dn MMIO fast helper. Sibling of M6.133's
+ * m68k_jit_move_b_addr_to_dn_mmio for the .W variant. Used by the
+ * MOVE.W (d16,An),Dn / MOVE.W (An),Dn / MOVE.W (xxx).W,Dn arms when
+ * the source address resolves to MMIO. thinkc-bullseye fires the
+ * (d16,An) variant 96K times.
+ *
+ * Args:
+ *   jit_arg1 = src addr (caller-computed)
+ *   jit_arg2 = dst Dn (0..7)
+ *
+ * Reads .W (2 BE bytes), merges into low 16 of cpu->d[dn] preserving
+ * high 16. MOVE-family CCR (N from bit 15, Z from .W==0, V=C=0,
+ * X preserved). Skips m68k_step's decode + cpu->instrs++. */
+void m68k_jit_move_w_addr_to_dn_mmio(m68k_cpu *cpu) {
+    int dn = (int)(cpu->jit_arg2 & 7);
+    u32 addr = cpu->jit_arg1;
+    u16 v = mac_read16(cpu->mem, addr);
+    cpu->d[dn] = (cpu->d[dn] & 0xFFFF0000u) | v;
+    u8 ccr = m68k_get_ccr(cpu) & CCR_X;
+    if (v == 0)     ccr |= CCR_Z;
+    if (v & 0x8000) ccr |= CCR_N;
+    m68k_set_ccr(cpu, ccr);
+}
+
 /* M6.229 — MOVE.L src,dst mem-to-mem MMIO fast helper, .L size.
  * Sibling of [[m68k_jit_move_b_addr_to_addr_mmio]] for boot-system-load's
  * 0x2F72 (MOVE.L (d8,A2,Xn),(d16,A7)) at PC=0x401F74 — 229,358 fires.

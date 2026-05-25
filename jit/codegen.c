@@ -4840,12 +4840,20 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             xt_and  (&e, 10, 8, 9);
             emit_cache_flush(&e, &rc);
             i32 op_pc_mwd = 4, op_cyc_mwd = 8;
-            /* MOVE.W (d16,An),Dn writes only Dn — set narrow mask. */
+            /* M6.239 — slow path uses custom MMIO fast helper instead
+             * of m68k_step. bullseye 0x342E fires 96K times via this
+             * MMIO bridge; skipping m68k_step's decode + cpu->instrs++
+             * is the [[mmio-fast-helper-pattern]] win. */
             g_helper_touched_mask = (u16)(1u << G_D(dn));
-            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_mwd, op_cyc_mwd)));
-            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
-                                              entry_off, &rc, op_pc_mwd, op_cyc_mwd);
+            g_helper_arg_mask = 3u;          /* arg1=addr, arg2=dn */
+            u32 mwd_bridge_size = emit_jit_fast_helper_size(&rc);
+            xt_beqz (&e, 10, (i32)(6u + mwd_bridge_size));
+            emit_jit_fast_helper(&e, 8, dn,
+                                 lit_off[HELPER_JIT_MOVE_W_ADDR_TO_DN_MMIO],
+                                 entry_off, &rc);
             g_helper_touched_mask = 0xFFFFu;
+            g_helper_arg_mask = 3u;
+            (void)op_pc_mwd; (void)op_cyc_mwd;
             u32 jmwd_pos = e.len;
             xt_j    (&e, 4);
             /* Fast path: read 2 BE bytes → .W in a10. */
