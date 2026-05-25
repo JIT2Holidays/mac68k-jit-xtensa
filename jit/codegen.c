@@ -2169,6 +2169,40 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
         if (top == 0x7) {                  /* MOVEQ */
             emit_moveq(&e, w, flags_dead[i], &rc);
             inline_ops++; done = true;
+        } else if (w == 0x007C) {
+            /* M6.191 — ORI.W #imm,SR. thinkc8-folder-open bench's
+             * 0x007C at PC=0x40276A ~25K hits/100 M. The imm at
+             * runtime is loaded at compile time and we restrict to
+             * the case where the S (supervisor) bit is NOT in the
+             * imm — this avoids the m68k_sync_sp swap that would
+             * otherwise be required.
+             *
+             * Boot 100M fires 0x007C 62 times (post-M6.66 divergence
+             * region). Cycle count matches interp (4 cyc, early
+             * return) so no trajectory shift.
+             *
+             * Semantics: cpu->sr |= imm.W; (no m68k_sync_sp if S unchanged).
+             * Length 4 (op + imm), cycles 4. */
+            u16 imm = mac_read16(cpu->mem, op_pc[i] + 2);
+
+            /* Only inline when S bit (0x2000) is NOT set in imm —
+             * else fall through to default helper which calls
+             * m68k_sync_sp. */
+            if ((imm & 0x2000u) == 0u) {
+                /* R_SR |= imm. Use xt_movi (12-bit signed: -2048..2047)
+                 * if imm fits, else emit_load_imm. */
+                if ((i16)imm >= -2048 && (i16)imm <= 2047) {
+                    xt_movi(&e, 8, (i16)imm);
+                } else {
+                    emit_load_imm32(&e, 8, 9, (u32)imm);
+                }
+                xt_or(&e, R_SR, R_SR, 8);
+                g_sr_dirty = true;
+                sext_memo_invalidate();
+                emit_advance(&e, 4, 4);
+                inline_ops++; done = true;
+            }
+            /* else: fall through to default helper. */
         } else if (top == 0xA) {
             /* M6.190 — A-line trap (Toolbox dispatch). thinkc8-folder-
              * open bench's 0xA000-0xAFFF range fires ~25 K times/100 M
