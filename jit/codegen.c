@@ -2682,11 +2682,23 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             emit_cache_flush(&e, &rc);
             i32 op_pc_jran = 0;
             i32 op_cyc_jran = 20;            /* base 4 + handler 16 */
+            /* M6.238 — JSR (An) MMIO slow path: reuse HELPER_JIT_BSR_S_MMIO.
+             * JSR (An) and BSR.S share semantics: push (source_pc + 2),
+             * pc = target_pc. Helper takes target via jit_arg1; we already
+             * have An in a15. thinkc-bullseye fires this MMIO bridge 49K
+             * times — strictly absent from other snaps. */
             g_helper_touched_mask = (u16)(1u << G_A(7));
-            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_jran, op_cyc_jran)));
-            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
-                                              entry_off, &rc, op_pc_jran, op_cyc_jran);
+            g_helper_sr_mask = 0u;     /* BSR helper doesn't touch SR */
+            g_helper_arg_mask = 1u;    /* uses jit_arg1 (target_pc) only */
+            u32 jran_bridge_size = emit_jit_fast_helper_size(&rc);
+            xt_beqz (&e, 10, (i32)(6u + jran_bridge_size));
+            emit_jit_fast_helper(&e, 15, 0,
+                                 lit_off[HELPER_JIT_BSR_S_MMIO],
+                                 entry_off, &rc);
             g_helper_touched_mask = 0xFFFFu;
+            g_helper_sr_mask = 3u;
+            g_helper_arg_mask = 3u;
+            (void)op_pc_jran;
             u32 jjran_pos = e.len;
             xt_j    (&e, 4);
             /* Fast path: write return_pc (= cpu->pc + 2 since JSR (An)
