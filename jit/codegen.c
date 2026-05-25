@@ -4775,9 +4775,18 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             xt_and  (&e, 10, 8, 9);
             emit_cache_flush(&e, &rc);
             i32 op_pc_dr = 4, op_cyc_dr = 8;
-            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_dr, op_cyc_dr)));
-            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
-                                              entry_off, &rc, op_pc_dr, op_cyc_dr);
+            /* M6.240c — slow path uses M6.144's HELPER_JIT_MOVE_L_AN_TO_DN_MMIO.
+             * bullseye fires 0x202C (MOVE.L (d16,A4),D0) ~73K times. */
+            g_helper_touched_mask = (u16)(1u << G_D(dn));
+            g_helper_arg_mask = 3u;
+            u32 dr_bridge_size = emit_jit_fast_helper_size(&rc);
+            xt_beqz (&e, 10, (i32)(6u + dr_bridge_size));
+            emit_jit_fast_helper(&e, 8, dn,
+                                 lit_off[HELPER_JIT_MOVE_L_AN_TO_DN_MMIO],
+                                 entry_off, &rc);
+            g_helper_touched_mask = 0xFFFFu;
+            g_helper_arg_mask = 3u;
+            (void)op_pc_dr; (void)op_cyc_dr;
             u32 jdr_pos = e.len;
             xt_j    (&e, 4);
             /* Fast path: 4 BE byte loads. */
