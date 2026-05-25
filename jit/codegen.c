@@ -5651,6 +5651,69 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + jcwa_pos + 2] = (u8)(jw_cwa >> 16);
 
             inline_ops++; done = true;
+        } else if (top == 0x8 && szf == 1 && ((w >> 8) & 1) == 1 && mode == 2) {
+            /* M6.208 attempt — OR.W Dn,(An). Speedo bench's 0x8155
+             * (OR.W D0,(A5)) at PC=0x4093BE fires 156 times/100M.
+             * Absent from boot 100M / cycle100m / rom-init / cycle30m
+             * top-40 helper histos (M6.142 trajectory-safe predicate).
+             *
+             * M6.145 attempted this OR.W Dn,(An) as bridge-only (no
+             * RAM fast path) and regressed boot 100M +2.2 % per
+             * memory/bridge-only-arms-trajectory-shift.md. This
+             * attempt adds a RAM fast path; M6.148 lesson says even
+             * with fast path, sibling arms may regress — must test
+             * all 8 benches and revert if any boot snap regresses.
+             *
+             * Length 2, cycles 8 (m68k_step base 4 + handler 4). */
+            int dn = (w >> 9) & 7;
+            int an = w & 7;
+
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(an), 8);            /* a8 = An */
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_orw = 2, op_cyc_orw = 8;
+            /* OR.W (An) writes only memory + CCR — no D/A reg. */
+            g_helper_touched_mask = 0u;
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_orw, op_cyc_orw)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_orw, op_cyc_orw);
+            g_helper_touched_mask = 0xFFFFu;
+            u32 jorw_pos = e.len;
+            xt_j    (&e, 4);
+
+            /* Fast path: read .W BE bytes, OR with Dn.W, write back. */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);                      /* a9 = ram + An */
+            xt_l8ui (&e, 10, 9, 0);                     /* a10 = hi byte */
+            xt_l8ui (&e, 11, 9, 1);                     /* a11 = lo byte */
+            xt_slli (&e, 10, 10, 8);
+            xt_or   (&e, 10, 10, 11);                   /* a10 = .W mem (low 16) */
+            emit_read_g(&e, &rc, G_D(dn), 11);          /* a11 = Dn (full 32) */
+            xt_extui(&e, 12, 11, 0, 15);                /* a12 = Dn[15:0] */
+            xt_or   (&e, 10, 10, 12);                   /* a10 = OR result */
+            xt_extui(&e, 12, 10, 8, 7); xt_s8i(&e, 12, 9, 0);
+            xt_extui(&e, 12, 10, 0, 7); xt_s8i(&e, 12, 9, 1);
+
+            if (!flags_dead[i]) {
+                /* Shift .W bit 15 to bit 31 for emit_logic_flags. */
+                xt_slli (&e, 8, 10, 16);
+                emit_logic_flags(&e, 8);
+            }
+            sext_memo_invalidate();
+            emit_advance(&e, op_pc_orw, op_cyc_orw);
+
+            u32 here_orw = e.len;
+            i32 jo_orw = (i32)(here_orw - jorw_pos) - 4;
+            u32 jw_orw = ((u32)((u32)jo_orw & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jorw_pos    ] = (u8)jw_orw;
+            base[entry_off + jorw_pos + 1] = (u8)(jw_orw >> 8);
+            base[entry_off + jorw_pos + 2] = (u8)(jw_orw >> 16);
+
+            inline_ops++; done = true;
         } else if (top == 0x4 && ((w >> 8) & 0xF) == 0x2 && szf == 2 && mode == 5) {
             /* M6.182 — CLR.L (d16,An). thinkc8-folder-open bench's
              * 0x42A8 at PC=0x4027E4 ~25K hits/100 M. Absent from boot
