@@ -4170,6 +4170,66 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + jpdl_pos + 2] = (u8)(jw >> 16);
 
             inline_ops++; done = true;
+        } else if (top == 0x3 && ((w >> 6) & 7) == 4 && mode == 7 && (w & 7) == 4) {
+            /* M6.222 — MOVE.W #imm,-(An). Speedo bench's 0x3F3C
+             * (MOVE.W #imm,-(A7)) at PC=0x038DF6 fires 14 times/100M.
+             * Absent from boot 100M / cycle100m / rom-init / cycle30m
+             * top-40 helper histos.
+             *
+             * .W sibling of M6.78 MOVE.L #imm32,-(An). The 16-bit imm
+             * is at op_pc+2 (compile-time constant). Length 4 (op +
+             * imm.W), cycles 8. */
+            int an = (w >> 9) & 7;
+            u16 imm = mac_read16(cpu->mem, op_pc[i] + 2);
+
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(an), 8);
+            xt_addi(&e, 8, 8, -2);                    /* a8 = new An */
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_pwi = 4, op_cyc_pwi = 8;    /* len 4, 8 cyc */
+            g_helper_touched_mask = (u16)(1u << G_A(an));
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_pwi, op_cyc_pwi)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_pwi, op_cyc_pwi);
+            g_helper_touched_mask = 0xFFFFu;
+            u32 jpwi_pos = e.len;
+            xt_j    (&e, 4);
+
+            /* Fast path: write imm.W as 2 BE bytes; update An. */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);
+            xt_movi (&e, 11, (i32)((imm >> 8) & 0xFF)); xt_s8i(&e, 11, 9, 0);
+            xt_movi (&e, 11, (i32)((imm >> 0) & 0xFF)); xt_s8i(&e, 11, 9, 1);
+            emit_write_g(&e, &rc, G_A(an), 8);
+
+            if (!flags_dead[i]) {
+                /* Compile-time MOVE-family flags from .W imm: N=bit15, Z=(imm==0). */
+                xt_movi (&e, 12, -16);
+                xt_and  (&e, R_SR, R_SR, 12);
+                u32 set_bits = 0;
+                if (imm == 0)            set_bits = 0x04;  /* Z */
+                else if (imm & 0x8000)   set_bits = 0x08;  /* N (.W sign) */
+                if (set_bits) {
+                    xt_movi(&e, 12, (i32)set_bits);
+                    xt_or  (&e, R_SR, R_SR, 12);
+                }
+                g_sr_dirty = true;
+                sext_memo_invalidate();
+            }
+            emit_advance(&e, op_pc_pwi, op_cyc_pwi);
+
+            u32 here_pwi = e.len;
+            i32 jo_pwi = (i32)(here_pwi - jpwi_pos) - 4;
+            u32 jw_pwi = ((u32)((u32)jo_pwi & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jpwi_pos    ] = (u8)jw_pwi;
+            base[entry_off + jpwi_pos + 1] = (u8)(jw_pwi >> 8);
+            base[entry_off + jpwi_pos + 2] = (u8)(jw_pwi >> 16);
+
+            inline_ops++; done = true;
         } else if (top == 0x2 && ((w >> 6) & 7) == 4 && mode == 7 && (w & 7) == 4) {
             /* MOVE.L #imm32,-(An) — immediate push. Bench-hot 0x2F3C
              * (MOVE.L #imm32,-(SP)) at 1008 hits/20 M cyc on the
