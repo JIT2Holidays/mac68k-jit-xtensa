@@ -5250,6 +5250,64 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + jcmpaL_pos + 2] = (u8)(cwL >> 16);
 
             inline_ops++; done = true;
+        } else if (top == 0xB && szf == 2 && ((w >> 8) & 1) == 0 && mode == 5) {
+            /* M6.178 — CMP.L (d16,An),Dn. thinkc8-folder-open bench's
+             * 0xB0AD (CMP.L (d16,A5),D0) at PC=0x3EA88C ~25K hits/100 M.
+             * Absent from boot 100 M and speedo. Sibling of CMP.W
+             * (d16,An),Dn below — same EA + MMIO bridge — but 32-bit
+             * compare so no "shift to high 16" trick is needed.
+             *
+             * Length 4, cycles 8 (interp base 4 + handler 4). CMP is
+             * flag-only — touched_mask = 0u. */
+            int dn = (w >> 9) & 7;
+            int an = w & 7;
+            u16 ext = mac_read16(cpu->mem, op_pc[i] + 2);
+            i32 d16 = (i16)ext;
+
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(an), 8);
+            if (d16 >= -128 && d16 <= 127) xt_addi(&e, 8, 8, d16);
+            else { emit_load_imm32(&e, 11, 12, (u32)d16); xt_add(&e, 8, 8, 11); }
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_cld = 4, op_cyc_cld = 8;
+            g_helper_touched_mask = 0u;
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_cld, op_cyc_cld)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_cld, op_cyc_cld);
+            g_helper_touched_mask = 0xFFFFu;
+            u32 jcld_pos = e.len;
+            xt_j    (&e, 4);
+
+            /* Fast path: read .L (4 BE bytes) → a8; compare against Dn. */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);
+            xt_l8ui (&e, 11, 9, 0);
+            xt_l8ui (&e, 12, 9, 1);
+            xt_slli (&e, 8, 11, 24);
+            xt_slli (&e, 12, 12, 16);
+            xt_or   (&e, 8, 8, 12);
+            xt_l8ui (&e, 11, 9, 2);
+            xt_l8ui (&e, 12, 9, 3);
+            xt_slli (&e, 11, 11, 8);
+            xt_or   (&e, 8, 8, 11);
+            xt_or   (&e, 8, 8, 12);                 /* a8 = .L source */
+            emit_read_g(&e, &rc, G_D(dn), 9);       /* a9 = Dn (full 32) */
+            xt_sub  (&e, 10, 9, 8);                 /* a10 = d - s */
+            emit_addsub_flags_long_masked(&e, true, true, 8, 9, 10, flags_needed[i]);
+            emit_advance(&e, op_pc_cld, op_cyc_cld);
+
+            u32 here_cld = e.len;
+            i32 jo_cld = (i32)(here_cld - jcld_pos) - 4;
+            u32 jw_cld = ((u32)((u32)jo_cld & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jcld_pos    ] = (u8)jw_cld;
+            base[entry_off + jcld_pos + 1] = (u8)(jw_cld >> 8);
+            base[entry_off + jcld_pos + 2] = (u8)(jw_cld >> 16);
+
+            inline_ops++; done = true;
         } else if (top == 0xB && szf == 1 && ((w >> 8) & 1) == 0 && mode == 5) {
             /* CMP.W (d16,An),Dn — bench-hot 0xBC6D (~6.8 %).
              *   EA = a[an] + sext16(d16); read .W; sext to 32; compare
