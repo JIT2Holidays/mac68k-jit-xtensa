@@ -5714,6 +5714,72 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + jorw_pos + 2] = (u8)(jw_orw >> 16);
 
             inline_ops++; done = true;
+        } else if (top == 0x8 && szf == 1 && ((w >> 8) & 1) == 1 && mode == 3) {
+            /* M6.209 — OR.W Dn,(An)+. Sibling of M6.208 with post-
+             * increment of An. Speedo bench's 0x815D (OR.W D0,(A5)+)
+             * at PC=0x4093B4 fires 34 times/100M. Absent from boot
+             * 100M / cycle100m / rom-init / cycle30m top-40 histos.
+             *
+             * Difference from M6.208: (a) after the byte write, An
+             * is incremented by 2 (post-inc semantics); (b) the slow-
+             * path bridge's touched_mask must include G_A(an) so the
+             * cache reloads An from cpu->a[an] (m68k_step's
+             * ea_decode increments cpu->a[an] for mode==3).
+             *
+             * Length 2, cycles 8 (m68k_step base 4 + handler 4). */
+            int dn = (w >> 9) & 7;
+            int an = w & 7;
+
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(an), 8);            /* a8 = An */
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_orw_pi = 2, op_cyc_orw_pi = 8;
+            /* OR.W (An)+ modifies memory + CCR + An. */
+            g_helper_touched_mask = (u16)(1u << G_A(an));
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_orw_pi, op_cyc_orw_pi)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_orw_pi, op_cyc_orw_pi);
+            g_helper_touched_mask = 0xFFFFu;
+            u32 jorwpi_pos = e.len;
+            xt_j    (&e, 4);
+
+            /* Fast path: read .W BE bytes, OR with Dn.W, write back,
+             * then increment An by 2. */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);                      /* a9 = ram + An */
+            xt_l8ui (&e, 10, 9, 0);
+            xt_l8ui (&e, 11, 9, 1);
+            xt_slli (&e, 10, 10, 8);
+            xt_or   (&e, 10, 10, 11);                   /* a10 = .W mem */
+            emit_read_g(&e, &rc, G_D(dn), 11);
+            xt_extui(&e, 12, 11, 0, 15);                /* a12 = Dn[15:0] */
+            xt_or   (&e, 10, 10, 12);                   /* a10 = OR result */
+            xt_extui(&e, 12, 10, 8, 7); xt_s8i(&e, 12, 9, 0);
+            xt_extui(&e, 12, 10, 0, 7); xt_s8i(&e, 12, 9, 1);
+
+            /* Post-increment An by 2. a8 still holds the OLD An. */
+            xt_addi (&e, 11, 8, 2);
+            emit_write_g(&e, &rc, G_A(an), 11);
+
+            if (!flags_dead[i]) {
+                xt_slli (&e, 8, 10, 16);
+                emit_logic_flags(&e, 8);
+            }
+            sext_memo_invalidate();
+            emit_advance(&e, op_pc_orw_pi, op_cyc_orw_pi);
+
+            u32 here_orwpi = e.len;
+            i32 jo_orwpi = (i32)(here_orwpi - jorwpi_pos) - 4;
+            u32 jw_orwpi = ((u32)((u32)jo_orwpi & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jorwpi_pos    ] = (u8)jw_orwpi;
+            base[entry_off + jorwpi_pos + 1] = (u8)(jw_orwpi >> 8);
+            base[entry_off + jorwpi_pos + 2] = (u8)(jw_orwpi >> 16);
+
+            inline_ops++; done = true;
         } else if (top == 0x4 && ((w >> 8) & 0xF) == 0x2 && szf == 2 && mode == 5) {
             /* M6.182 — CLR.L (d16,An). thinkc8-folder-open bench's
              * 0x42A8 at PC=0x4027E4 ~25K hits/100 M. Absent from boot
