@@ -5593,11 +5593,19 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             xt_and  (&e, 10, 8, 9);
             emit_cache_flush(&e, &rc);
             i32 op_pc_mxL = 4, op_cyc_mxL = 8;
+            /* M6.240b — slow path uses HELPER_JIT_MOVE_L_AN_TO_DN_MMIO
+             * (M6.144's generic addr→Dn .L helper). bullseye's 0x2C36
+             * (MOVE.L (d8,A6,Xn),D6) fires this MMIO bridge ~97K times. */
             g_helper_touched_mask = (u16)(1u << G_D(dn));
-            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_mxL, op_cyc_mxL)));
-            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
-                                              entry_off, &rc, op_pc_mxL, op_cyc_mxL);
+            g_helper_arg_mask = 3u;
+            u32 mxL_bridge_size = emit_jit_fast_helper_size(&rc);
+            xt_beqz (&e, 10, (i32)(6u + mxL_bridge_size));
+            emit_jit_fast_helper(&e, 8, dn,
+                                 lit_off[HELPER_JIT_MOVE_L_AN_TO_DN_MMIO],
+                                 entry_off, &rc);
             g_helper_touched_mask = 0xFFFFu;
+            g_helper_arg_mask = 3u;
+            (void)op_pc_mxL; (void)op_cyc_mxL;
             u32 jmxL_pos = e.len;
             xt_j    (&e, 4);
 
