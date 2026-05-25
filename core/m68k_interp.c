@@ -750,6 +750,29 @@ void m68k_jit_tst_b_mmio(m68k_cpu *cpu) {
     m68k_set_ccr(cpu, ccr);
 }
 
+/* M6.198 — RTE fast helper. Boot 100M's 0x4E73 at PC=0x401A82 fires
+ * 390 times — exception return. Skips m68k_step's decode + cpu->instrs
+ * increment.
+ *
+ * Semantics (per m68k_interp.c:1043):
+ *   bool was = m68k_is_super(cpu);
+ *   u16 sr = mac_read16(a[7]);    cpu->a[7] += 2;
+ *   u32 pc = mac_read32(a[7]);    cpu->a[7] += 4;
+ *   cpu->sr = sr; cpu->pc = pc;
+ *   m68k_sync_sp(cpu, was);
+ *
+ * No args. Block terminator (helper sets cpu->pc). */
+void m68k_jit_rte(m68k_cpu *cpu) {
+    bool was = m68k_is_super(cpu);
+    u32 a7 = cpu->a[7];
+    u16 sr = mac_read16(cpu->mem, a7);
+    u32 pc = mac_read32(cpu->mem, a7 + 2);
+    cpu->a[7] = a7 + 6;
+    cpu->sr = sr;
+    cpu->pc = pc;
+    m68k_sync_sp(cpu, was);
+}
+
 /* M6.193 — MOVE (An)+,SR fast helper. thinkc8-folder-open bench's
  * 0x46DF (MOVE (A7)+,SR) at PC=0x4027E0 ~25K hits/100 M (critical-
  * section SR-restore pattern). Skips m68k_step's decode + cpu->instrs

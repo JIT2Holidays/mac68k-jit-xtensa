@@ -2452,6 +2452,34 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
 
             sext_memo_invalidate();
             inline_ops++; done = true;
+        } else if (w == 0x4E73) {
+            /* M6.198 — RTE. Boot 100M's 0x4E73 at PC=0x401A82 fires
+             * 390 times — exception return path. Absent from speedo,
+             * thinkc8, cycle100m, boot 5M det — only boot 100M hits.
+             *
+             * Uses m68k_jit_rte fast helper (skips m68k_step's decode/
+             * cpu->instrs++). The helper does the full RTE sequence
+             * including m68k_sync_sp for possible S-bit change. No
+             * args; touches a[7], cpu->sr, cpu->pc (and possibly
+             * USP/SSP via sync_sp).
+             *
+             * Length 2, cycles 4 (interp returns early — no +N after
+             * the RTE handler). Block terminator (helper sets pc). */
+            emit_advance_flush(&e);   /* cpu->pc = op_pc */
+            emit_cache_flush(&e, &rc);
+            /* Helper writes a[7] and cpu->sr; touched_mask covers a[7]. */
+            g_helper_touched_mask = (u16)(1u << G_A(7));
+            g_helper_arg_mask = 0u;   /* no args */
+            g_helper_terminal_no_fastpath = true;   /* block terminator */
+            emit_jit_fast_helper(&e, 8, 0,
+                                 lit_off[HELPER_JIT_RTE],
+                                 entry_off, &rc);
+            g_helper_touched_mask = 0xFFFFu;
+            g_helper_arg_mask = 3u;
+            g_helper_terminal_no_fastpath = false;
+            emit_advance(&e, 0, 4);    /* helper sets cpu->pc; cyc base 4 */
+            sext_memo_invalidate();
+            inline_ops++; done = true;
         } else if (w == 0x4EBA) {
             /* JSR (d16,PC) — push return address, jump to PC + 2 + sext_d16.
              * Block terminator. Bench-hot at 2563 hits/20 M cyc on the
