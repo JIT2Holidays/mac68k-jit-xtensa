@@ -7450,6 +7450,73 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                  * falling through. M6.131 reset at iter start cleans up. */
                 g_helper_touched_mask = 0u;
             }
+        } else if ((w & 0xFFC0) == 0x4840 && ((w >> 3) & 7) == 5) {
+            /* M6.184 — PEA (d16,An). thinkc8-folder-open bench's 0x486E
+             * (PEA (d16,A6)) at PC=0x3E97D2 ~25K hits/100 M. Absent from
+             * boot 100M and speedo. Trajectory-safe.
+             *
+             * Semantics (per m68k_interp.c:1125):
+             *   ea = a[an] + sext16(d16);
+             *   cpu->a[7] -= 4;
+             *   mac_write32(cpu->mem, cpu->a[7], ea);
+             *
+             * No CCR effect. Length 4 (op + d16), cycles 16 (base 4 +
+             * handler 12). */
+            int an = w & 7;
+            i16 d16 = (i16)mac_read16(cpu->mem, op_pc[i] + 2);
+
+            emit_advance_flush(&e);
+            /* Compute ea = a[an] + d16 → a8 (the value to push). */
+            emit_read_g(&e, &rc, G_A(an), 8);
+            if (d16 >= -128 && d16 <= 127) {
+                xt_addi(&e, 8, 8, d16);
+            } else {
+                emit_load_imm32(&e, 11, 12, (u32)(i32)d16);
+                xt_add(&e, 8, 8, 11);
+            }
+            /* Compute new SP = a[7] - 4 → a11. Bounds check on a11. */
+            emit_read_g(&e, &rc, G_A(7), 11);
+            xt_addi(&e, 11, 11, -4);                    /* a11 = new SP */
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 11, 9);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_pea = 4, op_cyc_pea = 16;
+            g_helper_touched_mask = (u16)(1u << G_A(7));
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_pea, op_cyc_pea)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_pea, op_cyc_pea);
+            g_helper_touched_mask = 0xFFFFu;
+            u32 jpea_pos = e.len;
+            xt_j    (&e, 4);
+
+            /* Fast path:
+             *   a[7] = a11 (= new SP)
+             *   mac_write32(a11, a8 = ea_to_push) via 4 BE bytes. */
+            emit_write_g(&e, &rc, G_A(7), 11);
+
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 11);                     /* a9 = ram + new SP */
+            xt_extui(&e, 12, 8, 24, 7);
+            xt_s8i  (&e, 12, 9, 0);
+            xt_extui(&e, 12, 8, 16, 7);
+            xt_s8i  (&e, 12, 9, 1);
+            xt_extui(&e, 12, 8,  8, 7);
+            xt_s8i  (&e, 12, 9, 2);
+            xt_extui(&e, 12, 8,  0, 7);
+            xt_s8i  (&e, 12, 9, 3);
+
+            emit_advance(&e, op_pc_pea, op_cyc_pea);
+
+            u32 here_pea = e.len;
+            i32 jo_pea = (i32)(here_pea - jpea_pos) - 4;
+            u32 jw_pea = ((u32)((u32)jo_pea & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jpea_pos    ] = (u8)jw_pea;
+            base[entry_off + jpea_pos + 1] = (u8)(jw_pea >> 8);
+            base[entry_off + jpea_pos + 2] = (u8)(jw_pea >> 16);
+
+            inline_ops++; done = true;
         } else if (top == 0x4 && ((w >> 8) & 0xF) == 0xA && szf == 1
                    && mode == 7 && (w & 7) == 0) {
             /* M6.179 — TST.W (xxx).W. thinkc8-folder-open bench's
