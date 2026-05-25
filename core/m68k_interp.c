@@ -773,6 +773,48 @@ void m68k_jit_rte(m68k_cpu *cpu) {
     m68k_sync_sp(cpu, was);
 }
 
+/* M6.204 — BTST/BCHG/BCLR/BSET Dn,(An) MMIO fast helper. Slow-path
+ * conversion for M6.202's inline arm: when An lands outside RAM
+ * (MMIO range, etc.) the bridge used to call m68k_step which decodes
+ * the opcode from scratch and increments cpu->instrs. This helper
+ * skips both — saves ~30 LX7 per fire and drops real_helpers by the
+ * same count.
+ *
+ * Args:
+ *   jit_arg1 = guest EA address (already runtime-computed in the arm
+ *              from An, before the bounds check).
+ *   jit_arg2 = packed (which << 4) | dn:
+ *              which: 0=BTST, 1=BCHG, 2=BCLR, 3=BSET
+ *              dn:    source Dn register (0..7) for bit number
+ *
+ * Mirrors do_bitop()'s memory path (mode != 0, sz=1): bit number is
+ * Dn & 7; sets only Z; for non-BTST modifies the byte. PC/cycle
+ * advance is handled by the JIT arm's emit_advance — the helper
+ * touches neither cpu->pc nor cpu->cycles.
+ *
+ * Boot 100M's 0x09D1 (BSET D4,(A1)) at PC=0x40025E fires 696 times
+ * with A1 → MMIO. Boot-cycle100m fires 688, boot-rom-init fires 688.
+ * Per the [[slow-path-conversion-threshold]] rule (≥150 fires safe),
+ * 696 is well above the M6.162 threshold. */
+void m68k_jit_bitop_dn_an_mmio(m68k_cpu *cpu) {
+    u32 addr   = cpu->jit_arg1;
+    u32 packed = cpu->jit_arg2;
+    int which  = (int)((packed >> 4) & 3);
+    int dn     = (int)(packed & 7);
+    int bit    = (int)(cpu->d[dn] & 7);
+    u8 v       = mac_read8(cpu->mem, addr);
+    u8 mask    = (u8)(1u << bit);
+    u8 ccr     = m68k_get_ccr(cpu) & (u8)~CCR_Z;
+    if (!(v & mask)) ccr |= CCR_Z;
+    m68k_set_ccr(cpu, ccr);
+    switch (which) {
+        case 0: break;                                       /* BTST */
+        case 1: mac_write8(cpu->mem, addr, (u8)(v ^ mask)); break;  /* BCHG */
+        case 2: mac_write8(cpu->mem, addr, (u8)(v & (u8)~mask)); break; /* BCLR */
+        case 3: mac_write8(cpu->mem, addr, (u8)(v | mask)); break;  /* BSET */
+    }
+}
+
 /* M6.193 — MOVE (An)+,SR fast helper. thinkc8-folder-open bench's
  * 0x46DF (MOVE (A7)+,SR) at PC=0x4027E0 ~25K hits/100 M (critical-
  * section SR-restore pattern). Skips m68k_step's decode + cpu->instrs

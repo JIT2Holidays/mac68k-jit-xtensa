@@ -9064,13 +9064,27 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             xt_and  (&e, 10, 8, 11);
             emit_cache_flush(&e, &rc);
             i32 op_pc_bch = 2, op_cyc_bch = 8;
-            /* Helper path: m68k_step writes byte (BCHG/BCLR/BSET) +
-             * CCR. touched_mask=0u — no D/A reg modified. */
+            /* M6.204 — MMIO bridge converted from default m68k_step to
+             * a custom fast helper that skips decode + cpu->instrs++.
+             * Boot 100M's 0x09D1 (BSET D4,(A1)) fires 696 times via
+             * this bridge (A1 → MMIO), boot-cycle100m 688, boot-rom-
+             * init 688. Per [[slow-path-conversion-threshold]] 696
+             * fires is well above the M6.162 150-fire threshold.
+             *
+             * touched_mask=0u: helper doesn't write any D/A reg
+             *   (reads cpu->d[dn] but doesn't write it).
+             * arg_mask=3u: arg1=addr (a8), arg2=(which<<4)|dn.
+             * sr_mask=3u (default): reads X bit, writes Z bit. */
             g_helper_touched_mask = 0u;
-            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_bch, op_cyc_bch)));
-            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
-                                              entry_off, &rc, op_pc_bch, op_cyc_bch);
+            g_helper_arg_mask = 3u;
+            int packed_arg2 = (which << 4) | dn;
+            u32 fh_size_bch = emit_jit_fast_helper_size(&rc);
+            xt_beqz (&e, 10, (i32)(6u + fh_size_bch));
+            emit_jit_fast_helper(&e, 8 /* a8 = addr */, packed_arg2,
+                                 lit_off[HELPER_JIT_BITOP_DN_AN_MMIO],
+                                 entry_off, &rc);
             g_helper_touched_mask = 0xFFFFu;
+            g_helper_arg_mask = 3u;
             u32 jbch_pos = e.len;
             xt_j    (&e, 4);
 
