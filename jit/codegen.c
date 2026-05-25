@@ -5589,6 +5589,125 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + jmxL_pos + 2] = (u8)(jw_mxL >> 16);
 
             inline_ops++; done = true;
+        } else if (top == 0x2 && ((w >> 6) & 7) == 5 && mode == 6) {
+            /* M6.229 — MOVE.L (d8,An,Xn),(d16,Am) mem-to-mem.
+             * boot-system-load's 0x2F72 (MOVE.L (d8,A2,Xn),(d16,A7))
+             * at PC=0x401F74 fires 229,358 times via default m68k_step
+             * bridge (src EA in MMIO each time). Speedo's 25 fires,
+             * boot-cycle100m's 6 fires, boot-rom-init's 6 fires — all
+             * well below the trajectory-shift threshold and outside
+             * the boot 100M top-40. Category 4b safe per
+             * [[bridge-only-arms-trajectory-shift]].
+             *
+             * Sibling pair: M6.215 MOVE.L (d8,An,Xn),Dn (same src EA
+             * decode) + M6.175 MOVE.L (xxx).W,(d16,An) (.L dst write
+             * pattern). Uses the two-register-arg helper bridge
+             * established in M6.228.
+             *
+             * Length 6 (op + brief ext + d16 ext), cycles 8 (m68k_step
+             * base 4 + MOVE handler 4 at core/m68k_interp.c:1120). */
+            int src_an_m229 = w & 7;
+            int dst_an_m229 = (w >> 9) & 7;
+            u16 src_ext_m229 = mac_read16(cpu->mem, op_pc[i] + 2);
+            u16 dst_ext_m229 = mac_read16(cpu->mem, op_pc[i] + 4);
+            int  ireg_m229    = (src_ext_m229 >> 12) & 7;
+            bool is_an_m229   = (src_ext_m229 & 0x8000) != 0;
+            bool is_long_m229 = (src_ext_m229 & 0x0800) != 0;
+            i32  d8_m229      = (i8)(src_ext_m229 & 0xFF);
+            i32  d16_m229     = (i16)dst_ext_m229;
+
+            emit_advance_flush(&e);
+            /* Compute src EA into a8 (mirror M6.215). */
+            emit_read_g(&e, &rc, G_A(src_an_m229), 8);
+            emit_read_g(&e, &rc,
+                        is_an_m229 ? G_A(ireg_m229) : G_D(ireg_m229), 9);
+            if (!is_long_m229) {
+                xt_slli(&e, 9, 9, 16);
+                xt_srai(&e, 9, 9, 16);
+            }
+            xt_add(&e, 8, 8, 9);
+            if (d8_m229 != 0) xt_addi(&e, 8, 8, d8_m229);
+
+            /* Compute dst EA into a15. */
+            emit_read_g(&e, &rc, G_A(dst_an_m229), 15);
+            if (d16_m229 >= -128 && d16_m229 <= 127) {
+                if (d16_m229 != 0) xt_addi(&e, 15, 15, d16_m229);
+            } else {
+                emit_load_imm(&e, 11, 12, (u32)d16_m229);
+                xt_add (&e, 15, 15, 11);
+            }
+
+            /* Src bounds: .L RAM only (even-aligned). Bounds-byte
+             * versions admit odd addresses which would corrupt the
+             * fast path's 4-BE-byte read; LITERAL_RAM_BOUNDS has the
+             * `| 1` that fails odd. */
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);                  /* a10 = src OOB mask */
+            xt_and  (&e, 11, 15, 9);                 /* a11 = dst OOB mask */
+            xt_or   (&e, 12, 10, 11);                /* a12 == 0 iff both OK */
+
+            emit_cache_flush(&e, &rc);
+
+            /* --- Manual 2-reg helper bridge (M6.228 pattern). --- */
+            u32 m229_bridge_size = 3u*5u;           /* s32i, s32i, mov, l32r, callx0 */
+            m229_bridge_size += 3u;                  /* emit_sr_reload */
+            if (g_sr_dirty) m229_bridge_size += 3u;  /* emit_sr_flush */
+            xt_beqz (&e, 12, (i32)(6u + m229_bridge_size));
+            sext_memo_invalidate();
+            if (g_sr_dirty) emit_sr_flush(&e);
+            xt_s32i(&e, 8,  R_CPU, OFF_JIT_ARG1);
+            xt_s32i(&e, 15, R_CPU, OFF_JIT_ARG2);
+            xt_mov (&e, R_ARG, R_CPU);
+            emit_l32r_at(&e, R_HELP,
+                         lit_off[HELPER_JIT_MOVE_L_ADDR_TO_ADDR_MMIO],
+                         entry_off + e.len);
+            xt_callx0(&e, R_HELP);
+            g_block_emitted_callx0 = true;
+            emit_sr_reload(&e);
+            /* No cache_reload — helper doesn't touch D/A. */
+            u32 jm229_pos = e.len;
+            xt_j    (&e, 4);
+
+            /* Fast path: read 4 BE bytes from src into a10 (.L). */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);
+            xt_l8ui (&e, 11, 9, 0);
+            xt_l8ui (&e, 12, 9, 1);
+            xt_slli (&e, 10, 11, 24);
+            xt_slli (&e, 12, 12, 16);
+            xt_or   (&e, 10, 10, 12);
+            xt_l8ui (&e, 11, 9, 2);
+            xt_l8ui (&e, 12, 9, 3);
+            xt_slli (&e, 11, 11, 8);
+            xt_or   (&e, 10, 10, 11);
+            xt_or   (&e, 10, 10, 12);             /* a10 = .L source */
+
+            /* Write 4 BE bytes to dst. */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 15);
+            xt_extui(&e, 11, 10, 24, 7);
+            xt_s8i  (&e, 11, 9, 0);
+            xt_extui(&e, 11, 10, 16, 7);
+            xt_s8i  (&e, 11, 9, 1);
+            xt_extui(&e, 11, 10,  8, 7);
+            xt_s8i  (&e, 11, 9, 2);
+            xt_extui(&e, 11, 10,  0, 7);
+            xt_s8i  (&e, 11, 9, 3);
+
+            if (!flags_dead[i]) emit_logic_flags(&e, 10);
+            emit_advance(&e, 6, 8);
+
+            u32 here_m229 = e.len;
+            i32 jo_m229 = (i32)(here_m229 - jm229_pos) - 4;
+            u32 jw_m229 = ((u32)((u32)jo_m229 & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jm229_pos    ] = (u8)jw_m229;
+            base[entry_off + jm229_pos + 1] = (u8)(jw_m229 >> 8);
+            base[entry_off + jm229_pos + 2] = (u8)(jw_m229 >> 16);
+
+            inline_ops++; done = true;
         } else if (top == 0xD && szf == 2 && ((w >> 8) & 1) == 0 && mode == 6) {
             /* M6.216 — ADD.L (d8,An,Xn),Dn. Speedo bench's 0xD2B1
              * (ADD.L (d8,A1,Xn),D1) at PC=0x408DD8 fires 34 times/100M.

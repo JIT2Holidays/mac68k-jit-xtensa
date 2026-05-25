@@ -93,6 +93,40 @@ produced a sub-window (1.36% diff). Then iterate inside.
 
 These tools are reusable for any future Mac-Plus interactive scripting.
 
+## M6.229 — MOVE.L (d8,An,Xn),(d16,Am) mem-to-mem — boot-system-load → helpers=0 🎯🎯🎯
+
+**boot-system-load reaches helpers=0 — same milestone the thinkc8-folder-open
+bench reached at M6.193.** boot-system-load's final hotspot 0x2F72
+(MOVE.L (d8,A2,Xn),(d16,A7)) at PC=0x401F74 was firing 229,358 times
+per 100 M cycles. Inlined with the two-register-arg helper pattern
+established in M6.228 — sibling of M6.215 MOVE.L (d8,An,Xn),Dn (same
+indexed src EA decode) + M6.175 MOVE.L (xxx).W,(d16,An) (.L dst write).
+
+Length 6 (op + brief ext + d16 ext), cycles 8. Helper
+m68k_jit_move_l_addr_to_addr_mmio takes jit_arg1=src and jit_arg2=dst
+(both runtime-computed in the inline arm), does mac_read32 +
+mac_write32 + MOVE-family CCR.
+
+Bench impact:
+| Bench | M6.228 baseline | M6.229 | Δ |
+|---|---:|---:|---:|
+| **boot-system-load** | 229,358 / 1.854 | **0 / 1.786** | **−229,358 / −3.66 %** |
+| speedo | 1281 / 1.179 | 1256 / 1.179 | −25 (0x2F72's 25 speedo fires) |
+| boot-cycle100m | 1428 / 1.634 | 1422 / 1.634 | −6 (boot-cycle100m's 6 fires) |
+| boot-rom-init | 232,275 / 1.662 | 232,106 / 1.662 | −169 (M6.66 noise reverted; boot-rom-init's 6 fires absorbed) |
+| all others | unchanged | unchanged | 0 |
+
+ctest 11/11; diff.sh 321 blocks match.
+
+**Cumulative M6.225-M6.229 boot-system-load delta — milestone:**
+| Metric | Pre-M6.225 | Post-M6.229 | Δ |
+|---|---:|---:|---:|
+| helpers/100M | 802,753 | **0** | **−100 %** |
+| lx7/cyc | 2.140 | **1.786** | **−16.5 %** |
+
+Five inline arms in one /loop iteration. Two new bench targets now
+sit at helpers=0 (thinkc8-folder-open and boot-system-load).
+
 ## M6.228 — MOVE.B (d16,An),(d16,Am) mem-to-mem MMIO fast helper — boot-system-load 1.955 → 1.854 lx7/cyc (−5.17 %), −229,358 helpers 🎯🎯
 
 The biggest single-arm win of this iteration. boot-system-load's

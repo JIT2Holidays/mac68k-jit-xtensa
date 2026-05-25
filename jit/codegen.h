@@ -67,6 +67,7 @@ typedef enum {
     HELPER_JIT_BITOP_DN_AN_MMIO,          /* M6.204 — BTST/BCHG/BCLR/BSET Dn,(An) MMIO fast helper */
     HELPER_JIT_MOVE_L_XXXW_TO_AN_MMIO,    /* M6.225 — MOVE.L (xxx).W,(An) MMIO fast helper */
     HELPER_JIT_MOVE_B_ADDR_TO_ADDR_MMIO,  /* M6.228 — MOVE.B (d16,An),(d16,Am) mem-to-mem MMIO fast helper */
+    HELPER_JIT_MOVE_L_ADDR_TO_ADDR_MMIO,  /* M6.229 — MOVE.L src,dst mem-to-mem MMIO fast helper */
     /* M6.76 — ROM-source read fast path. Used by the MOVE.L (An)+,(Am)+
      * mem-to-mem inline arm so that bench's ROM-resident pointer-table
      * reads (~71K hits/20M cyc) can take a fast path instead of falling
