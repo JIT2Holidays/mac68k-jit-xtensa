@@ -5752,6 +5752,64 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + jorw_pos + 2] = (u8)(jw_orw >> 16);
 
             inline_ops++; done = true;
+        } else if (top == 0x3 && ((w >> 6) & 7) == 3 && ((w >> 3) & 7) == 0) {
+            /* M6.214 — MOVE.W Dn,(An)+. Speedo bench's 0x3AC0
+             * (MOVE.W D0,(A5)+) at PC=0x4092B0 and 0x3AC6 (MOVE.W
+             * D0,(A6)+) fire 18 each ≈ 36+ cumulative. Absent from
+             * boot 100M / cycle100m / rom-init / cycle30m top-40
+             * helper histos.
+             *
+             * Like M6.208/M6.209 (OR.W Dn,(An)/(An)+) but no OR — just
+             * write Dn[15:0] as 2 BE bytes, post-inc An by 2, set logic
+             * flags from .W value.
+             *
+             * Length 2, cycles 8 (m68k_step base 4 + handler 4). */
+            int dn_dst_reg = (w >> 9) & 7;       /* dst An register */
+            int dm_src     = w & 7;              /* src Dn register */
+
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(dn_dst_reg), 8);   /* a8 = An */
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_mwpi = 2, op_cyc_mwpi = 8;
+            /* MOVE.W Dn,(An)+ modifies CCR + An (postinc). */
+            g_helper_touched_mask = (u16)(1u << G_A(dn_dst_reg));
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_mwpi, op_cyc_mwpi)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_mwpi, op_cyc_mwpi);
+            g_helper_touched_mask = 0xFFFFu;
+            u32 jmwpi_pos = e.len;
+            xt_j    (&e, 4);
+
+            /* Fast path: write 2 BE bytes (Dn.W), increment An by 2. */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);                      /* a9 = ram + An */
+            emit_read_g(&e, &rc, G_D(dm_src), 11);      /* a11 = Dn */
+            xt_extui(&e, 12, 11, 8, 7); xt_s8i(&e, 12, 9, 0);
+            xt_extui(&e, 12, 11, 0, 7); xt_s8i(&e, 12, 9, 1);
+
+            /* Post-increment An by 2. */
+            xt_addi (&e, 12, 8, 2);
+            emit_write_g(&e, &rc, G_A(dn_dst_reg), 12);
+
+            if (!flags_dead[i]) {
+                xt_slli (&e, 8, 11, 16);                /* .W sign at bit 31 */
+                emit_logic_flags(&e, 8);
+            }
+            sext_memo_invalidate();
+            emit_advance(&e, op_pc_mwpi, op_cyc_mwpi);
+
+            u32 here_mwpi = e.len;
+            i32 jo_mwpi = (i32)(here_mwpi - jmwpi_pos) - 4;
+            u32 jw_mwpi = ((u32)((u32)jo_mwpi & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jmwpi_pos    ] = (u8)jw_mwpi;
+            base[entry_off + jmwpi_pos + 1] = (u8)(jw_mwpi >> 8);
+            base[entry_off + jmwpi_pos + 2] = (u8)(jw_mwpi >> 16);
+
+            inline_ops++; done = true;
         } else if (top == 0x8 && szf == 1 && ((w >> 8) & 1) == 1 && mode == 3) {
             /* M6.209 — OR.W Dn,(An)+. Sibling of M6.208 with post-
              * increment of An. Speedo bench's 0x815D (OR.W D0,(A5)+)
