@@ -5907,6 +5907,65 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + jorw_pos + 2] = (u8)(jw_orw >> 16);
 
             inline_ops++; done = true;
+        } else if (top == 0x3 && ((w >> 6) & 7) == 1 && mode == 5) {
+            /* M6.218 — MOVEA.W (d16,An),Am. Speedo bench's 0x346E
+             * (MOVEA.W (d16,A6),A2) at PC=0x409338 fires 26/100M,
+             * 0x366E (MOVEA.W (d16,A6),A3) at PC=0x40933C fires 27,
+             * = 53 cumulative + other variants. Absent from boot 100M
+             * / cycle100m / rom-init / cycle30m top-40 helper histos.
+             *
+             * MOVEA.W sign-extends .W src to 32-bit, writes to Am.
+             * No CCR side effect. Length 4 (op + d16), cycles 8. */
+            int dst_am = (w >> 9) & 7;
+            int src_an = w & 7;
+            u16 ext = mac_read16(cpu->mem, op_pc[i] + 2);
+            i32 d16 = (i16)ext;
+
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(src_an), 8);
+            if (d16 >= -128 && d16 <= 127) {
+                xt_addi(&e, 8, 8, d16);
+            } else {
+                emit_load_imm(&e, 11, 12, (u32)d16);
+                xt_add (&e, 8, 8, 11);
+            }
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_mAW = 4, op_cyc_mAW = 8;
+            /* MOVEA.W writes only Am (no CCR). */
+            g_helper_touched_mask = (u16)(1u << G_A(dst_am));
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_mAW, op_cyc_mAW)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_mAW, op_cyc_mAW);
+            g_helper_touched_mask = 0xFFFFu;
+            u32 jmAW_pos = e.len;
+            xt_j    (&e, 4);
+
+            /* Fast path: read 2 BE bytes, sign-extend .W to .L, write to Am. */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);
+            xt_l8ui (&e, 11, 9, 0);
+            xt_l8ui (&e, 12, 9, 1);
+            xt_slli (&e, 10, 11, 8);
+            xt_or   (&e, 10, 10, 12);                  /* a10 = .W src (zero-ext) */
+            xt_slli (&e, 10, 10, 16);                  /* shift to high 16 */
+            xt_srai (&e, 10, 10, 16);                  /* arith shift back: sign-ext */
+            emit_write_g(&e, &rc, G_A(dst_am), 10);
+            /* MOVEA — no flag emit. */
+            sext_memo_invalidate();
+            emit_advance(&e, op_pc_mAW, op_cyc_mAW);
+
+            u32 here_mAW = e.len;
+            i32 jo_mAW = (i32)(here_mAW - jmAW_pos) - 4;
+            u32 jw_mAW = ((u32)((u32)jo_mAW & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jmAW_pos    ] = (u8)jw_mAW;
+            base[entry_off + jmAW_pos + 1] = (u8)(jw_mAW >> 8);
+            base[entry_off + jmAW_pos + 2] = (u8)(jw_mAW >> 16);
+
+            inline_ops++; done = true;
         } else if (top == 0x3 && ((w >> 6) & 7) == 3 && ((w >> 3) & 7) == 5) {
             /* M6.217 — MOVE.W (d16,An),(Am)+. Speedo bench's 0x346E
              * (MOVE.W (d16,A6),(A2)+) at PC=0x409338 fires 26/100M,
