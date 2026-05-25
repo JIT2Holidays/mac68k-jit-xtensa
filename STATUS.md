@@ -624,13 +624,18 @@ divergence chaotic region (see `memory/m6.66-trajectory-traps.md`), so
 new inline arms shift the trajectory more than they shave LX7. The path
 forward is structural, not piecemeal. Three items, biggest-win-first:
 
-**Progress summary (post-M6.200):**
+**Progress summary (post-M6.206):**
 
 | Item | State | Notes |
 |------|-------|-------|
-| 1. Full register caching | mostly done | Cache miss rate < 1 % on steady-state. **thinkc8 36 % miss** but absolute count tiny (~75/200). M6.197 cache-slot canonicalization (sort `rc.guest[]` by guest reg index after picking) was tried — functionally correct but zero measurable chain_cache_matches change because most blocks have ≤1 slot and are already trivially canonical. Widening to 6+ slots needs asm trampolines on ESP32 or repurposing a8..a12. Untestable on host. |
-| 2. Lazy-CC classifier | partial (M6.158/162-164 + M6.198/199) | Per-helper SR + arg masks delivered across 7 non-SR helpers + 3 MOVE-family unused-arg1 helpers + F-line/A-line traps. M6.198 RTE custom helper. M6.199 ADDQ.L (xxx).W skip_flags inline (with the necessary lazy-CC whitelist entry at `~codegen.c:1995`). **Per-flag CCR liveness (split N/Z/V/C liveness) blocked by diff_jit_trace** (`memory/per-flag-ccr-blocked.md`): interp always computes all bits, so masked emits diverge at block boundaries. The measured thinkc8 gain was −1.7 % lx7/cyc but is unmergeable without (a) an interp lazy-CC mode or (b) a `cpu->sr_lazy` field. |
-| 3. Native ESP32 chaining | infrastructure ready (M6.54) | Host-unmeasurable. Awaiting on-device benchmark. The infrastructure (`predicted_next_entry`, `chain_entry_addr`, `cache_sig` compat) is in place and used. ESP32 boot 100M should see ~5–15 LX7 saved per chained block. |
+| 1. Full register caching | **saturated** | Cache miss rate < 1 % on steady-state per `memory/cache-hit-rate-analysis.md`. M6.197 cache-slot canonicalization tried — zero measurable change because most blocks have ≤1 slot. Widening to 6+ slots needs asm trampolines on ESP32; untestable on host. Item 1 has no further host-measurable wins. |
+| 2. Lazy-CC classifier | **partial (M6.158/162-164 + M6.198/199 + M6.204 + M6.206); fusion is the open path** | Per-helper SR + arg masks delivered across 7 non-SR helpers + 3 MOVE-family unused-arg1 helpers + F-line/A-line traps. M6.198 RTE custom helper. M6.199 ADDQ.L (xxx).W skip_flags inline. M6.204 BSET D4,(A1) MMIO fast-helper conversion. **Per-flag CCR liveness blocked by diff_jit_trace** (`memory/per-flag-ccr-blocked.md`): interp always computes all 5 CCR bits, so masked emits diverge at block boundaries — the measured thinkc8 gain was −1.7 % lx7/cyc but unmergeable. **Workaround path: instruction fusion that bypasses R_SR entirely** — `emit_cmp_cond_fused` is the canonical pattern (~15 call sites in M6.95/M6.147/M6.178/M6.180/M6.194/M6.195/M6.196/M6.206 etc). The fusion path is correctness-safe because the condition is computed inline from (s, d, r) without ever writing R_SR, so no diff_jit_trace blocker. Currently supports cc ∈ {NE, EQ, BLT, BLE}; expanding to {BPL, BMI, BGE, BGT, BHI, BLS, BCC, BCS} would broaden coverage. |
+| 3. Native ESP32 chaining | infrastructure ready (M6.54) | Host-unmeasurable. Awaiting on-device benchmark. The infrastructure (`predicted_next_entry`, `chain_entry_addr`, `cache_sig` compat) is in place and used. ESP32 boot 100M should see ~5–15 LX7 saved per chained block. No further host work possible. |
+
+**Item 2 (fusion expansion) is the actionable next move.** Each new cc
+value supported by `emit_cmp_cond_fused` benefits every existing
+CMP/CMPI/TST + Bcc.S/Bcc.W fusion site. Pure expansion of an existing
+correctness-proven pattern — no diff_jit_trace risk.
 
 **Most actionable next moves (post-M6.200):**
 
