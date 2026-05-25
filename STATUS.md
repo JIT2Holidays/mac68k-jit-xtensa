@@ -624,18 +624,61 @@ divergence chaotic region (see `memory/m6.66-trajectory-traps.md`), so
 new inline arms shift the trajectory more than they shave LX7. The path
 forward is structural, not piecemeal. Three items, biggest-win-first:
 
-**Progress summary (post-M6.206):**
+**Progress summary (post-M6.220):**
 
 | Item | State | Notes |
 |------|-------|-------|
-| 1. Full register caching | **saturated** | Cache miss rate < 1 % on steady-state per `memory/cache-hit-rate-analysis.md`. M6.197 cache-slot canonicalization tried — zero measurable change because most blocks have ≤1 slot. Widening to 6+ slots needs asm trampolines on ESP32; untestable on host. Item 1 has no further host-measurable wins. |
-| 2. Lazy-CC classifier | **partial (M6.158/162-164 + M6.198/199 + M6.204 + M6.206); fusion is the open path** | Per-helper SR + arg masks delivered across 7 non-SR helpers + 3 MOVE-family unused-arg1 helpers + F-line/A-line traps. M6.198 RTE custom helper. M6.199 ADDQ.L (xxx).W skip_flags inline. M6.204 BSET D4,(A1) MMIO fast-helper conversion. **Per-flag CCR liveness blocked by diff_jit_trace** (`memory/per-flag-ccr-blocked.md`): interp always computes all 5 CCR bits, so masked emits diverge at block boundaries — the measured thinkc8 gain was −1.7 % lx7/cyc but unmergeable. **Workaround path: instruction fusion that bypasses R_SR entirely** — `emit_cmp_cond_fused` is the canonical pattern (~15 call sites in M6.95/M6.147/M6.178/M6.180/M6.194/M6.195/M6.196/M6.206 etc). The fusion path is correctness-safe because the condition is computed inline from (s, d, r) without ever writing R_SR, so no diff_jit_trace blocker. Currently supports cc ∈ {NE, EQ, BLT, BLE}; expanding to {BPL, BMI, BGE, BGT, BHI, BLS, BCC, BCS} would broaden coverage. |
-| 3. Native ESP32 chaining | infrastructure ready (M6.54) | Host-unmeasurable. Awaiting on-device benchmark. The infrastructure (`predicted_next_entry`, `chain_entry_addr`, `cache_sig` compat) is in place and used. ESP32 boot 100M should see ~5–15 LX7 saved per chained block. No further host work possible. |
+| 1. Full register caching | **saturated** | Cache miss rate < 1 % on steady-state per `memory/cache-hit-rate-analysis.md`. M6.197 cache-slot canonicalization tried — zero measurable change. Widening to 6+ slots needs asm trampolines on ESP32; untestable on host. No further host-measurable wins. |
+| 2. Lazy-CC classifier | **partial (M6.158/162-164 + M6.198/199 + M6.204 + M6.206 + M6.210 fusion)** | Per-helper SR/arg masks delivered. Per-flag CCR liveness still blocked by diff_jit_trace per `memory/per-flag-ccr-blocked.md` — M6.207 attempt confirmed the existing fusion's latent bug only happens to dodge divergence by coincidence; adding BPL/BMI/BGE/BGT exposed it. The fusion-expansion workaround is itself blocked. |
+| 3. Native ESP32 chaining | infrastructure ready (M6.54) | Host-unmeasurable. Awaiting on-device benchmark. ESP32 boot 100M should see ~5–15 LX7 saved per chained block. No further host work possible. |
 
-**Item 2 (fusion expansion) is the actionable next move.** Each new cc
-value supported by `emit_cmp_cond_fused` benefits every existing
-CMP/CMPI/TST + Bcc.S/Bcc.W fusion site. Pure expansion of an existing
-correctness-proven pattern — no diff_jit_trace risk.
+**THE FRONTIER WASN'T ACTUALLY SATURATED — M6.208-M6.220 added 12 inline arms in ~8 iterations:**
+
+| MS | Pattern | Speedo helpers Δ |
+|----|---------|----------------:|
+| M6.208 | OR.W Dn,(An) | **−156** |
+| M6.209 | OR.W Dn,(An)+ | −34 |
+| M6.210 | CMP.W (An)+,Dn + Bcc.S/W fusion | −61 |
+| M6.211 | AND.W (An),Dn | −37 |
+| M6.213 | MOVE.W An,Dn | −61 |
+| M6.214 | MOVE.W Dn,(An)+ | −64 |
+| M6.215 | MOVE.L (d8,An,Xn),Dn | −45 |
+| M6.216 | ADD.L (d8,An,Xn),Dn | −34 |
+| M6.217 | MOVE.W (d16,An),(Am)+ | −16 |
+| M6.218 | MOVEA.W (d16,An),Am | −53 |
+| M6.219 | MOVE.L (d16,An),-(Am) | −33 |
+| M6.220 | ADD.B/SUB.B (d16,An),Dn | −26 |
+| **Total** | | **−620 (−36.1 %)** |
+
+Plus 3 reverts that refined the rules: M6.207 (fusion expansion exposed latent bug),
+M6.212 (full ADD with mem dest tripped boot 100M trajectory), M6.216-first (mis-decoded opcode).
+
+**Why the "saturated" narrative was wrong:** the refined
+`bridge-only-arms-trajectory-shift` category 4b — NEW bridge arm WITH
+a RAM fast path AND opcode absent from boot 100M top-40 — is
+MEDIUM-LOW risk, not HIGH risk. M6.208 first proved this; the rest
+of the series followed. The previously-saturated narrative was
+mostly correct about register-caching/native-chaining but missed
+that speedo's top-40 still had ~13 actionable sibling-extension
+candidates.
+
+**Methodology that worked:**
+1. Pick next speedo top-40 entry above ~25 fires.
+2. Verify bit-exact decode (M6.216-first/M6.217 lesson: misread
+   = wasted iteration). Use `python3 -c "op = ...; ..."` to
+   double-check before writing the arm predicate.
+3. Find closest sibling arm template.
+4. Adapt EA compute + flag emit. Watch for the
+   bridge-only-arms-category-4b risk (RAM fast path required).
+5. Test ALL 8 benches; revert if ANY boot snap regresses by even
+   a small amount (the M6.212 lesson — even +198 boot helpers is
+   a regression worth reverting).
+
+Remaining speedo top entries above 25 fires are all in known-blocked
+or higher-complexity territory: variable shifts (encoder), TST.B/L
+(An) (M6.148 catastrophic), MMIO bridges of inlined arms, JMP indirect,
+SUBQ.L mem RMW (M6.212-class risk), PC-relative indexed (literal-pool
+infra needed), ADD.L mem dest (M6.212 reverted).
 
 **Most actionable next moves (post-M6.200):**
 
