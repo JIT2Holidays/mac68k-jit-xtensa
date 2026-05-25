@@ -8589,22 +8589,38 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
         } else if (top == 0x0 && !((w >> 8) & 1) && ((w >> 9) & 7) == 6
                    && szf == 1 && mode == 2) {
             /* M6.172 — CMPI.W #imm,(An). thinkc8-folder-open bench's
-             * 0x0C50 at PC=0x3E5814 — Finder linked-list walk's inner
-             * compare against a tagged record byte. ~50K hits / 100 M.
-             * Absent from boot 100 M and speedo. Trajectory-safe per
-             * the M6.142 predicate.
+             * 0x0C50 at PC=0x3E5814 ~50K hits / 100 M. Absent from
+             * boot 100 M and speedo.
              *
-             * Sibling of M6.80 CMPI.W (d16,An) at line below: same
-             * compare + flag-set + MMIO bridge structure; just no d16
-             * (EA = An). Length 4 (op + imm16), cycles 8. */
+             * M6.195 — fused with Bcc.S when the next op is BNE/BEQ/
+             * BLT/BLE with non-trivial disp. Saves ~12 LX7/fire by
+             * skipping the R_SR write + emit_cond. */
             int src_an = w & 7;
             u16 imm = mac_read16(cpu->mem, op_pc[i] + 2);
             i32 imm32 = (i32)(i16)imm;
 
+            /* M6.195 fusion eligibility. */
+            bool fuse = false;
+            int fuse_cc = 0;
+            i32 fuse_disp = 0;
+            u32 fuse_ft = 0;
+            if (i + 1 < n_ops) {
+                u16 nw = op_word[i + 1];
+                if ((nw >> 12) == 0x6) {
+                    int cc = (nw >> 8) & 0xF;
+                    i32 disp = (i8)(nw & 0xFF);
+                    if ((cc == 6 || cc == 7 || cc == 13 || cc == 15) && disp != 0 && disp != -1) {
+                        fuse = true;
+                        fuse_cc = cc;
+                        fuse_disp = disp;
+                        fuse_ft = op_pc[i + 1] + 2;
+                    }
+                }
+            }
+
             emit_advance_flush(&e);
             emit_read_g(&e, &rc, G_A(src_an), 8);     /* a8 = An (EA) */
-            /* Unified RAM-or-ROM bounds (source might be ROM-resident
-             * Toolbox data). Mirrors M6.80 CMPI.W (d16,An). */
+            /* Unified RAM-or-ROM bounds. */
             emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
                          entry_off + e.len);
             xt_and  (&e, 10, 8, 9);
@@ -8618,10 +8634,22 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             emit_cache_flush(&e, &rc);
             i32 op_pc_ci2 = 4, op_cyc_ci2 = 8;
             g_helper_touched_mask = 0u;            /* CMP flag-only */
-            xt_beqz (&e, 12, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_ci2, op_cyc_ci2)));
+            u32 helper_skip2 = helper_step_after_flush_undo_size(&rc, op_pc_ci2, op_cyc_ci2);
+            u32 helper_tail2 = fuse ? fused_helper_bcc_tail_size(fuse_cc) : 0u;
+            xt_beqz (&e, 12, (i32)(6u + helper_skip2 + helper_tail2));
             emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
                                               entry_off, &rc, op_pc_ci2, op_cyc_ci2);
             g_helper_touched_mask = 0xFFFFu;
+            if (fuse) {
+                /* Helper path Bcc tail. The bridge undid m68k_step's
+                 * natural advance; we fold CMPI.W 8 + Bcc.S 12 = 20. */
+                u32 before = e.len;
+                emit_cond(&e, fuse_cc);
+                emit_bcc_branchless_tail(&e, fuse_ft, fuse_disp, 20);
+                if (e.len - before != helper_tail2) {
+                    e.overflow = true;
+                }
+            }
             u32 jci2_pos = e.len;
             xt_j    (&e, 4);
             /* Fast path: pick base via a10 (RAM_BASE when a10==0). */
@@ -8643,10 +8671,15 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             xt_slli (&e, 8, 8, 16);
             /* r = d - s → a10. */
             xt_sub  (&e, 10, 9, 8);
-            if (!flags_dead[i]) {
-                emit_addsub_flags_long_masked(&e, true, true, 8, 9, 10, flags_needed[i]);
+            if (fuse) {
+                emit_cmp_cond_fused(&e, fuse_cc, 8, 9, 10);
+                emit_bcc_branchless_tail(&e, fuse_ft, fuse_disp, 20);
+            } else {
+                if (!flags_dead[i]) {
+                    emit_addsub_flags_long_masked(&e, true, true, 8, 9, 10, flags_needed[i]);
+                }
+                emit_advance(&e, op_pc_ci2, op_cyc_ci2);
             }
-            emit_advance(&e, op_pc_ci2, op_cyc_ci2);
 
             u32 here_ci2 = e.len;
             i32 jo_ci2 = (i32)(here_ci2 - jci2_pos) - 4;
@@ -8654,6 +8687,12 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + jci2_pos    ] = (u8)jw_ci2;
             base[entry_off + jci2_pos + 1] = (u8)(jw_ci2 >> 8);
             base[entry_off + jci2_pos + 2] = (u8)(jw_ci2 >> 16);
+
+            if (fuse) {
+                g_pc_acc = 0;
+                g_cyc_acc = 0;
+                i++;
+            }
 
             inline_ops++; done = true;
         } else if (top == 0x0 && !((w >> 8) & 1) && ((w >> 9) & 7) == 6
