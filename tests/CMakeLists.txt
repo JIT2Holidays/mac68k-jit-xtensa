@@ -112,3 +112,17 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/roms/disks/boot-cycle100m.snap")
                      --max-cycles 100000
              WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endif()
+
+# M6.203 — boot cycle 30M snapshot. Falls between boot-rom-init=4M
+# and boot-system-load=60M. The boot ROM trap dispatcher phase with
+# very low helper count (8 per 100M cyc) and lowest lx7/cyc across
+# all six benches (1.334). Deterministic to ≥10M cycles (111K blocks).
+# Regenerate via scripts/snap-cycle30m.sh.
+if(EXISTS "${CMAKE_SOURCE_DIR}/roms/disks/boot-cycle30m.snap")
+    add_test(NAME diff_jit_boot_cycle30m_lockstep
+             COMMAND $<TARGET_FILE:mac68k_host>
+                     --diff-jit-trace --no-irq
+                     --load-snapshot ${CMAKE_SOURCE_DIR}/roms/disks/boot-cycle30m.snap
+                     --max-cycles 100000
+             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+endif()
