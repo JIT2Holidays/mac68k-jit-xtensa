@@ -26,7 +26,7 @@ All seven active targets have ctest diff_jit_trace coverage (11K
 cycles for speedo, 100K for boot snaps after M6.201) — see
 `tests/CMakeLists.txt`.
 
-### MacBench 4.0 — infeasible on Mac Plus 🚫
+### MacBench 4.0 — infeasible on Mac Plus 🚫 (concrete blocker captured)
 
 The "make MacBench 4.0 work end-to-end" directive runs into a hard
 compatibility wall. From the InfiniteHD6 disk's own About-MacBench text:
@@ -40,6 +40,25 @@ We emulate a **Mac Plus** (68000, System 6.0.8, max 4 MB RAM). MacBench
 will refuse to start regardless of how it's launched. The InfiniteHD6
 also doesn't include older MacBench versions (3.0 / 2.0 / etc.) that
 would be compatible.
+
+**Concrete error confirmed empirically (Apr 2026):** Navigated Finder
+to InfiniteHD → Utilities → MacBench 4.0 → double-clicked the app.
+The OS rejected the launch with:
+
+> The application 'MacBench® 4.0' could not be opened (9,500K needed,
+> 3,621K available). Try quitting from another application to increase
+> unused memory.
+
+So MacBench's 9.5 MB partition exceeds Mac Plus's 4 MB total RAM
+(≈3.6 MB free after System 6 loads). Memory is the FIRST wall —
+the OS blocks launch before MacBench's own CPU/System version checks
+fire. Even with `--ram-mb 12` the Mac Plus ROM crashes during boot
+because it doesn't expect >4 MB.
+
+Pivot for the bench rotation: instead of MacBench, the new
+**thinkc-bullseye** target (#8 above, 2.222 lx7/cyc, 2.1M
+real_helpers/100M) serves a similar "rich opcode mix" role with
+genuinely running Mac code.
 
 ### THINK C IDE — full end-to-end DONE 🎯
 
