@@ -37,6 +37,7 @@ void m68k_jit_fline_trap(m68k_cpu *cpu);
 void m68k_jit_move_l_an_to_dn_mmio(m68k_cpu *cpu);
 void m68k_jit_clr_w_anpi_mmio(m68k_cpu *cpu);
 void m68k_jit_tst_b_mmio(m68k_cpu *cpu);
+void m68k_jit_aline_trap(m68k_cpu *cpu);
 
 /* Run the pure interpreter until cpu->cycles >= until or the CPU halts.
  * Polls interrupts and ticks the peripherals between instructions. */

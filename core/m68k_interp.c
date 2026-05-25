@@ -750,6 +750,17 @@ void m68k_jit_tst_b_mmio(m68k_cpu *cpu) {
     m68k_set_ccr(cpu, ccr);
 }
 
+/* M6.190 — A-line trap fast helper. thinkc8-folder-open bench's
+ * 0xA000-0xAFFF range fires ~25 K times/100 M cyc (Toolbox trap
+ * dispatch). Sibling of m68k_jit_fline_trap below — just calls
+ * m68k_exception(cpu, 10).
+ *
+ * Note: skips the m68k_trap_hook call. Trace mode (MAC68K_TRACE_FROM/
+ * _TO) won't see line-A traces under --jit; use --interp if needed. */
+void m68k_jit_aline_trap(m68k_cpu *cpu) {
+    m68k_exception(cpu, 10);
+}
+
 /* M6.137 — F-line trap fast helper. Bench-hot 0xFFFF at 21 808 hits /
  * 100 M cyc (the bench's M6.66-equivalent divergence zone fetches
  * 0xFFFF from unmapped memory, which top-nibble F decodes to line-F).

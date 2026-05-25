@@ -2169,6 +2169,32 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
         if (top == 0x7) {                  /* MOVEQ */
             emit_moveq(&e, w, flags_dead[i], &rc);
             inline_ops++; done = true;
+        } else if (top == 0xA) {
+            /* M6.190 — A-line trap (Toolbox dispatch). thinkc8-folder-
+             * open bench's 0xA000-0xAFFF range fires ~25 K times/100 M
+             * (Toolbox _LoadSeg / _SetPort / etc. traps). Absent from
+             * boot 100 M and speedo helper-histos in this opcode space.
+             * Sibling of M6.137 line-F trap — same skip-m68k_step
+             * structure, just calls m68k_exception(10) instead of (11).
+             *
+             * Block terminator — m68k_exception sets cpu->pc to vector
+             * 10 (A-line emulator). Length 2; cycles 4 (m68k_step base)
+             * emitted via emit_advance + 34 from m68k_exception = 38
+             * total. */
+            emit_advance_flush(&e);
+            emit_cache_flush(&e, &rc);
+            g_helper_touched_mask = (u16)(1u << G_A(7));
+            g_helper_arg_mask = 0u;
+            g_helper_terminal_no_fastpath = true;
+            emit_jit_fast_helper(&e, 8, 0,
+                                 lit_off[HELPER_JIT_ALINE_TRAP],
+                                 entry_off, &rc);
+            g_helper_touched_mask = 0xFFFFu;
+            g_helper_arg_mask = 3u;
+            g_helper_terminal_no_fastpath = false;
+            emit_advance(&e, 0, 4);
+            sext_memo_invalidate();
+            inline_ops++; done = true;
         } else if (top == 0xF) {
             /* M6.137 — F-line trap. Bench-hot 0xFFFF at 21 808 hits /
              * 100 M cyc (the bench's M6.66-equivalent divergence zone
