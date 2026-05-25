@@ -5957,16 +5957,53 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
         } else if (top == 0xB && szf == 2 && ((w >> 8) & 1) == 0 && mode == 5) {
             /* M6.178 — CMP.L (d16,An),Dn. thinkc8-folder-open bench's
              * 0xB0AD (CMP.L (d16,A5),D0) at PC=0x3EA88C ~25K hits/100 M.
-             * Absent from boot 100 M and speedo. Sibling of CMP.W
-             * (d16,An),Dn below — same EA + MMIO bridge — but 32-bit
-             * compare so no "shift to high 16" trick is needed.
              *
-             * Length 4, cycles 8 (interp base 4 + handler 4). CMP is
-             * flag-only — touched_mask = 0u. */
+             * M6.196 — Bcc.S/Bcc.W fusion. The thinkc8 hot site's
+             * follow-up is Bcc.W (0x6600 NNNN) — long branch with
+             * 16-bit displacement — so fusion must accept both
+             * Bcc.S (8-bit disp inline) and Bcc.W (16-bit disp in
+             * ext word). */
             int dn = (w >> 9) & 7;
             int an = w & 7;
             u16 ext = mac_read16(cpu->mem, op_pc[i] + 2);
             i32 d16 = (i16)ext;
+
+            /* M6.196 fusion eligibility: Bcc.S (disp != 0/-1) OR
+             * Bcc.W (disp byte == 0, disp from ext word). */
+            bool fuse = false;
+            bool fuse_w = false;          /* true = Bcc.W, false = Bcc.S */
+            int  fuse_cc = 0;
+            i32  fuse_disp = 0;           /* signed displacement */
+            u32  fuse_ft = 0;             /* fall-through PC */
+            if (i + 1 < n_ops) {
+                u16 nw = op_word[i + 1];
+                if ((nw >> 12) == 0x6) {
+                    int cc = (nw >> 8) & 0xF;
+                    if (cc == 6 || cc == 7 || cc == 13 || cc == 15) {
+                        u8 disp8 = nw & 0xFFu;
+                        if (disp8 == 0) {
+                            /* Bcc.W — 16-bit disp in the ext word. */
+                            i32 disp16 = (i16)mac_read16(cpu->mem,
+                                                        op_pc[i + 1] + 2);
+                            fuse = true;
+                            fuse_w = true;
+                            fuse_cc = cc;
+                            fuse_disp = disp16;
+                            fuse_ft = op_pc[i + 1] + 4;
+                        } else if (disp8 != 0xFF) {
+                            /* Bcc.S — 8-bit disp inline. */
+                            i32 disp = (i8)disp8;
+                            if (disp != 0 && disp != -1) {
+                                fuse = true;
+                                fuse_w = false;
+                                fuse_cc = cc;
+                                fuse_disp = disp;
+                                fuse_ft = op_pc[i + 1] + 2;
+                            }
+                        }
+                    }
+                }
+            }
 
             emit_advance_flush(&e);
             emit_read_g(&e, &rc, G_A(an), 8);
@@ -5978,10 +6015,25 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             emit_cache_flush(&e, &rc);
             i32 op_pc_cld = 4, op_cyc_cld = 8;
             g_helper_touched_mask = 0u;
-            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_cld, op_cyc_cld)));
+            u32 helper_skip_cld = helper_step_after_flush_undo_size(&rc, op_pc_cld, op_cyc_cld);
+            u32 helper_tail_cld = fuse ? fused_helper_bcc_tail_size(fuse_cc) : 0u;
+            xt_beqz (&e, 10, (i32)(6u + helper_skip_cld + helper_tail_cld));
             emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
                                               entry_off, &rc, op_pc_cld, op_cyc_cld);
             g_helper_touched_mask = 0xFFFFu;
+            if (fuse) {
+                /* Slow-path Bcc tail. CMP.L 8 + Bcc 12 = 20 folded.
+                 * For Bcc.W, ft is op_pc + 4 but disp16 is rel to
+                 * op_pc + 2 — pass disp - 2 to make ft + disp = taken
+                 * (mirrors M6.106 BRA.W/Bcc.W arm at line 6906). */
+                u32 before = e.len;
+                emit_cond(&e, fuse_cc);
+                i32 tail_disp = fuse_w ? (fuse_disp - 2) : fuse_disp;
+                emit_bcc_branchless_tail(&e, fuse_ft, tail_disp, 20);
+                if (e.len - before != helper_tail_cld) {
+                    e.overflow = true;
+                }
+            }
             u32 jcld_pos = e.len;
             xt_j    (&e, 4);
 
@@ -6001,8 +6053,14 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             xt_or   (&e, 8, 8, 12);                 /* a8 = .L source */
             emit_read_g(&e, &rc, G_D(dn), 9);       /* a9 = Dn (full 32) */
             xt_sub  (&e, 10, 9, 8);                 /* a10 = d - s */
-            emit_addsub_flags_long_masked(&e, true, true, 8, 9, 10, flags_needed[i]);
-            emit_advance(&e, op_pc_cld, op_cyc_cld);
+            if (fuse) {
+                emit_cmp_cond_fused(&e, fuse_cc, 8, 9, 10);
+                i32 tail_disp = fuse_w ? (fuse_disp - 2) : fuse_disp;
+                emit_bcc_branchless_tail(&e, fuse_ft, tail_disp, 20);
+            } else {
+                emit_addsub_flags_long_masked(&e, true, true, 8, 9, 10, flags_needed[i]);
+                emit_advance(&e, op_pc_cld, op_cyc_cld);
+            }
 
             u32 here_cld = e.len;
             i32 jo_cld = (i32)(here_cld - jcld_pos) - 4;
@@ -6010,6 +6068,12 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + jcld_pos    ] = (u8)jw_cld;
             base[entry_off + jcld_pos + 1] = (u8)(jw_cld >> 8);
             base[entry_off + jcld_pos + 2] = (u8)(jw_cld >> 16);
+
+            if (fuse) {
+                g_pc_acc = 0;
+                g_cyc_acc = 0;
+                i++;
+            }
 
             inline_ops++; done = true;
         } else if (top == 0xB && szf == 1 && ((w >> 8) & 1) == 0 && mode == 5) {
