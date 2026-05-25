@@ -11855,8 +11855,15 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             u8 src_reg = (dn_xt >= 0) ? (u8)dn_xt : 8;
             if (dn_xt < 0) emit_read_g(&e, &rc, G_D(dn), 8);
 
-            /* a9 = src.size. */
-            xt_extui(&e, 9, src_reg, 0, size_bits - 1);
+            /* a9 = src.size.
+             * M6.232 follow-up: same xt_extui(0, 31) truncation bug
+             * applies here for .L. See [[xt-extui-32-bit-truncation]]
+             * memory note. Branch on size_bits == 32 to use mov instead. */
+            if (size_bits == 32) {
+                xt_mov(&e, 9, src_reg);
+            } else {
+                xt_extui(&e, 9, src_reg, 0, size_bits - 1);
+            }
 
             /* Iterate `imm` times — unrolled. a10 = last_out (final C). */
             for (int k = 0; k < imm; k++) {
@@ -11864,7 +11871,9 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                     /* ROL: last_out = bit (size-1); val = (val<<1 | last_out). */
                     xt_extui(&e, 10, 9, size_bits - 1, 0);
                     xt_slli (&e, 9, 9, 1);
-                    xt_extui(&e, 9, 9, 0, size_bits - 1);
+                    if (size_bits != 32) {
+                        xt_extui(&e, 9, 9, 0, size_bits - 1);
+                    }
                     xt_or   (&e, 9, 9, 10);
                 } else {
                     /* ROR: last_out = bit 0; val = (val>>1 | last_out<<(size-1)). */
@@ -11875,11 +11884,16 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                 }
             }
 
-            /* Merge result into Dn (preserve upper bits). */
-            xt_srli (&e, 12, src_reg, size_bits);
-            xt_slli (&e, 12, 12, size_bits);
             u8 dst_reg = (dn_xt >= 0) ? (u8)dn_xt : 8;
-            xt_or   (&e, dst_reg, 12, 9);
+            if (size_bits == 32) {
+                /* a9 already has the full 32-bit result. */
+                xt_mov(&e, dst_reg, 9);
+            } else {
+                /* Merge result into Dn (preserve upper bits). */
+                xt_srli (&e, 12, src_reg, size_bits);
+                xt_slli (&e, 12, 12, size_bits);
+                xt_or   (&e, dst_reg, 12, 9);
+            }
 
             if (dn_xt >= 0) {
                 for (int s = 0; s < rc.active; s++)
