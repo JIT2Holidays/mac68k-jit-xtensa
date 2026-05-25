@@ -5033,6 +5033,121 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + jclrl_pos + 2] = (u8)(jw_clrl >> 16);
 
             inline_ops++; done = true;
+        } else if (top == 0x4 && ((w >> 8) & 0xF) == 0x2 && szf == 1 && mode == 2) {
+            /* M6.181 — CLR.W (An). thinkc8-folder-open bench's 0x4250
+             * at PC=0x4027E2 ~25K hits/100 M. Absent from boot 100 M
+             * and speedo. Trajectory-safe.
+             *
+             * Sibling of CLR.W (An)+ just below — same memory write
+             * and Z-flag pattern, but no An post-increment. Uses the
+             * default m68k_step helper for MMIO (simpler — no An mod
+             * means we don't need a dedicated fast helper).
+             *
+             * Length 2, cycles 8 (interp base 4 + handler 4). CCR:
+             * Z=1, N=V=C=0, X preserved. */
+            int an = w & 7;
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(an), 8);
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_cwa = 2, op_cyc_cwa = 8;
+            /* CLR.W (An) writes only CCR (no D/A reg). */
+            g_helper_touched_mask = 0u;
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_cwa, op_cyc_cwa)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_cwa, op_cyc_cwa);
+            g_helper_touched_mask = 0xFFFFu;
+            u32 jcwa_pos = e.len;
+            xt_j    (&e, 4);
+
+            /* Fast path: write 2 zero bytes at [ram_base + An]. */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);
+            xt_movi (&e, 11, 0);
+            xt_s8i  (&e, 11, 9, 0);
+            xt_s8i  (&e, 11, 9, 1);
+            if (!flags_dead[i]) {
+                /* CLR flags: keep X (bit 4-up), clear N/Z/V/C, then OR Z=0x04. */
+                xt_movi (&e, 12, -16);
+                xt_and  (&e, R_SR, R_SR, 12);
+                xt_movi (&e, 12, 0x04);
+                xt_or   (&e, R_SR, R_SR, 12);
+                g_sr_dirty = true;
+                sext_memo_invalidate();
+            }
+            emit_advance(&e, op_pc_cwa, op_cyc_cwa);
+
+            u32 here_cwa = e.len;
+            i32 jo_cwa = (i32)(here_cwa - jcwa_pos) - 4;
+            u32 jw_cwa = ((u32)((u32)jo_cwa & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jcwa_pos    ] = (u8)jw_cwa;
+            base[entry_off + jcwa_pos + 1] = (u8)(jw_cwa >> 8);
+            base[entry_off + jcwa_pos + 2] = (u8)(jw_cwa >> 16);
+
+            inline_ops++; done = true;
+        } else if (top == 0x4 && ((w >> 8) & 0xF) == 0x2 && szf == 2 && mode == 5) {
+            /* M6.182 — CLR.L (d16,An). thinkc8-folder-open bench's
+             * 0x42A8 at PC=0x4027E4 ~25K hits/100 M. Absent from boot
+             * 100 M and speedo. Trajectory-safe.
+             *
+             * Companion of CLR.W (An) just above — same pattern but
+             * .L (4 bytes) and EA = An + d16.
+             *
+             * Length 4 (op + d16), cycles 8. Z=1, N=V=C=0, X preserved. */
+            int an = w & 7;
+            i16 d16 = (i16)mac_read16(cpu->mem, op_pc[i] + 2);
+
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(an), 8);
+            if (d16 >= -128 && d16 <= 127) {
+                xt_addi(&e, 8, 8, d16);
+            } else {
+                emit_load_imm32(&e, 11, 12, (u32)(i32)d16);
+                xt_add(&e, 8, 8, 11);
+            }
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_cld2 = 4, op_cyc_cld2 = 8;
+            g_helper_touched_mask = 0u;
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_cld2, op_cyc_cld2)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_cld2, op_cyc_cld2);
+            g_helper_touched_mask = 0xFFFFu;
+            u32 jcld2_pos = e.len;
+            xt_j    (&e, 4);
+
+            /* Fast path: write 4 zero bytes at [ram_base + EA]. */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);
+            xt_movi (&e, 11, 0);
+            xt_s8i  (&e, 11, 9, 0);
+            xt_s8i  (&e, 11, 9, 1);
+            xt_s8i  (&e, 11, 9, 2);
+            xt_s8i  (&e, 11, 9, 3);
+            if (!flags_dead[i]) {
+                xt_movi (&e, 12, -16);
+                xt_and  (&e, R_SR, R_SR, 12);
+                xt_movi (&e, 12, 0x04);
+                xt_or   (&e, R_SR, R_SR, 12);
+                g_sr_dirty = true;
+                sext_memo_invalidate();
+            }
+            emit_advance(&e, op_pc_cld2, op_cyc_cld2);
+
+            u32 here_cld2 = e.len;
+            i32 jo_cld2 = (i32)(here_cld2 - jcld2_pos) - 4;
+            u32 jw_cld2 = ((u32)((u32)jo_cld2 & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jcld2_pos    ] = (u8)jw_cld2;
+            base[entry_off + jcld2_pos + 1] = (u8)(jw_cld2 >> 8);
+            base[entry_off + jcld2_pos + 2] = (u8)(jw_cld2 >> 16);
+
+            inline_ops++; done = true;
         } else if (top == 0x4 && ((w >> 8) & 0xF) == 0x2 && szf == 1 && mode == 3) {
             /* CLR.W (An)+ — bench-hot 0x4258 at ~23 % of all helpers (M6.73).
              * Speedometer runs a memset-zero loop body that hammers this.

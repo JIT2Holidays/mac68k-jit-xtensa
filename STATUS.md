@@ -492,13 +492,37 @@ divergence chaotic region (see `memory/m6.66-trajectory-traps.md`), so
 new inline arms shift the trajectory more than they shave LX7. The path
 forward is structural, not piecemeal. Three items, biggest-win-first:
 
-**Progress summary (post-M6.164):**
+**Progress summary (post-M6.180):**
 
 | Item | State | Notes |
 |------|-------|-------|
-| 1. Full register caching | mostly done | Cache miss rate already < 1 %. Widening is low-ceiling. The "trampoline-preserves-a4..a7" sub-item remains as a possible follow-up (asm-required on ESP32, untestable on host). |
-| 2. Lazy-CC classifier | partial (M6.158 + M6.162-164) | Per-helper SR + arg masks delivered across 7 non-SR helpers + 3 MOVE-family unused-arg1 helpers + F-line trap. MOVE-family X-bit refactor remains (marginal). Saturated on host. |
-| 3. Native ESP32 chaining | infrastructure ready | Host-unmeasurable. Awaiting on-device benchmark. |
+| 1. Full register caching | mostly done | Cache miss rate < 1 % on steady-state (bench/boot 100 M). **thinkc8 is the outlier at 36 % miss** but absolute compile-time counts are tiny (~75 misses across ~200 accesses per the 100 M run). Widening from 4 → 6+ slots requires repurposing a8..a12 scratch or asm trampolines (Item 1 sub). Untestable on host. |
+| 2. Lazy-CC classifier | partial (M6.158 + M6.162-164) | Per-helper SR + arg masks delivered across 7 non-SR helpers + 3 MOVE-family unused-arg1 helpers + F-line trap. MOVE-family X-bit refactor remains (marginal). Per-flag CCR (split N/Z/V/C/X liveness) would be a meaningful step but requires a significant flags_dead[] refactor. |
+| 3. Native ESP32 chaining | infrastructure ready (M6.54) | Host-unmeasurable. Awaiting on-device benchmark. |
+
+**Most actionable next moves (post-M6.180):**
+
+Continued inline arms remain the highest-yield gap. The thinkc8
+helper-histo post-M6.180 still has 13 opcodes at ~25 K hits each
+(CLR.W/L variants, PEA, index-mode MOVE/CMPI, MOVE-from-SR / ORI #imm,SR,
+AND.L (xxx).W). Each matches the M6.142 trajectory-safety predicate
+(absent from boot 100 M and speedo). Cumulative cap: another ~10 %
+on thinkc8 lx7/cyc.
+
+Structural targets that would unlock new ground beyond the current
+saturation:
+* MOVE-family X-bit pass-through (Item 2 refinement) — requires
+  splitting `cpu->sr` low byte from the T/S/IPL high byte to avoid
+  the RMW. Worth ~3 LX7/fire across MOVE.B/W/L helpers. ~50 LX7
+  bytes of helper rework.
+* Per-flag CCR liveness (Item 2 follow-up) — replace `flags_dead[k]`
+  bool with 5-bit mask, propagate through `flags_needed[]` per flag.
+  Lets ADDQ/SUBQ-then-Bcc.NE patterns elide V/C computation. ~80 LX7
+  bytes of liveness pass rework.
+* Cache widening to 5-6 slots (Item 1 sub) — repurpose `a8` or `a13`
+  conditionally when block analysis shows no inline emit needs the
+  scratch. ~5-10 % of the host xt_instrs cost on thinkc8 is the
+  l32i/s32i emits the cache would eliminate.
 
 **Host-perf saturation (memory/host-perf-saturation.md):** post-M6.164
 the host-measurable optimization frontier is saturated. Cataloged
