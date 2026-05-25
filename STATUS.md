@@ -41,32 +41,46 @@ will refuse to start regardless of how it's launched. The InfiniteHD6
 also doesn't include older MacBench versions (3.0 / 2.0 / etc.) that
 would be compatible.
 
-### THINK C IDE running — partial progress
+### THINK C IDE running — partial progress (trap-trace confirmed)
 
 The `thinkc8-folder-open` snapshot captures the Finder steady-state
 with the THINK C 8 folder window open — this is already in the bench
 rotation as target #3 at 1.389 lx7/cyc.
 
-Extending to **THINK C 5.0 IDE actively running** (compile or edit
-state) was attempted this iteration. Key findings:
+Extending to **THINK C IDE actively running** (compile or edit
+state) is in progress. Key findings (trap-trace verified):
 
 1. **Window activation prerequisite.** Clicks inside the THINK C 8
    folder's content area don't register until ANY one click first
    "activates" the window. Empirically: a single click on the
    THINK C Debugger 5.0 icon at (435, 305) at cycle ~1.5B activates
    subsequent clicks within the window.
-2. **THINK C 5.0 icon at (335, 305).** Single-clicks select it
-   reliably (1.67% framebuffer diff = selection highlight).
-3. **Double-click and File→Open both produce a sub-window, not an
-   app launch.** Indicates the "THINK C 5.0" item inside THINK C 8
-   is actually a *folder* (or alias to a folder), not the IDE
-   executable itself. The real IDE is presumably one level deeper
-   in the folder hierarchy.
-4. **Deeper navigation needs more scripted clicks.** Each level of
-   Finder navigation adds ~300-400M cycles of OS work to the snap
-   recipe, and trajectory chaos compounds across levels. A full
-   THINK C running snap is feasible but needs an iteration budget
-   for the navigation sweep.
+2. **The icon at (335, 305) is named "THINK C" (not "THINK C 5.0")
+   and IS A FOLDER**, not the IDE executable. Confirmed via Cmd-I
+   Get Info — dialog reports `Kind: folder, Size: 5,003,396 bytes
+   used, 6,120K on disk for 263 files`. The IDE is inside this
+   folder (one level deeper).
+3. **Cmd-key shortcuts trigger `_MenuSelect` (0xA938)**, not
+   `_MenuKey` (0xA93D) as expected. Verified working: Cmd-W (close
+   window, 12.15% diff), Cmd-N (new folder, 1.61% diff + visible
+   new folder), Cmd-I (Get Info dialog, 8.84% diff). All worked
+   with 5M-cycle inter-event spacing (Cmd-down, +5M key-down, +5M
+   key-up, +5M Cmd-up).
+4. **Cmd-O does NOT visibly open the THINK C folder** even when it
+   IS selected and active. Selection is confirmed valid (Cmd-I
+   works on same state). Hypothesis: Cmd-O is opening the folder
+   into a new Finder window that's drawn off-screen or behind
+   existing windows. Earlier File→Open via menu drag showed a
+   1.36% diff that might have been a new sub-window in middle of
+   screen. Future iteration: scroll/move sub-window to verify.
+5. **Trap-trace shows _GetNextEvent alternating between mouse-only
+   (mask=2) and all-events (mask=0xFFFFFFFF) polling.** Key events
+   delivered after several poll cycles — typical Mac OS event-loop
+   pattern. No anomaly here.
+
+Future iteration: drag/move the THINK C folder sub-window to a
+visible area after Cmd-O, or use the existing File→Open path that
+produced a sub-window (1.36% diff). Then iterate inside.
 
 **Infrastructure built during this directive attempt (kept):**
 * `scripts/framediff.sh` — byte-level BMP diff for click-effect detection
