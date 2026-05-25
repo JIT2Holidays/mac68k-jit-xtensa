@@ -7909,14 +7909,21 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             xt_and  (&e, 10, 8, 9);
             emit_cache_flush(&e, &rc);   /* before conditional helper */
             i32 op_pc_cwd = 4, op_cyc_cwd = 8;
-            /* M6.129 — CMP.W (d16,An),Dn modifies only CCR. */
+            /* M6.241 — slow path uses custom CMP.W MMIO helper instead
+             * of m68k_step. bullseye fires CMP.W (d16,An),Dn family
+             * (0xB66E + 0xB06E + 0xB46E) ~52K combined. The helper
+             * computes set_flags_cmp on (s, d, r) for sz=2. */
             g_helper_touched_mask = 0u;
-            u32 helper_skip = helper_step_after_flush_undo_size(&rc, op_pc_cwd, op_cyc_cwd);
+            g_helper_arg_mask = 3u;
+            u32 cwd_bridge_size = emit_jit_fast_helper_size(&rc);
             u32 helper_bcc_tail_size = fuse ? fused_helper_bcc_tail_size(fuse_cc) : 0;
-            xt_beqz (&e, 10, (i32)(6u + helper_skip + helper_bcc_tail_size));
-            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
-                                              entry_off, &rc, op_pc_cwd, op_cyc_cwd);
+            xt_beqz (&e, 10, (i32)(6u + cwd_bridge_size + helper_bcc_tail_size));
+            emit_jit_fast_helper(&e, 8, dn,
+                                 lit_off[HELPER_JIT_CMP_W_ADDR_DN_MMIO],
+                                 entry_off, &rc);
             g_helper_touched_mask = 0xFFFFu;
+            g_helper_arg_mask = 3u;
+            (void)op_pc_cwd; (void)op_cyc_cwd;
             if (fuse) {
                 /* Helper-path Bcc tail. The bridge already reloaded R_SR
                  * (CMP wrote it), so emit_cond reads CMP's flags. The

@@ -815,6 +815,32 @@ void m68k_jit_bitop_dn_an_mmio(m68k_cpu *cpu) {
     }
 }
 
+/* M6.241 — CMP.W (addr),Dn MMIO fast helper. Used by CMP.W (d16,An),Dn /
+ * CMP.W (An),Dn / CMP.W (d8,An,Xn),Dn arms when source address resolves
+ * to MMIO. thinkc-bullseye fires CMP.W (d16,An),Dn family (0xB66E, 0xB06E,
+ * 0xB46E) ~52K combined.
+ *
+ * Args:
+ *   jit_arg1 = src addr (caller-computed)
+ *   jit_arg2 = Dn (0..7)
+ *
+ * Reads .W from src, compares against Dn.W; sets N/Z/V/C, preserves X.
+ * Mirrors set_flags_cmp() for sz=2 (.W). Skips m68k_step's decode +
+ * cpu->instrs++. */
+void m68k_jit_cmp_w_addr_dn_mmio(m68k_cpu *cpu) {
+    int dn = (int)(cpu->jit_arg2 & 7);
+    u32 addr = cpu->jit_arg1;
+    u32 s = mac_read16(cpu->mem, addr);          /* zero-extended */
+    u32 d = cpu->d[dn] & 0xFFFFu;
+    u32 r = (d - s) & 0xFFFFu;
+    u8 c = m68k_get_ccr(cpu) & CCR_X;
+    if (r == 0)               c |= CCR_Z;
+    if (r & 0x8000u)          c |= CCR_N;
+    if (s > d)                c |= CCR_C;
+    if (((s ^ d) & (d ^ r)) & 0x8000u) c |= CCR_V;
+    m68k_set_ccr(cpu, c);
+}
+
 /* M6.240d — MOVEA.L src,Am MMIO fast helper. Generic addr→An.L
  * variant. Used by MOVEA.L (d16,An),Am / MOVEA.L (An),Am /
  * MOVEA.L (xxx).W,Am / MOVEA.L (d8,An,Xn),Am arms when source addr
