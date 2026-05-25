@@ -5296,12 +5296,20 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             xt_and  (&e, 12, 10, 11);
             emit_cache_flush(&e, &rc);
             i32 op_pc_b3 = 2, op_cyc_b3 = 8;
-            /* M6.127 — MOVE.B (An)+,Dn modifies Dn and An (post-incr). */
+            /* M6.240 — slow path uses custom MMIO helper that handles
+             * post-inc + Dn merge + CCR. bullseye fires this MMIO bridge
+             * heavily via 0x1018/0x1019 (~132K combined). */
             g_helper_touched_mask = (u16)((1u << G_D(dn)) | (1u << G_A(an)));
-            xt_beqz (&e, 12, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_b3, op_cyc_b3)));
-            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
-                                              entry_off, &rc, op_pc_b3, op_cyc_b3);
+            g_helper_arg_mask = 2u;          /* uses jit_arg2 only (packed an|dn) */
+            int packed_b3 = (an << 4) | dn;
+            u32 b3_bridge_size = emit_jit_fast_helper_size(&rc);
+            xt_beqz (&e, 12, (i32)(6u + b3_bridge_size));
+            emit_jit_fast_helper(&e, 8, packed_b3,
+                                 lit_off[HELPER_JIT_MOVE_B_POSTINC_TO_DN_MMIO],
+                                 entry_off, &rc);
             g_helper_touched_mask = 0xFFFFu;
+            g_helper_arg_mask = 3u;
+            (void)op_pc_b3; (void)op_cyc_b3;
             u32 jb3_pos = e.len;
             xt_j    (&e, 4);
 

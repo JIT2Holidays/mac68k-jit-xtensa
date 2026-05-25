@@ -815,6 +815,28 @@ void m68k_jit_bitop_dn_an_mmio(m68k_cpu *cpu) {
     }
 }
 
+/* M6.240 — MOVE.B (An)+,Dn MMIO fast helper. Sibling of M6.132's
+ * m68k_jit_move_l_postinc_to_dn_mmio for the .B variant. Used by the
+ * MOVE.B (An)+,Dn arm (M6.94) when An resolves to MMIO. thinkc-bullseye
+ * fires 0x1018/0x1019 family ~132K combined.
+ *
+ * Args: jit_arg2 packed = dn | (an << 4). Reads cpu->a[an] for addr.
+ * Reads 1 byte, merges into low 8 of cpu->d[dn], post-increments An by
+ * 1 (or 2 for A7). MOVE-family flags. */
+void m68k_jit_move_b_postinc_to_dn_mmio(m68k_cpu *cpu) {
+    int dn = (int)(cpu->jit_arg2 & 7);
+    int an = (int)((cpu->jit_arg2 >> 4) & 7);
+    u32 addr = cpu->a[an];
+    u8 v = mac_read8(cpu->mem, addr);
+    int step = (an == 7) ? 2 : 1;
+    cpu->a[an] = addr + (u32)step;
+    cpu->d[dn] = (cpu->d[dn] & 0xFFFFFF00u) | v;
+    u8 ccr = m68k_get_ccr(cpu) & CCR_X;
+    if (v == 0)   ccr |= CCR_Z;
+    if (v & 0x80) ccr |= CCR_N;
+    m68k_set_ccr(cpu, ccr);
+}
+
 /* M6.239 — MOVE.W src,Dn MMIO fast helper. Sibling of M6.133's
  * m68k_jit_move_b_addr_to_dn_mmio for the .W variant. Used by the
  * MOVE.W (d16,An),Dn / MOVE.W (An),Dn / MOVE.W (xxx).W,Dn arms when
