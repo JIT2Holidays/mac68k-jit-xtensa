@@ -3345,6 +3345,91 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                 /* MMIO src — touches dst An. */
                 g_helper_touched_mask = (u16)(1u << G_A(dst_an));
             }
+        } else if (top == 0x1 && ((w >> 6) & 7) == 5 && mode == 7 && (w & 7) == 0) {
+            /* M6.189 — MOVE.B (xxx).W,(d16,An). thinkc8-folder-open
+             * bench's 0x1178 at PC=0x40275C ~25K hits/100 M. Absent
+             * from boot 100 M and speedo.
+             *
+             * Sibling of M6.175 MOVE.L (xxx).W,(d16,An) — same
+             * compile-time RAM check on abs.W source, same MMIO
+             * bridge — but .B (1 byte) instead of .L (4 bytes).
+             *
+             * Length 6 (op + abs.W + d16), cycles 8. */
+            int dst_an = (w >> 9) & 7;
+            u16 src_ext = mac_read16(cpu->mem, op_pc[i] + 2);
+            u32 abs_addr = (u32)(i32)(i16)src_ext;
+            abs_addr &= 0xFFFFFFu;
+            u16 d_ext = mac_read16(cpu->mem, op_pc[i] + 4);
+            i32 d16 = (i16)d_ext;
+
+            u32 ram_size_mb = cpu->mem ? cpu->mem->ram_size : 0;
+            bool overlay_mb = cpu->mem ? cpu->mem->overlay : true;
+            bool ram_pow2_mb = ram_size_mb > 0 && (ram_size_mb & (ram_size_mb - 1)) == 0;
+            /* .B source: no alignment required. */
+            bool addr_in_ram_mb = !overlay_mb && ram_pow2_mb && abs_addr < ram_size_mb;
+
+            if (addr_in_ram_mb) {
+                emit_advance_flush(&e);
+                /* Dest EA: a[dst_an] + d16. */
+                emit_read_g(&e, &rc, G_A(dst_an), 8);
+                if (d16 >= -128 && d16 <= 127) {
+                    xt_addi(&e, 8, 8, d16);
+                } else {
+                    emit_load_imm(&e, 11, 12, (u32)d16);
+                    xt_add (&e, 8, 8, 11);
+                }
+                /* Bounds check dest EA in a8. */
+                emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS_BYTE],
+                             entry_off + e.len);
+                xt_and  (&e, 10, 8, 9);
+                emit_cache_flush(&e, &rc);
+                i32 op_pc_mbx = 6, op_cyc_mbx = 8;
+                g_helper_touched_mask = 0u;
+                xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_mbx, op_cyc_mbx)));
+                emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                                  entry_off, &rc, op_pc_mbx, op_cyc_mbx);
+                g_helper_touched_mask = 0xFFFFu;
+                u32 jmbx_pos = e.len;
+                xt_j    (&e, 4);
+
+                /* Fast path: read 1 byte from RAM_BASE + abs_addr → a10. */
+                emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                             entry_off + e.len);
+                if ((i32)abs_addr >= -128 && (i32)abs_addr <= 127) {
+                    xt_addi(&e, 9, 9, (i32)abs_addr);
+                } else if ((i32)abs_addr >= -2048 && (i32)abs_addr <= 2047) {
+                    xt_movi(&e, 12, (i32)abs_addr);
+                    xt_add (&e, 9, 9, 12);
+                } else {
+                    emit_load_imm(&e, 12, 11, abs_addr);
+                    xt_add (&e, 9, 9, 12);
+                }
+                xt_l8ui (&e, 10, 9, 0);                  /* a10 = .B src */
+
+                /* Write 1 byte at RAM_BASE + dst_EA (a8). a9 reused. */
+                emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                             entry_off + e.len);
+                xt_add  (&e, 9, 9, 8);
+                xt_s8i  (&e, 10, 9, 0);
+                if (!flags_dead[i]) {
+                    /* Shift byte to bit 31 for MOVE-family flags. */
+                    xt_slli (&e, 8, 10, 24);
+                    emit_logic_flags(&e, 8);
+                }
+                emit_advance(&e, op_pc_mbx, op_cyc_mbx);
+
+                u32 here_mbx = e.len;
+                i32 jo_mbx = (i32)(here_mbx - jmbx_pos) - 4;
+                u32 jw_mbx = ((u32)((u32)jo_mbx & 0x3FFFFu) << 6) | 0x06u;
+                base[entry_off + jmbx_pos    ] = (u8)jw_mbx;
+                base[entry_off + jmbx_pos + 1] = (u8)(jw_mbx >> 8);
+                base[entry_off + jmbx_pos + 2] = (u8)(jw_mbx >> 16);
+
+                inline_ops++; done = true;
+            } else {
+                /* MMIO src — flag-only side effect. */
+                g_helper_touched_mask = 0u;
+            }
         } else if (top == 0x2 && ((w >> 6) & 7) == 5 && mode == 7 && (w & 7) == 0) {
             /* M6.175 — MOVE.L (xxx).W,(d16,An). thinkc8-folder-open
              * bench's 0x2178 at PC=0x402746 — Toolbox dispatcher
