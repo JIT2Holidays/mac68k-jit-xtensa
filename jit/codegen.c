@@ -1991,6 +1991,8 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             b1 |= (top == 0x0 && !((w >> 8) & 1) && sf == 2 && mm == 0
                    && rr != 4 && rr != 7);                                 /* ORI/ANDI/ADDI/SUBI/EORI.L #imm32,Dn */
             b1 |= (top == 0x7);                                            /* MOVEQ */
+            /* M6.199 — ADDQ.L #imm,(xxx).W with skip_flags-aware inline emit. */
+            b1 |= (top == 0x5 && sf == 2 && !((w >> 8) & 1) && mm == 7 && (w & 7) == 0);
             if (!b1) flags_dead[i] = false;
         }
     }
@@ -2972,6 +2974,74 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             int data = (w >> 9) & 7; if (data == 0) data = 8;
             emit_addq_w_dn(&e, w & 7, data, (w >> 8) & 1, flags_dead[i], &rc);
             inline_ops++; done = true;
+        } else if (top == 0x5 && szf == 2 && ((w >> 8) & 1) == 0
+                   && mode == 7 && (w & 7) == 0 && flags_dead[i]) {
+            /* M6.199 — ADDQ.L #imm,(xxx).W — only when flags_dead.
+             * Boot 100M's 0x52B8 (ADDQ.L #1,(0x16A).W) at PC=0x401B12
+             * fires 390 times. Followed by MOVE.B #imm,(xxx).W which
+             * overwrites CCR — flags_dead[ADDQ] = true.
+             *
+             * Absent from speedo, thinkc8, cycle100m, boot 5M det.
+             *
+             * abs_addr is compile-time known (sext16 of ext word). Only
+             * inline when abs_addr is in RAM AND .L-aligned. Length 4
+             * (op + abs.W), cycles 8 (interp base 4 + handler 4, flat
+             * for ADDQ regardless of size — see m68k_interp.c:1324).
+             * With flags_dead the inline body is trivial: read .L, add,
+             * write back. */
+            int data = (w >> 9) & 7; if (data == 0) data = 8;
+            u16 ext = mac_read16(cpu->mem, op_pc[i] + 2);
+            u32 abs_addr = (u32)(i32)(i16)ext;
+            abs_addr &= 0xFFFFFFu;
+
+            u32 ram_size_aq = cpu->mem ? cpu->mem->ram_size : 0;
+            bool overlay_aq = cpu->mem ? cpu->mem->overlay : true;
+            bool ram_pow2_aq = ram_size_aq > 0 && (ram_size_aq & (ram_size_aq - 1)) == 0;
+            /* .L needs even alignment; conservatively require word-aligned. */
+            bool addr_in_ram_aq = !overlay_aq && ram_pow2_aq
+                                  && abs_addr + 3 < ram_size_aq
+                                  && (abs_addr & 1) == 0;
+
+            if (addr_in_ram_aq) {
+                emit_advance_flush(&e);
+                emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                             entry_off + e.len);
+                if ((i32)abs_addr >= -128 && (i32)abs_addr <= 127) {
+                    xt_addi(&e, 9, 9, (i32)abs_addr);
+                } else if ((i32)abs_addr >= -2048 && (i32)abs_addr <= 2047) {
+                    xt_movi(&e, 10, (i32)abs_addr);
+                    xt_add (&e, 9, 9, 10);
+                } else {
+                    emit_load_imm(&e, 10, 11, abs_addr);
+                    xt_add (&e, 9, 9, 10);
+                }
+                /* Read 4 BE bytes → a8 (.L). */
+                xt_l8ui (&e, 10, 9, 0);
+                xt_l8ui (&e, 11, 9, 1);
+                xt_slli (&e, 8, 10, 24);
+                xt_slli (&e, 11, 11, 16);
+                xt_or   (&e, 8, 8, 11);
+                xt_l8ui (&e, 10, 9, 2);
+                xt_l8ui (&e, 11, 9, 3);
+                xt_slli (&e, 10, 10, 8);
+                xt_or   (&e, 8, 8, 10);
+                xt_or   (&e, 8, 8, 11);          /* a8 = .L value */
+                /* a8 = a8 + data (.L unmasked) */
+                xt_addi (&e, 8, 8, data);
+                /* Write 4 BE bytes back. */
+                xt_extui(&e, 11, 8, 24, 7);
+                xt_s8i  (&e, 11, 9, 0);
+                xt_extui(&e, 11, 8, 16, 7);
+                xt_s8i  (&e, 11, 9, 1);
+                xt_extui(&e, 11, 8,  8, 7);
+                xt_s8i  (&e, 11, 9, 2);
+                xt_extui(&e, 11, 8,  0, 7);
+                xt_s8i  (&e, 11, 9, 3);
+                /* flags_dead — skip flag emit. */
+                emit_advance(&e, 4, 8);
+                inline_ops++; done = true;
+            }
+            /* else: fall through to default helper. */
         } else if (top == 0x5 && szf == 0 && mode == 0) {
             /* M6.160 — ADDQ.B / SUBQ.B #imm,Dn. Pure register-op,
              * sibling of the ADDQ.W arm above.
