@@ -5218,6 +5218,90 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + jmxL_pos + 2] = (u8)(jw_mxL >> 16);
 
             inline_ops++; done = true;
+        } else if (top == 0xD && szf == 2 && ((w >> 8) & 1) == 0 && mode == 6) {
+            /* M6.216 — ADD.L (d8,An,Xn),Dn. Speedo bench's 0xD2B1
+             * (ADD.L (d8,A1,Xn),D1) at PC=0x408DD8 fires 34 times/100M.
+             * Absent from boot 100M / cycle100m / rom-init / cycle30m
+             * top-40 helper histos.
+             *
+             * Sibling of M6.215 MOVE.L (d8,An,Xn),Dn — same (d8,An,Xn)
+             * EA decode + .L read, but ADD with Dn and emit full ADD
+             * flags via emit_addsub_flags_long_masked(is_sub=false,
+             * keep_x=false). M6.212 lesson re full-ADD-flags + memory
+             * write doesn't apply: dst is Dn (register), not memory.
+             *
+             * Length 4 (op + brief ext), cycles 14 (m68k_step base 4 +
+             * handler 6 for .L src + 4 for to_dn). Actually let me
+             * verify: m68k_interp's case 0x9/D handler:
+             *   cycles += (sz == 4) ? (mode <= 1 ? 8 : 6) : 4;
+             *
+             * For src EA modes >= 2 with .L, handler = 6, so total 4+6=10.
+             * Hmm — let me use 10. */
+            int dn      = (w >> 9) & 7;
+            int src_an  = w & 7;
+            u16 ext     = mac_read16(cpu->mem, op_pc[i] + 2);
+            int  ireg    = (ext >> 12) & 7;
+            bool is_an   = (ext & 0x8000) != 0;
+            bool is_long = (ext & 0x0800) != 0;
+            i32  d8      = (i8)(ext & 0xFF);
+
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(src_an), 8);
+            emit_read_g(&e, &rc, is_an ? G_A(ireg) : G_D(ireg), 9);
+            if (!is_long) {
+                xt_slli(&e, 9, 9, 16);
+                xt_srai(&e, 9, 9, 16);
+            }
+            xt_add(&e, 8, 8, 9);
+            if (d8 != 0) xt_addi(&e, 8, 8, d8);
+
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_addxL = 4, op_cyc_addxL = 10;
+            g_helper_touched_mask = (u16)(1u << G_D(dn));
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_addxL, op_cyc_addxL)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_addxL, op_cyc_addxL);
+            g_helper_touched_mask = 0xFFFFu;
+            u32 jaddxL_pos = e.len;
+            xt_j    (&e, 4);
+
+            /* Fast path: read .L src → a8, ADD with Dn → result in a10,
+             * store result to Dn, set ADD flags. */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);
+            xt_l8ui (&e, 11, 9, 0);
+            xt_l8ui (&e, 12, 9, 1);
+            xt_slli (&e, 8, 11, 24);
+            xt_slli (&e, 12, 12, 16);
+            xt_or   (&e, 8, 8, 12);
+            xt_l8ui (&e, 11, 9, 2);
+            xt_l8ui (&e, 12, 9, 3);
+            xt_slli (&e, 11, 11, 8);
+            xt_or   (&e, 8, 8, 11);
+            xt_or   (&e, 8, 8, 12);                /* a8 = .L src (s) */
+            emit_read_g(&e, &rc, G_D(dn), 9);      /* a9 = Dn (d) */
+            xt_add  (&e, 10, 9, 8);                /* a10 = d + s (r) */
+            emit_write_g(&e, &rc, G_D(dn), 10);
+
+            if (!flags_dead[i]) {
+                emit_addsub_flags_long_masked(&e, false, false,
+                                              8, 9, 10, flags_needed[i]);
+            }
+            sext_memo_invalidate();
+            emit_advance(&e, op_pc_addxL, op_cyc_addxL);
+
+            u32 here_addxL = e.len;
+            i32 jo_addxL = (i32)(here_addxL - jaddxL_pos) - 4;
+            u32 jw_addxL = ((u32)((u32)jo_addxL & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jaddxL_pos    ] = (u8)jw_addxL;
+            base[entry_off + jaddxL_pos + 1] = (u8)(jw_addxL >> 8);
+            base[entry_off + jaddxL_pos + 2] = (u8)(jw_addxL >> 16);
+
+            inline_ops++; done = true;
         } else if (top == 0x2 && ((w >> 6) & 7) == 1 && mode == 6) {
             /* M6.186 — MOVEA.L (d8,An,Xn),Am. thinkc8-folder-open
              * bench's 0x2472 (MOVEA.L (d8,A2,Xn),A2) at PC=0x401F94
