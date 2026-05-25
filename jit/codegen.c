@@ -6716,6 +6716,81 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + jcmpaL2_pos + 2] = (u8)(cwL2 >> 16);
 
             inline_ops++; done = true;
+        } else if (top == 0xC && szf == 1 && ((w >> 8) & 1) == 0 && mode == 3) {
+            /* M6.224 — AND.W (An)+,Dn. boot-system-load fires 0xC05F
+             * (AND.W (A7)+,D0) at PC=0xA001B6A0 114,679 times. Absent
+             * from boot 100M / cycle100m / rom-init / cycle30m top-40
+             * helper histos.
+             *
+             * Sibling of M6.211 AND.W (An),Dn for mode=3 postinc.
+             * Length 2, cycles 8. Bridge's touched_mask must include
+             * BOTH G_D(dn) (Dn modified) and G_A(an) (postinc). */
+            int dn = (w >> 9) & 7;
+            int an = w & 7;
+
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(an), 8);            /* a8 = An */
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_awp = 2, op_cyc_awp = 8;
+            g_helper_touched_mask = (u16)((1u << G_D(dn)) | (1u << G_A(an)));
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_awp, op_cyc_awp)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_awp, op_cyc_awp);
+            g_helper_touched_mask = 0xFFFFu;
+            u32 jawp_pos = e.len;
+            xt_j    (&e, 4);
+
+            /* Fast path: read .W BE bytes → a8, merge into Dn low 16,
+             * post-inc An. */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);                      /* a9 = ram + An */
+            xt_l8ui (&e, 11, 9, 0);
+            xt_l8ui (&e, 12, 9, 1);
+            xt_slli (&e, 8, 11, 8);
+            xt_or   (&e, 8, 8, 12);                     /* a8 = .W src */
+
+            /* Post-increment An by 2 (read old An then add). */
+            {
+                u8 old_an_reg = emit_read_g_in(&e, &rc, G_A(an), 11);
+                xt_addi(&e, 12, old_an_reg, 2);
+                emit_write_g(&e, &rc, G_A(an), 12);
+            }
+
+            /* Merge: Dn[15:0] AND src.W, preserve Dn[31:16]. */
+            int dn_xt = cache_lookup(&rc, G_D(dn));
+            u8 dn_reg = (dn_xt >= 0) ? (u8)dn_xt : 11;
+            if (dn_xt < 0) emit_read_g(&e, &rc, G_D(dn), 11);
+            xt_extui(&e, 10, dn_reg, 0, 15);
+            xt_and  (&e, 10, 10, 8);                    /* a10 = AND result .W */
+            xt_srli (&e, dn_reg, dn_reg, 16);
+            xt_slli (&e, dn_reg, dn_reg, 16);
+            xt_or   (&e, dn_reg, dn_reg, 10);
+
+            if (dn_xt >= 0) {
+                for (int s = 0; s < rc.active; s++)
+                    if (rc.guest[s] == (u8)G_D(dn)) { rc.dirty |= (u16)(1u << s); break; }
+            } else {
+                emit_write_g(&e, &rc, G_D(dn), 11);
+            }
+            if (!flags_dead[i]) {
+                xt_slli (&e, 9, 10, 16);
+                emit_logic_flags(&e, 9);
+            }
+            sext_memo_invalidate();
+            emit_advance(&e, op_pc_awp, op_cyc_awp);
+
+            u32 here_awp = e.len;
+            i32 jo_awp = (i32)(here_awp - jawp_pos) - 4;
+            u32 jw_awp = ((u32)((u32)jo_awp & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jawp_pos    ] = (u8)jw_awp;
+            base[entry_off + jawp_pos + 1] = (u8)(jw_awp >> 8);
+            base[entry_off + jawp_pos + 2] = (u8)(jw_awp >> 16);
+
+            inline_ops++; done = true;
         } else if (top == 0xC && szf == 1 && ((w >> 8) & 1) == 0 && mode == 2) {
             /* M6.211 — AND.W (An),Dn. Sibling of M6.183 AND.W (xxx).W,Dn
              * for mode=2 (An indirect). Speedo bench's 0xC255 (AND.W
