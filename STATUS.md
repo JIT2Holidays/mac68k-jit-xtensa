@@ -93,6 +93,47 @@ produced a sub-window (1.36% diff). Then iterate inside.
 
 These tools are reusable for any future Mac-Plus interactive scripting.
 
+## M6.230 — BTST/BCHG/BCLR/BSET #imm,(An) static bit op mode 2 inline
+
+Boot 100M live + boot-cycle100m + boot-rom-init each fire 0x08D1
+(BSET #imm,(A1)) ~62 times at PC=0x40024E (real ROM, NOT a phantom
+PC — the bit-op family). Aggregate 184 helper fires across three
+snapshots; speedo has 0; thinkc8/boot-cycle30m/boot-system-load
+have 0.
+
+This pattern was previously caught by the M6.202 DYNAMIC bit op
+arm (`Dn,(An)`) but the STATIC `#imm,(An)` form fell through to
+m68k_step. Sibling of M6.113 (xxx).W and the mode 5 BTST arm: same
+byte RMW shape, simpler EA (just `(An)`).
+
+Predicate: `top == 0x0 && !((w >> 8) & 1) && ((w >> 9) & 7) == 4 &&
+mode == 2`. Length 4 (op + imm.W), cycles 8 (m68k_step base 4 +
+bit-op handler 4 at `core/m68k_interp.c:1114`).
+
+Bench impact:
+| Bench | M6.229 | M6.230 | Δ real_helpers |
+|---|---:|---:|---:|
+| boot-cycle100m | 1428 / 1.634 | 1422 / 1.634 | −6 |
+| speedo | 1256 / 1.179 | 1244 / 1.179 | −12 |
+| boot-system-load | 0 / 1.786 | 0 / 1.786 | 0 |
+| boot-cycle30m | 8 / 1.334 | 8 / 1.334 | 0 |
+| thinkc8 | 0 / 1.389 | 0 / 1.389 | 0 |
+| boot-rom-init | 232,106 / 1.662 | 232,106 / 1.662 | 0 |
+| boot 5M det | 54 / 1.952 | 54 / 1.952 | 0 |
+| boot 100M live | 175,726 / 1.656 | 175,726 / 1.656 | 0 |
+
+ctest 11/11; diff.sh 321 blocks match. **boot 100M live unchanged** —
+no trajectory shift despite the opcode being in its top-10. The
+arm's slow path uses the default `emit_helper_step_after_flush_undo`
+bridge for MMIO fires (most of the 62 are MMIO at runtime); the
+6 RAM-resident fires use the inline fast path. xt helper-bridge
+count drops 67 in boot-cycle100m (4288 LX7 saved in the cost model).
+
+Coverage gaps still open: mode 5 with szf != 0 (BCHG/BCLR/BSET
+#imm,(d16,An) — 0x08A9 / 0x08E9, ~37 fires each in boot-cycle100m
+and boot 100M live). Deferred — would require extending the
+existing mode 5 BTST arm rather than adding a new one.
+
 ## M6.229 — MOVE.L (d8,An,Xn),(d16,Am) mem-to-mem — boot-system-load → helpers=0 🎯🎯🎯
 
 **boot-system-load reaches helpers=0 — same milestone the thinkc8-folder-open

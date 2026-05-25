@@ -10882,6 +10882,91 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             }
             /* else: fall through to helper. */
         } else if (top == 0x0 && !((w >> 8) & 1) && ((w >> 9) & 7) == 4
+                   && mode == 2) {
+            /* M6.230 — BTST / BCHG / BCLR / BSET #imm,(An). Static
+             * bit op against the byte at (An).
+             *
+             * Fires: boot-cycle100m + boot-rom-init + boot 100M live
+             * each fire 0x08D1 (BSET #imm,(A1)) ~62 times at
+             * PC=0x40024E (real ROM, pre-M6.66-region phantom). Same
+             * code path in all three — cumulative 184 helper fires.
+             * Speedo has 0 fires; thinkc8 / boot-cycle30m /
+             * boot-system-load have 0.
+             *
+             * Sibling of M6.113 (xxx).W and the mode 5 BTST arm just
+             * below: same byte RMW shape, but the EA is just (An) so
+             * no displacement decode is needed.
+             *
+             * which = (w >> 6) & 3: 0=BTST, 1=BCHG, 2=BCLR, 3=BSET.
+             * For byte EA, bit_num = imm_word & 7. Length 4 (op +
+             * imm.W); cycles 8 (m68k_step base 4 + bit-op handler 4
+             * at core/m68k_interp.c:1114).
+             *
+             * CCR: sets ONLY Z = !old_bit; N/V/C/X unchanged. */
+            int which_sbm = (w >> 6) & 3;
+            int an_sbm = w & 7;
+            u16 imm_word_sbm = mac_read16(cpu->mem, op_pc[i] + 2);
+            int bit_num_sbm = imm_word_sbm & 7;
+
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(an_sbm), 8);
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS_BYTE],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_sbm = 4, op_cyc_sbm = 8;
+            /* Slow path: m68k_step bridge. Helper touches no D/A
+             * (just byte mem + Z). */
+            g_helper_touched_mask = 0u;
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_sbm, op_cyc_sbm)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_sbm, op_cyc_sbm);
+            g_helper_touched_mask = 0xFFFFu;
+            u32 jsbm_pos = e.len;
+            xt_j    (&e, 4);
+
+            /* Fast path: read byte, extract bit, optionally
+             * modify + writeback, then update Z. */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);
+            xt_l8ui (&e, 10, 9, 0);                       /* a10 = byte */
+            xt_extui(&e, 11, 10, (u8)bit_num_sbm, 0);     /* a11 = old bit (0/1) */
+
+            if (which_sbm != 0) {
+                int mask_sbm = 1 << bit_num_sbm;
+                if (which_sbm == 1) {                /* BCHG: byte ^= mask */
+                    xt_movi(&e, 12, mask_sbm);
+                    xt_xor (&e, 10, 10, 12);
+                } else if (which_sbm == 2) {         /* BCLR: byte &= ~mask */
+                    xt_movi(&e, 12, ~mask_sbm & 0xFF);
+                    xt_and (&e, 10, 10, 12);
+                } else {                              /* BSET: byte |= mask */
+                    xt_movi(&e, 12, mask_sbm);
+                    xt_or  (&e, 10, 10, 12);
+                }
+                xt_s8i (&e, 10, 9, 0);
+            }
+
+            /* Update SR.Z (bit 2): set if old bit == 0, clear else. */
+            xt_movi (&e, 12, -5);                          /* ~0x04 */
+            xt_and  (&e, R_SR, R_SR, 12);
+            xt_movi (&e, 12, 0x04);
+            xt_bnez (&e, 11, 6);                           /* skip OR if bit set */
+            xt_or   (&e, R_SR, R_SR, 12);
+            g_sr_dirty = true;
+            sext_memo_invalidate();
+            emit_advance(&e, op_pc_sbm, op_cyc_sbm);
+
+            u32 here_sbm = e.len;
+            i32 jo_sbm = (i32)(here_sbm - jsbm_pos) - 4;
+            u32 jw_sbm = ((u32)((u32)jo_sbm & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jsbm_pos    ] = (u8)jw_sbm;
+            base[entry_off + jsbm_pos + 1] = (u8)(jw_sbm >> 8);
+            base[entry_off + jsbm_pos + 2] = (u8)(jw_sbm >> 16);
+
+            inline_ops++; done = true;
+        } else if (top == 0x0 && !((w >> 8) & 1) && ((w >> 9) & 7) == 4
                    && szf == 0 && mode == 5) {
             /* BTST #imm,(d16,An) — boot-hot 0x082D at 214 K execs.
              * Byte EA: bit & 7 selects the bit to test. Sets only Z.
