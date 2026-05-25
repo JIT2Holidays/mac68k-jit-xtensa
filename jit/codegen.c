@@ -11036,6 +11036,90 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + jbt_pos + 2] = (u8)(jw_bt >> 16);
 
             inline_ops++; done = true;
+        } else if (top == 0x0 && !((w >> 8) & 1) && ((w >> 9) & 7) == 4
+                   && szf != 0 && mode == 5) {
+            /* M6.231 — BCHG/BCLR/BSET #imm,(d16,An). Static bit op
+             * with byte EA at a[an] + sext16(d16). Sibling of M6.230
+             * mode 2 — same byte RMW shape, but adds d16.
+             *
+             * Fires: boot 100M live + boot-cycle100m + boot-rom-init
+             * each fire 0x08A9 (BCLR #imm,(d16,A1)) ~37 times at
+             * PC=0x400268 and 0x08E9 (BSET #imm,(d16,A1)) ~37 times
+             * at PC=0x400282 (real ROM, pre-divergence in actual Mac
+             * time). Aggregate 222 helper fires. Speedo 7 fires.
+             *
+             * The existing mode-5 BTST arm above handles szf==0;
+             * this arm extends to szf=1..3 (BCHG/BCLR/BSET).
+             *
+             * which = (w >> 6) & 3: 1=BCHG, 2=BCLR, 3=BSET (BTST
+             * caught above). bit_num = imm_word & 7. Length 6 (op +
+             * imm.W + d16.W); cycles 8.
+             *
+             * CCR: sets ONLY Z = !old_bit; N/V/C/X unchanged. */
+            int which_sb5 = (w >> 6) & 3;
+            int an_sb5 = w & 7;
+            u16 imm_word_sb5 = mac_read16(cpu->mem, op_pc[i] + 2);
+            int bit_num_sb5 = imm_word_sb5 & 7;
+            i16 d16_sb5 = (i16)mac_read16(cpu->mem, op_pc[i] + 4);
+
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(an_sb5), 8);
+            if (d16_sb5 >= -128 && d16_sb5 <= 127) {
+                xt_addi(&e, 8, 8, d16_sb5);
+            } else {
+                emit_load_imm32(&e, 11, 12, (u32)(i32)d16_sb5);
+                xt_add  (&e, 8, 8, 11);
+            }
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS_BYTE],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_sb5 = 6, op_cyc_sb5 = 8;
+            g_helper_touched_mask = 0u;
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_sb5, op_cyc_sb5)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_sb5, op_cyc_sb5);
+            g_helper_touched_mask = 0xFFFFu;
+            u32 jsb5_pos = e.len;
+            xt_j    (&e, 4);
+
+            /* Fast path: byte RMW + Z update. */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);
+            xt_l8ui (&e, 10, 9, 0);
+            xt_extui(&e, 11, 10, (u8)bit_num_sb5, 0);
+
+            int mask_sb5 = 1 << bit_num_sb5;
+            if (which_sb5 == 1) {                /* BCHG */
+                xt_movi(&e, 12, mask_sb5);
+                xt_xor (&e, 10, 10, 12);
+            } else if (which_sb5 == 2) {         /* BCLR */
+                xt_movi(&e, 12, ~mask_sb5 & 0xFF);
+                xt_and (&e, 10, 10, 12);
+            } else {                              /* BSET */
+                xt_movi(&e, 12, mask_sb5);
+                xt_or  (&e, 10, 10, 12);
+            }
+            xt_s8i (&e, 10, 9, 0);
+
+            xt_movi (&e, 12, -5);
+            xt_and  (&e, R_SR, R_SR, 12);
+            xt_movi (&e, 12, 0x04);
+            xt_bnez (&e, 11, 6);
+            xt_or   (&e, R_SR, R_SR, 12);
+            g_sr_dirty = true;
+            sext_memo_invalidate();
+            emit_advance(&e, op_pc_sb5, op_cyc_sb5);
+
+            u32 here_sb5 = e.len;
+            i32 jo_sb5 = (i32)(here_sb5 - jsb5_pos) - 4;
+            u32 jw_sb5 = ((u32)((u32)jo_sb5 & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jsb5_pos    ] = (u8)jw_sb5;
+            base[entry_off + jsb5_pos + 1] = (u8)(jw_sb5 >> 8);
+            base[entry_off + jsb5_pos + 2] = (u8)(jw_sb5 >> 16);
+
+            inline_ops++; done = true;
         } else if (top == 0x0 && !((w >> 8) & 1) && szf == 0 && mode == 5
                    && ((w >> 9) & 7) == 0) {
             /* ORI.B #imm8,(d16,An) — boot-hot 0x002C at 408 K execs.

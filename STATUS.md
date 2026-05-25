@@ -93,6 +93,35 @@ produced a sub-window (1.36% diff). Then iterate inside.
 
 These tools are reusable for any future Mac-Plus interactive scripting.
 
+## M6.231 — BCHG/BCLR/BSET #imm,(d16,An) static bit op mode 5
+
+Sibling of M6.230 with d16 EA addition. boot 100M live + boot-cycle100m
++ boot-rom-init fire 0x08A9 (BCLR) and 0x08E9 (BSET) each ~37 times
+at PC=0x400268 / 0x400282 (real ROM, NOT phantom). Aggregate 222
+helper fires across three snapshots. Speedo has 7 fires.
+
+The existing mode-5 BTST arm at line ~10969 handles `szf==0`; M6.231
+extends to `szf=1..3` (BCHG/BCLR/BSET). Predicate:
+`top == 0x0 && !((w >> 8) & 1) && ((w >> 9) & 7) == 4 && szf != 0
+&& mode == 5`. Length 6 (op + imm.W + d16.W), cycles 8.
+
+Bench impact:
+| Bench | M6.230 | M6.231 | Δ |
+|---|---:|---:|---:|
+| speedo | 1244 / 1.179 | 1237 / 1.179 | −7 real_helpers |
+| boot-cycle100m | 1422 / 1.634 | 1422 / 1.634 (real_lx7 1.635) | 0 (xt −72 compile bridges, all 72 fires MMIO at runtime) |
+| boot-rom-init | 232,106 / 1.662 | 232,106 / 1.662 | 0 (same as cycle100m) |
+| all others | unchanged | unchanged | 0 |
+
+ctest 11/11; diff.sh 321 blocks match. boot 100M live & boot 5M det
+unchanged — no trajectory shift.
+
+For boot-cycle100m all 72 fires are MMIO-resident at runtime so the
+inline arm takes its slow path (m68k_step bridge inside the arm). The
+compile-time helper count drops 72 (separate bridges → in-arm
+conditional bridge) but runtime calls are unchanged. The 7 speedo
+fires are RAM-resident and use the inline fast path.
+
 ## M6.230 — BTST/BCHG/BCLR/BSET #imm,(An) static bit op mode 2 inline
 
 Boot 100M live + boot-cycle100m + boot-rom-init each fire 0x08D1
