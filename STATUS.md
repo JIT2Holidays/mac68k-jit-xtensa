@@ -88,13 +88,13 @@ Combined Δ since M6.153:
 | Boot 100M helpers | 178 459 | **177 861** | -598 |
 | Boot 100M jit_cost | 166 511 K | **165 800 K** | **-711 K LX7** |
 
-## M6.169-M6.174 — thinkc8 hotspot inline series 🎯
+## M6.169-M6.180 — thinkc8 hotspot inline series 🎯
 
-Six consecutive inline arms targeting the M6.168 thinkc8-folder-open
+Twelve consecutive inline arms targeting the M6.168 thinkc8-folder-open
 hot loop (the Finder linked-list walk at PC=0x3E5700-0x3E5828 and
-the surrounding subroutine call frame). Each opcode was verified
-absent from boot 100 M's helper-histogram before adding — the
-M6.142 trajectory-safety predicate.
+the surrounding subroutine call frame + Toolbox dispatcher). Each
+opcode was verified absent from boot 100 M's helper-histogram before
+adding — the M6.142 trajectory-safety predicate.
 
 | Milestone | Opcode | Mnemonic | thinkc8 hits | net helpers savings |
 |-----------|--------|----------|-------------:|--------------------:|
@@ -104,19 +104,25 @@ M6.142 trajectory-safety predicate.
 | **M6.172** | `0C50` | CMPI.W #imm,(An) | 50 K | -50 K |
 | **M6.173** | `4E58` | UNLK An | 50 K | -50 K |
 | **M6.174** | `4E50` | LINK An,#d16 | 50 K | -50 K |
-| **Total** | | | **1.526 M** | **-1.595 M (-76 %)** |
+| **M6.175** | `2178` | MOVE.L (xxx).W,(d16,An) | 50 K | -50 K |
+| **M6.176** | `200D` | MOVE.L Am,Dn | 25 K | -25 K |
+| **M6.177** | `4A6D` | TST.W (d16,An) | 25 K | -25 K |
+| **M6.178** | `B0AD` | CMP.L (d16,An),Dn | 25 K | -25 K |
+| **M6.179** | `4A78` | TST.W (xxx).W | 25 K | -25 K |
+| **M6.180** | `B0B8` | CMP.L (xxx).W,Dn | 25 K | -25 K |
+| **Total** | | | **1.701 M** | **-1.769 M (-85 %)** |
 
-Cumulative bench impact (M6.168 baseline → M6.174):
+Cumulative bench impact (M6.168 baseline → M6.180):
 
-| Workload | M6.168 lx7/cyc | M6.174 lx7/cyc | Δ |
+| Workload | M6.168 lx7/cyc | M6.180 lx7/cyc | Δ |
 |----------|---------------:|---------------:|--:|
-| **thinkc8-folder-open** | **2.414** | **1.623** | **−0.791 (−33 %)** 🎯 |
+| **thinkc8-folder-open** | **2.414** | **1.557** | **−0.857 (−36 %)** 🎯 |
 | Boot 100M           | 1.657      | 1.657      | 0.000 ✓ |
 | Bench 100M (speedo) | 1.179      | 1.179      | 0.000 ✓ |
 | Boot 5M det         | 1.952      | 1.952      | 0.000 ✓ |
 
-Speedo bench helpers also dropped 257 (-10.5 %) because UNLK/LINK
-in speedo's small call stack also get inlined now. Boot 100M
+Speedo bench helpers dropped 311 (-12.7 %) because UNLK/LINK and
+MOVE.L Am,Dn in speedo's call stack also get inlined. Boot 100M
 unchanged (the new arms are absent from its histogram, so M6.66
 trajectory is untouched).
 
