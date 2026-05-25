@@ -19,7 +19,7 @@ is currently exercised against:
 | 5 | **boot 100M** (live Mac Plus boot, no snapshot) | **1.656** | 175 726 | ✅ active |
 | 6 | **boot-rom-init** (boot ROM memory test) | **1.662** | 232 106 | ✅ active |
 | 7 | **boot-system-load** (post-System-load ROM phase) | **1.786** | **0** | ✅ active |
-| 8 | **thinkc-bullseye** (THINK C 5.0 IDE running Bullseye demo) | **2.222** | 2 096 071 | ✅ active 🆕 |
+| 8 | **thinkc-bullseye** (THINK C 5.0 IDE running Bullseye demo) | **2.161** | 1 103 341 | ✅ active 🆕 |
 | — | **MacBench 4.0** (Mac compatibility benchmark) | — | — | **🚫 incompatible — see below** |
 
 All seven active targets have ctest diff_jit_trace coverage (11K
