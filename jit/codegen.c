@@ -2816,6 +2816,44 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                 emit_move_l_dd(&e, dn, dm, flags_dead[i], &rc);
                 inline_ops++; done = true;
             }
+        } else if (top == 0x3 && mode == 1 && ((w >> 6) & 7) == 0) {
+            /* M6.213 — MOVE.W An,Dn. Sibling of M6.176 MOVE.L Am,Dn
+             * for .W size. Speedo bench's 0x340A (MOVE.W A2,D2),
+             * 0x340B (MOVE.W A3,D2), etc. at 26 fires each ≈ 50+
+             * cumulative. Pure register-op (no memory, no bridge) —
+             * safe per bridge-only-arms-trajectory-shift category 1.
+             *
+             * Length 2, cycles 8 (m68k_step base 4 + handler 4).
+             *
+             * Differences from M6.176 (.L variant):
+             *  - Result is .W: merge An[15:0] into Dn[15:0], preserve
+             *    Dn[31:16] (Dn high bits unchanged).
+             *  - Logic flags from .W value (shift to bit 31 for N). */
+            int dn = (w >> 9) & 7;
+            int am = w & 7;
+
+            emit_read_g(&e, &rc, G_A(am), 8);            /* a8 = An (full 32) */
+            xt_extui(&e, 9, 8, 0, 15);                   /* a9 = An[15:0] */
+
+            int dn_xt = cache_lookup(&rc, G_D(dn));
+            u8 dn_reg = (dn_xt >= 0) ? (u8)dn_xt : 10;
+            if (dn_xt < 0) emit_read_g(&e, &rc, G_D(dn), 10);
+            xt_srli (&e, dn_reg, dn_reg, 16);
+            xt_slli (&e, dn_reg, dn_reg, 16);            /* dn = Dn[31:16] << 16 */
+            xt_or   (&e, dn_reg, dn_reg, 9);             /* dn = Dn[31:16] | An[15:0] */
+
+            if (dn_xt >= 0) {
+                for (int s = 0; s < rc.active; s++)
+                    if (rc.guest[s] == (u8)G_D(dn)) { rc.dirty |= (u16)(1u << s); break; }
+            } else {
+                emit_write_g(&e, &rc, G_D(dn), 10);
+            }
+            if (!flags_dead[i]) {
+                xt_slli (&e, 8, 9, 16);                  /* .W sign to bit 31 */
+                emit_logic_flags(&e, 8);
+            }
+            emit_advance(&e, 2, 8);
+            inline_ops++; done = true;
         } else if (top == 0x2 && mode == 1 && ((w >> 6) & 7) == 0) {
             /* M6.176 — MOVE.L Am,Dn. thinkc8-folder-open bench's 0x200D
              * (MOVE.L A5,D0) at PC=0x3ED9E2 ~25 K hits / 100 M.
