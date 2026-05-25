@@ -8191,6 +8191,72 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             emit_immarith_bw_dn(&e, w & 7, imm, size, (w >> 9) & 7, &rc);
             inline_ops++; done = true;
         } else if (top == 0x0 && !((w >> 8) & 1) && ((w >> 9) & 7) == 6
+                   && szf == 1 && mode == 6) {
+            /* M6.187 — CMPI.W #imm,(d8,An,Xn). thinkc8-folder-open
+             * bench's 0x0C70 at PC=0x3E97CA ~25K hits/100 M. Absent
+             * from boot 100 M and speedo. Trajectory-safe.
+             *
+             * Second arm using the M6.186 (d8,An,Xn) index-mode EA
+             * compute. CMP-only flag-set + default-helper MMIO bridge.
+             * Length 6 (op + imm16 + brief ext), cycles 8. */
+            int src_an = w & 7;
+            u16 imm  = mac_read16(cpu->mem, op_pc[i] + 2);
+            u16 ext  = mac_read16(cpu->mem, op_pc[i] + 4);
+            i32 imm32 = (i32)(i16)imm;
+            int  ireg    = (ext >> 12) & 7;
+            bool is_an   = (ext & 0x8000) != 0;
+            bool is_long = (ext & 0x0800) != 0;
+            i32  d8      = (i8)(ext & 0xFF);
+
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(src_an), 8);
+            emit_read_g(&e, &rc, is_an ? G_A(ireg) : G_D(ireg), 9);
+            if (!is_long) {
+                xt_slli(&e, 9, 9, 16);
+                xt_srai(&e, 9, 9, 16);
+            }
+            xt_add(&e, 8, 8, 9);
+            if (d8 != 0) xt_addi(&e, 8, 8, d8);
+
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_cix = 6, op_cyc_cix = 8;
+            g_helper_touched_mask = 0u;
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_cix, op_cyc_cix)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_cix, op_cyc_cix);
+            g_helper_touched_mask = 0xFFFFu;
+            u32 jcix_pos = e.len;
+            xt_j    (&e, 4);
+
+            /* Fast path: read .W (2 BE bytes), shift to high 16, sub. */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);
+            xt_l8ui (&e, 11, 9, 0);
+            xt_l8ui (&e, 12, 9, 1);
+            xt_slli (&e, 11, 11, 8);
+            xt_or   (&e, 11, 11, 12);              /* a11 = mem .W */
+            xt_slli (&e, 9, 11, 16);               /* a9 = d shifted */
+            emit_load_imm(&e, 8, 11, (u32)imm32);
+            xt_slli (&e, 8, 8, 16);                /* a8 = s shifted */
+            xt_sub  (&e, 10, 9, 8);
+            if (!flags_dead[i]) {
+                emit_addsub_flags_long_masked(&e, true, true, 8, 9, 10, flags_needed[i]);
+            }
+            emit_advance(&e, op_pc_cix, op_cyc_cix);
+
+            u32 here_cix = e.len;
+            i32 jo_cix = (i32)(here_cix - jcix_pos) - 4;
+            u32 jw_cix = ((u32)((u32)jo_cix & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jcix_pos    ] = (u8)jw_cix;
+            base[entry_off + jcix_pos + 1] = (u8)(jw_cix >> 8);
+            base[entry_off + jcix_pos + 2] = (u8)(jw_cix >> 16);
+
+            inline_ops++; done = true;
+        } else if (top == 0x0 && !((w >> 8) & 1) && ((w >> 9) & 7) == 6
                    && szf == 1 && mode == 2) {
             /* M6.172 — CMPI.W #imm,(An). thinkc8-folder-open bench's
              * 0x0C50 at PC=0x3E5814 — Finder linked-list walk's inner
