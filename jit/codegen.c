@@ -5041,6 +5041,64 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + jw_pos + 2] = (u8)(jww >> 16);
 
             inline_ops++; done = true;
+        } else if (top == 0x1 && ((w >> 6) & 7) == 5 && mode == 0) {
+            /* M6.188 — MOVE.B Dn,(d16,An). thinkc8-folder-open bench's
+             * 0x1141 (MOVE.B D1,(d16,A0)) at PC=0x402758 ~25K hits.
+             * Absent from boot 100M and speedo. Trajectory-safe.
+             *
+             * Sibling of M6.118 MOVE.W Dn,(d16,An) just below — same
+             * EA + MMIO bridge pattern — but writes 1 byte instead of 2.
+             *
+             * Length 4 (op + d16), cycles 8 (interp base 4 + handler 4). */
+            int an = (w >> 9) & 7;
+            int dn = w & 7;
+            u16 ext = mac_read16(cpu->mem, op_pc[i] + 2);
+            i32 d16 = (i16)ext;
+
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(an), 8);
+            if (d16 >= -128 && d16 <= 127) {
+                xt_addi(&e, 8, 8, d16);
+            } else {
+                emit_load_imm(&e, 11, 12, (u32)d16);
+                xt_add (&e, 8, 8, 11);
+            }
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_dbn = 4, op_cyc_dbn = 8;
+            /* MOVE.B Dn,(d16,An) writes no D/A reg, only CCR. */
+            g_helper_touched_mask = 0u;
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_dbn, op_cyc_dbn)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_dbn, op_cyc_dbn);
+            g_helper_touched_mask = 0xFFFFu;
+            u32 jdbn_pos = e.len;
+            xt_j    (&e, 4);
+
+            /* Fast path: write low byte of Dn to RAM at EA + flags. */
+            emit_read_g(&e, &rc, G_D(dn), 10);       /* a10 = Dn */
+            xt_extui(&e, 11, 10, 0, 7);              /* a11 = .B low byte */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);
+            xt_s8i  (&e, 11, 9, 0);
+            if (!flags_dead[i]) {
+                /* MOVE-family flags from .B: shift byte to bit 31. */
+                xt_slli (&e, 8, 10, 24);
+                emit_logic_flags(&e, 8);
+            }
+            emit_advance(&e, op_pc_dbn, op_cyc_dbn);
+
+            u32 here_dbn = e.len;
+            i32 jo_dbn = (i32)(here_dbn - jdbn_pos) - 4;
+            u32 jw_dbn = ((u32)((u32)jo_dbn & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jdbn_pos    ] = (u8)jw_dbn;
+            base[entry_off + jdbn_pos + 1] = (u8)(jw_dbn >> 8);
+            base[entry_off + jdbn_pos + 2] = (u8)(jw_dbn >> 16);
+
+            inline_ops++; done = true;
         } else if (top == 0x3 && ((w >> 6) & 7) == 5 && mode == 0) {
             /* M6.118 — MOVE.W Dn,(d16,An). Bench-hot 0x3B40 (MOVE.W D0,
              * (d16,A5)) at 4995 helpers / 100 M cyc (the next un-inlined
