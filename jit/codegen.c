@@ -4784,6 +4784,84 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + jmAd_pos + 2] = (u8)(jw_mAd >> 16);
 
             inline_ops++; done = true;
+        } else if (top == 0x2 && ((w >> 6) & 7) == 1 && mode == 6) {
+            /* M6.186 — MOVEA.L (d8,An,Xn),Am. thinkc8-folder-open
+             * bench's 0x2472 (MOVEA.L (d8,A2,Xn),A2) at PC=0x401F94
+             * ~25K hits/100 M. Toolbox dispatch-table walk. Absent
+             * from boot 100 M and speedo. Trajectory-safe.
+             *
+             * First arm to inline a (d8,An,Xn) addressing mode. The
+             * brief extension word is at op_pc+2 (compile-time
+             * constant); decoded into:
+             *   ireg    = (ext >> 12) & 7       (Xn register index)
+             *   is_an   = (ext & 0x8000) != 0   (D vs A reg for Xn)
+             *   is_long = (ext & 0x0800) != 0   (.W sign-ext vs full .L)
+             *   d8      = (i8)(ext & 0xFF)      (signed byte disp)
+             *
+             * Runtime EA = An + Xn (sign-ext .W or full .L) + d8.
+             *
+             * Length 4 (op + brief ext word), cycles 8 (interp base 4
+             * + handler 4). */
+            int dst_am = (w >> 9) & 7;
+            int src_an = w & 7;
+            u16 ext = mac_read16(cpu->mem, op_pc[i] + 2);
+            int  ireg    = (ext >> 12) & 7;
+            bool is_an   = (ext & 0x8000) != 0;
+            bool is_long = (ext & 0x0800) != 0;
+            i32  d8      = (i8)(ext & 0xFF);
+
+            emit_advance_flush(&e);
+            /* a8 = An */
+            emit_read_g(&e, &rc, G_A(src_an), 8);
+            /* a9 = Xn (sign-ext .W to .L if needed) */
+            emit_read_g(&e, &rc, is_an ? G_A(ireg) : G_D(ireg), 9);
+            if (!is_long) {
+                xt_slli(&e, 9, 9, 16);
+                xt_srai(&e, 9, 9, 16);
+            }
+            xt_add(&e, 8, 8, 9);
+            if (d8 != 0) xt_addi(&e, 8, 8, d8);
+
+            /* Bounds check on EA in a8. */
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_max = 4, op_cyc_max = 8;
+            g_helper_touched_mask = (u16)(1u << G_A(dst_am));
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_max, op_cyc_max)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_max, op_cyc_max);
+            g_helper_touched_mask = 0xFFFFu;
+            u32 jmax_pos = e.len;
+            xt_j    (&e, 4);
+
+            /* Fast path: read 4 BE bytes from RAM_BASE + EA → Am. */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);
+            xt_l8ui (&e, 11, 9, 0);
+            xt_l8ui (&e, 12, 9, 1);
+            xt_slli (&e, 10, 11, 24);
+            xt_slli (&e, 12, 12, 16);
+            xt_or   (&e, 10, 10, 12);
+            xt_l8ui (&e, 11, 9, 2);
+            xt_l8ui (&e, 12, 9, 3);
+            xt_slli (&e, 11, 11, 8);
+            xt_or   (&e, 10, 10, 11);
+            xt_or   (&e, 10, 10, 12);         /* a10 = .L value */
+            emit_write_g(&e, &rc, G_A(dst_am), 10);
+            /* MOVEA — no flags. */
+            emit_advance(&e, op_pc_max, op_cyc_max);
+
+            u32 here_max = e.len;
+            i32 jo_max = (i32)(here_max - jmax_pos) - 4;
+            u32 jw_max = ((u32)((u32)jo_max & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jmax_pos    ] = (u8)jw_max;
+            base[entry_off + jmax_pos + 1] = (u8)(jw_max >> 8);
+            base[entry_off + jmax_pos + 2] = (u8)(jw_max >> 16);
+
+            inline_ops++; done = true;
         } else if (top == 0xD && szf == 3 && ((w >> 8) & 1) && mode == 5) {
             /* ADDA.L (d16,An),Am — bench-hot 0xD1EE (ADDA.L (d16,A6),A0)
              * at 2000 hits/20 M cyc on the M6.77 corrected path (M6.79).
