@@ -7033,6 +7033,129 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             }
 
             inline_ops++; done = true;
+        } else if (top == 0xB && szf == 2 && ((w >> 8) & 1) == 0 && mode == 3) {
+            /* M6.223 — CMP.L (An)+,Dn. Sibling of M6.210 CMP.W (An)+,Dn
+             * for .L size, and M6.196 CMP.L (d16,An),Dn for mode=3
+             * postinc. boot-system-load fires 0xB09F (CMP.L (A7)+,D0)
+             * 114,679 times — caught by this arm.
+             *
+             * Includes M6.196-style Bcc.S/Bcc.W fusion (cc ∈ {NE, EQ,
+             * BLT, BLE}). Length 2, cycles 14 (CMP.L base 4 + handler
+             * 10 — M6.170 cycle count for .L vs M6.129's .W base 6).
+             *
+             * Actually m68k_interp's case 0xB regular CMP path adds
+             * cpu->cycles += 4 (handler), so total = 4+4 = 8 for any
+             * size. Let me verify: case 0xB szf=2 (CMP.L) goes through
+             * the regular CMP path at line 1554-1559 with cpu->cycles +=
+             * 4. So total = 8 cycles for CMP.L (An)+ too.
+             *
+             * Bridge's touched_mask includes G_A(an). */
+            int dn = (w >> 9) & 7;
+            int an = w & 7;
+
+            /* Fusion eligibility — same pattern as M6.210. */
+            bool fuse = false;
+            bool fuse_w = false;
+            int  fuse_cc = 0;
+            i32  fuse_disp = 0;
+            u32  fuse_ft = 0;
+            if (i + 1 < n_ops) {
+                u16 nw = op_word[i + 1];
+                if ((nw >> 12) == 0x6) {
+                    int cc = (nw >> 8) & 0xF;
+                    if (cc == 6 || cc == 7 || cc == 13 || cc == 15) {
+                        u8 disp8 = nw & 0xFFu;
+                        if (disp8 == 0) {
+                            i32 disp16 = (i16)mac_read16(cpu->mem,
+                                                         op_pc[i + 1] + 2);
+                            fuse = true; fuse_w = true;
+                            fuse_cc = cc; fuse_disp = disp16;
+                            fuse_ft = op_pc[i + 1] + 4;
+                        } else if (disp8 != 0xFF) {
+                            i32 disp = (i8)disp8;
+                            if (disp != 0 && disp != -1) {
+                                fuse = true; fuse_w = false;
+                                fuse_cc = cc; fuse_disp = disp;
+                                fuse_ft = op_pc[i + 1] + 2;
+                            }
+                        }
+                    }
+                }
+            }
+
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(an), 8);            /* a8 = An */
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_cLp = 2, op_cyc_cLp = 8;
+            g_helper_touched_mask = (u16)(1u << G_A(an));
+            u32 helper_skip_cLp = helper_step_after_flush_undo_size(&rc, op_pc_cLp, op_cyc_cLp);
+            u32 helper_tail_cLp = fuse ? fused_helper_bcc_tail_size(fuse_cc) : 0u;
+            xt_beqz (&e, 10, (i32)(6u + helper_skip_cLp + helper_tail_cLp));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_cLp, op_cyc_cLp);
+            g_helper_touched_mask = 0xFFFFu;
+            if (fuse) {
+                u32 before = e.len;
+                emit_cond(&e, fuse_cc);
+                i32 tail_disp = fuse_w ? (fuse_disp - 2) : fuse_disp;
+                emit_bcc_branchless_tail(&e, fuse_ft, tail_disp, 20);
+                if (e.len - before != helper_tail_cLp) {
+                    e.overflow = true;
+                }
+            }
+            u32 jcLp_pos = e.len;
+            xt_j    (&e, 4);
+
+            /* Fast path: read 4 BE bytes → a8 (.L src), post-inc An,
+             * compute CMP. */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);
+            xt_l8ui (&e, 11, 9, 0);
+            xt_l8ui (&e, 12, 9, 1);
+            xt_slli (&e, 8, 11, 24);
+            xt_slli (&e, 12, 12, 16);
+            xt_or   (&e, 8, 8, 12);
+            xt_l8ui (&e, 11, 9, 2);
+            xt_l8ui (&e, 12, 9, 3);
+            xt_slli (&e, 11, 11, 8);
+            xt_or   (&e, 8, 8, 11);
+            xt_or   (&e, 8, 8, 12);                     /* a8 = .L src */
+
+            /* Post-increment An by 4 — read old An from cache, write +4. */
+            {
+                u8 old_an_reg = emit_read_g_in(&e, &rc, G_A(an), 11);
+                xt_addi(&e, 12, old_an_reg, 4);
+                emit_write_g(&e, &rc, G_A(an), 12);
+            }
+            emit_read_g(&e, &rc, G_D(dn), 9);           /* a9 = Dn */
+            xt_sub  (&e, 10, 9, 8);                     /* a10 = d - s */
+            if (fuse) {
+                emit_cmp_cond_fused(&e, fuse_cc, 8, 9, 10);
+                i32 tail_disp = fuse_w ? (fuse_disp - 2) : fuse_disp;
+                emit_bcc_branchless_tail(&e, fuse_ft, tail_disp, 20);
+            } else {
+                emit_addsub_flags_long_masked(&e, true, true, 8, 9, 10, flags_needed[i]);
+                emit_advance(&e, op_pc_cLp, op_cyc_cLp);
+            }
+
+            u32 here_cLp = e.len;
+            i32 jo_cLp = (i32)(here_cLp - jcLp_pos) - 4;
+            u32 jw_cLp = ((u32)((u32)jo_cLp & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jcLp_pos    ] = (u8)jw_cLp;
+            base[entry_off + jcLp_pos + 1] = (u8)(jw_cLp >> 8);
+            base[entry_off + jcLp_pos + 2] = (u8)(jw_cLp >> 16);
+
+            if (fuse) {
+                g_pc_acc = 0;
+                g_cyc_acc = 0;
+                i++;
+            }
+
+            inline_ops++; done = true;
         } else if (top == 0xB && szf == 1 && ((w >> 8) & 1) == 0 && mode == 3) {
             /* M6.210 — CMP.W (An)+,Dn. Sibling of M6.196 CMP.W (d16,An),Dn
              * for mode=3 (post-increment) addressing. Speedo bench has
