@@ -12,13 +12,13 @@ is currently exercised against:
 
 | # | Bench target | lx7/cyc | real_helpers/100M | Status |
 |---|--------------|--------:|------------------:|--------|
-| 1 | **speedo-bench** (Speedometer 4.0 mid-run) | **1.179** | 1 993 | ✅ active |
+| 1 | **speedo-bench** (Speedometer 4.0 mid-run) | **1.179** | 1 256 | ✅ active |
 | 2 | **boot-cycle30m** (boot ROM Toolbox init) | **1.334** | 8 | ✅ active |
 | 3 | **thinkc8-folder-open** (Finder mid-state at THINK C 8 folder) | **1.389** | 0 | ✅ active |
-| 4 | **boot-cycle100m** (boot mid INIT/extension load) | **1.634** | 1 436 | ✅ active |
-| 5 | **boot 100M** (live Mac Plus boot, no snapshot) | **1.656** | 175 861 | ✅ active |
-| 6 | **boot-rom-init** (boot ROM memory test) | **1.662** | 232 115 | ✅ active |
-| 7 | **boot-system-load** (post-System-load ROM phase) | **2.280** | 1 146 790 | ✅ active |
+| 4 | **boot-cycle100m** (boot mid INIT/extension load) | **1.634** | 1 422 | ✅ active |
+| 5 | **boot 100M** (live Mac Plus boot, no snapshot) | **1.656** | 175 726 | ✅ active |
+| 6 | **boot-rom-init** (boot ROM memory test) | **1.662** | 232 106 | ✅ active |
+| 7 | **boot-system-load** (post-System-load ROM phase) | **1.786** | **0** | ✅ active |
 | — | **MacBench 4.0** (Mac compatibility benchmark) | — | — | **🚫 incompatible — see below** |
 | — | THINK C 5.0 IDE running | — | — | 🚧 blocked at folder-open → app-launch navigation |
 
