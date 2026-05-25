@@ -8063,14 +8063,22 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                          entry_off + e.len);
             xt_and  (&e, 10, 8, 9);
 
-            /* 3. beqz a10, fast_path. rel = 3+9+3 = 15. */
+            /* 3. beqz a10, fast_path. */
             emit_cache_flush(&e, &rc);   /* before conditional helper */
             i32 op_pc_ix = 4, op_cyc_ix = 8;
-            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_ix, op_cyc_ix)));
-
-            /* 4. Helper path (mov + l32r + callx0 + undo + reload). */
-            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
-                                              entry_off, &rc, op_pc_ix, op_cyc_ix);
+            /* M6.239b — slow path uses custom MMIO helper instead of
+             * m68k_step. bullseye fires this MMIO path ~132K times via
+             * 0x3C36 (MOVE.W (d8,A6,Xn),D6). */
+            g_helper_touched_mask = (u16)(1u << G_D(dn));
+            g_helper_arg_mask = 3u;
+            u32 ix_bridge_size = emit_jit_fast_helper_size(&rc);
+            xt_beqz (&e, 10, (i32)(6u + ix_bridge_size));
+            emit_jit_fast_helper(&e, 8, dn,
+                                 lit_off[HELPER_JIT_MOVE_W_ADDR_TO_DN_MMIO],
+                                 entry_off, &rc);
+            g_helper_touched_mask = 0xFFFFu;
+            g_helper_arg_mask = 3u;
+            (void)op_pc_ix; (void)op_cyc_ix;
 
             /* 5. j past fast path — backpatched after the fast path is emitted. */
             u32 jix_pos = e.len;
@@ -8093,7 +8101,7 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                 xt_slli (&e, 8, 10, 16);
                 emit_logic_flags(&e, 8);
             }
-            emit_advance(&e, op_pc_ix, op_cyc_ix);  /* 4 bytes: opcode + ext */
+            emit_advance(&e, 4, 8);  /* 4 bytes: opcode + ext */
             { u32 jh = e.len; i32 jo = (i32)(jh - jix_pos) - 4;
               u32 jw = ((u32)((u32)jo & 0x3FFFFu) << 6) | 0x06u;
               base[entry_off + jix_pos    ] = (u8)jw;
