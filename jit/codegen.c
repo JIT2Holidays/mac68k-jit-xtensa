@@ -2540,20 +2540,41 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
              *                                              cpu->pc on
              *                                              source_pc) */
             emit_advance_flush(&e);            /* cpu->pc = source_pc */
+            /* Pre-compute target_pc into a15 for both paths. */
+            u32 target_pc_jsr;
+            {
+                u16 ext_jsr = mac_read16(cpu->mem, op_pc[i] + 2);
+                target_pc_jsr = op_pc[i] + 2 + (u32)(i32)(i16)ext_jsr;
+            }
+            if (g_pc_lit_valid && target_pc_jsr == g_pc_lit_val) {
+                emit_l32r_at(&e, 15, g_pc_lit_off, g_pc_lit_entry_off + e.len);
+            } else {
+                emit_load_imm32(&e, 15, 11, target_pc_jsr);
+            }
             emit_read_g(&e, &rc, G_A(7), 8);   /* a8 = SP */
             xt_addi(&e, 8, 8, -4);              /* a8 = new SP */
             emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
                          entry_off + e.len);
             xt_and  (&e, 10, 8, 9);
             emit_cache_flush(&e, &rc);
-            i32 op_pc_jsr = 0;        /* m68k_step sets cpu->pc directly */
-            i32 op_cyc_jsr = 20;      /* full m68k_step: base 4 + handler 16 */
-            /* M6.123 — narrow touched_mask: JSR modifies only A7. */
+            i32 op_pc_jsr = 0;        /* helper sets cpu->pc directly */
+            i32 op_cyc_jsr = 20;      /* base 4 + handler 16 */
+            /* M6.238b — JSR (d16,PC) MMIO slow path: reuse
+             * HELPER_JIT_BSR_W_MMIO. Both ops push (source_pc + 4) and set
+             * pc = target_pc. thinkc-bullseye fires this MMIO bridge 35K
+             * times — strictly absent from other snaps. */
             g_helper_touched_mask = (u16)(1u << G_A(7));
-            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_jsr, op_cyc_jsr)));
-            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
-                                              entry_off, &rc, op_pc_jsr, op_cyc_jsr);
+            g_helper_sr_mask = 0u;
+            g_helper_arg_mask = 1u;
+            u32 jsr_bridge_size = emit_jit_fast_helper_size(&rc);
+            xt_beqz (&e, 10, (i32)(6u + jsr_bridge_size));
+            emit_jit_fast_helper(&e, 15, 0,
+                                 lit_off[HELPER_JIT_BSR_W_MMIO],
+                                 entry_off, &rc);
             g_helper_touched_mask = 0xFFFFu;
+            g_helper_sr_mask = 3u;
+            g_helper_arg_mask = 3u;
+            (void)op_pc_jsr;
             u32 jjsr_pos = e.len;
             xt_j    (&e, 4);
             /* Fast path: write return_pc (= cpu->pc + 4) as 4 BE bytes to
@@ -2569,16 +2590,8 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             xt_extui(&e, 11, 10,  8, 7); xt_s8i(&e, 11, 9, 2);
             xt_extui(&e, 11, 10,  0, 7); xt_s8i(&e, 11, 9, 3);
             emit_write_g(&e, &rc, G_A(7), 8);
-            /* Set cpu->pc = target. LITERAL_BCC_PC holds target_pc. */
-            if (g_pc_lit_valid) {
-                emit_l32r_at(&e, 10, g_pc_lit_off,
-                             g_pc_lit_entry_off + e.len);
-            } else {
-                u16 ext = mac_read16(cpu->mem, op_pc[i] + 2);
-                u32 target_pc = op_pc[i] + 2 + (u32)(i32)(i16)ext;
-                emit_load_imm32(&e, 10, 11, target_pc);
-            }
-            xt_s32i(&e, 10, R_CPU, OFF_PC);
+            /* M6.238b — target_pc already in a15 (loaded before bridge). */
+            xt_s32i(&e, 15, R_CPU, OFF_PC);
             emit_advance(&e, op_pc_jsr, op_cyc_jsr);
 
             u32 here_jsr = e.len;
