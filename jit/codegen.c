@@ -8099,16 +8099,33 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
              * ext), cycles 4 (interp returns early before the +4 in
              * the NEGX/CLR/NEG/NOT/TST/TAS group).
              *
-             * Sibling of M6.144 BTST.B (d16,An) — same EA pattern,
-             * same RAM-bounds-check + custom-MMIO-helper structure.
-             * The custom helper (m68k_jit_tst_b_mmio) takes EA in
-             * jit_arg1 and sets only N/Z (V/C cleared, X kept).
-             *
-             * Fast path: l8ui byte, shift to bit 31 so emit_logic_flags
-             * sees N=bit 7 and Z=(byte==0) at the same position it would
-             * for a .L value. */
+             * M6.194 — fused with Bcc.S when the next op is BNE/BEQ/
+             * BLT/BLE with non-trivial disp. The .B sign-bit goes to
+             * bit 31 so emit_cmp_cond_fused (s==d==r) derives N=byte
+             * sign, Z=(byte==0), V=0 (cancels). Saves ~10 LX7 per
+             * fire on the 638 K-hit Finder walk. */
             int an = w & 7;
             i16 d16 = (i16)mac_read16(cpu->mem, op_pc[i] + 2);
+
+            /* M6.194 fusion eligibility — next op is Bcc.S BNE/BEQ/
+             * BLT/BLE with i8 disp != 0/-1. */
+            bool fuse = false;
+            int fuse_cc = 0;
+            i32 fuse_disp = 0;
+            u32 fuse_ft = 0;
+            if (i + 1 < n_ops) {
+                u16 nw = op_word[i + 1];
+                if ((nw >> 12) == 0x6) {
+                    int cc = (nw >> 8) & 0xF;
+                    i32 disp = (i8)(nw & 0xFF);
+                    if ((cc == 6 || cc == 7 || cc == 13 || cc == 15) && disp != 0 && disp != -1) {
+                        fuse = true;
+                        fuse_cc = cc;
+                        fuse_disp = disp;
+                        fuse_ft = op_pc[i + 1] + 2;
+                    }
+                }
+            }
 
             emit_advance_flush(&e);
             emit_read_g(&e, &rc, G_A(an), 8);
@@ -8127,11 +8144,13 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             /* Bridge size for the MMIO arm (must match what we emit).
              * 3 setup ops: s32i arg1, mov R_ARG, l32r helper, callx0.
              * Plus 3 each for sr_flush (if g_sr_dirty) and sr_reload.
-             * No emit_cache_reload — tst_b_mmio doesn't touch D/A regs. */
+             * No emit_cache_reload — tst_b_mmio preserves D/A regs.
+             * M6.194 — add fused helper-Bcc tail size when fusing. */
             u32 tst_bridge_size = 4u * 3u;  /* s32i, mov, l32r, callx0 */
             if (g_sr_dirty) tst_bridge_size += 3u;
             tst_bridge_size += 3u;          /* emit_sr_reload */
-            xt_beqz(&e, 10, (i32)(6u + tst_bridge_size));
+            u32 fuse_tail_sz = fuse ? fused_helper_bcc_tail_size(fuse_cc) : 0u;
+            xt_beqz(&e, 10, (i32)(6u + tst_bridge_size + fuse_tail_sz));
             /* --- Custom MMIO TST helper bridge. --- */
             sext_memo_invalidate();
             emit_sr_flush(&e);
@@ -8144,6 +8163,18 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             emit_sr_reload(&e);
             /* Note: NO emit_cache_reload — tst_b_mmio preserves D/A. */
             /* --- end custom bridge --- */
+            if (fuse) {
+                /* Slow path tail: R_SR was reloaded by the helper with
+                 * the new N/Z bits; emit_cond reads R_SR to get the
+                 * branch condition. Fold TST.B 4 + Bcc.S 12 = 16 cyc.
+                 * The accumulator is 0 (op's own advance not yet done). */
+                u32 before = e.len;
+                emit_cond(&e, fuse_cc);
+                emit_bcc_branchless_tail(&e, fuse_ft, fuse_disp, 16);
+                if (e.len - before != fuse_tail_sz) {
+                    e.overflow = true;
+                }
+            }
             u32 jtb_pos = e.len;
             xt_j(&e, 4);
             /* Fast path: read byte from RAM, set N/Z via logic flags. */
@@ -8151,20 +8182,34 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                          entry_off + e.len);
             xt_add(&e, 9, 9, 8);
             xt_l8ui(&e, 10, 9, 0);                  /* a10 = byte */
-            if (!flags_dead[i]) {
+            if (fuse) {
+                /* Shift byte to bit 31 so N = byte's sign. Pass
+                 * s==d==r==shifted_byte: V cancels (s==d), N=bit31(r),
+                 * Z=(r==0). TST.B 4 + Bcc.S 12 = 16 cyc folded. */
+                xt_slli(&e, 10, 10, 24);
+                emit_cmp_cond_fused(&e, fuse_cc, 10, 10, 10);
+                emit_bcc_branchless_tail(&e, fuse_ft, fuse_disp, 16);
+            } else if (!flags_dead[i]) {
                 /* Shift byte to bit 31 so emit_logic_flags reads N=bit 7
                  * and Z=(byte==0) at the .L convention. */
                 xt_slli(&e, 10, 10, 24);
                 emit_logic_flags(&e, 10);
             }
             sext_memo_invalidate();
-            emit_advance(&e, op_pc_tb, op_cyc_tb);
+            if (!fuse) emit_advance(&e, op_pc_tb, op_cyc_tb);
             u32 here_tb = e.len;
             i32 jo_tb = (i32)(here_tb - jtb_pos) - 4;
             u32 jw_tb = ((u32)((u32)jo_tb & 0x3FFFFu) << 6) | 0x06u;
             base[entry_off + jtb_pos    ] = (u8)jw_tb;
             base[entry_off + jtb_pos + 1] = (u8)(jw_tb >> 8);
             base[entry_off + jtb_pos + 2] = (u8)(jw_tb >> 16);
+
+            if (fuse) {
+                /* Bcc.S has set cpu->pc directly and absorbed all cycles. */
+                g_pc_acc = 0;
+                g_cyc_acc = 0;
+                i++;   /* skip absorbed Bcc.S */
+            }
 
             inline_ops++; done = true;
         } else if (top == 0x4 && ((w >> 8) & 0xF) == 0x4 && szf == 2 && mode == 0) {
