@@ -815,6 +815,31 @@ void m68k_jit_bitop_dn_an_mmio(m68k_cpu *cpu) {
     }
 }
 
+/* M6.242 — MOVE.W (addr),(Am)+ MMIO fast helper. Used by the MOVE.W
+ * (d16,An),(Am)+ inline arm when src and/or dst resolve to MMIO.
+ * thinkc-bullseye fires this pattern heavily (0x32E9 + 0x366E + 0x346E
+ * ~63K combined).
+ *
+ * Args:
+ *   jit_arg1 = src addr (caller-computed)
+ *   jit_arg2 = dst Am idx (0..7)
+ *
+ * Reads .W from src, writes to cpu->a[am], post-increments An by 2.
+ * MOVE-family CCR (N from bit 15, Z from .W == 0, V/C=0, X preserved). */
+void m68k_jit_move_w_addr_to_postinc_mmio(m68k_cpu *cpu) {
+    int am = (int)(cpu->jit_arg2 & 7);
+    u32 src = cpu->jit_arg1;
+    u16 v = mac_read16(cpu->mem, src);
+    u32 dst = cpu->a[am];
+    mac_write16(cpu->mem, dst, v);
+    /* .W postinc: A7 increments by 2 too (same as size, only .B differs). */
+    cpu->a[am] = dst + 2;
+    u8 ccr = m68k_get_ccr(cpu) & CCR_X;
+    if (v == 0)     ccr |= CCR_Z;
+    if (v & 0x8000) ccr |= CCR_N;
+    m68k_set_ccr(cpu, ccr);
+}
+
 /* M6.241 — CMP.W (addr),Dn MMIO fast helper. Used by CMP.W (d16,An),Dn /
  * CMP.W (An),Dn / CMP.W (d8,An,Xn),Dn arms when source address resolves
  * to MMIO. thinkc-bullseye fires CMP.W (d16,An),Dn family (0xB66E, 0xB06E,

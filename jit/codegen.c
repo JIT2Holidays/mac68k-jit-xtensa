@@ -5884,6 +5884,56 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + jm236_pos + 2] = (u8)(jw_m236 >> 16);
 
             inline_ops++; done = true;
+        } else if (top == 0x3 && ((w >> 6) & 7) == 3 && mode == 5) {
+            /* M6.242 — MOVE.W (d16,An),(Am)+ via custom MMIO helper.
+             * thinkc-bullseye fires this pattern heavily across multiple
+             * variants:
+             *   0x32E9 (MOVE.W (d16,A1),(A1)+) 26,376
+             *   0x366E (MOVE.W (d16,A6),(A3)+) 20,449
+             *   0x346E (MOVE.W (d16,A6),(A2)+) 17,152
+             *   ~63K combined. STRICTLY ABSENT from all 6 other snapshots.
+             *
+             * M6.237 (an earlier inline-with-RAM-fast-path attempt) was
+             * reverted because runtime never took the fast path (src/dst
+             * always MMIO in bullseye). M6.242 uses a custom MMIO helper
+             * instead — skips m68k_step's decode + cpu->instrs++ for
+             * the always-firing slow path.
+             *
+             * Helper m68k_jit_move_w_addr_to_postinc_mmio takes src_addr
+             * (jit_arg1) and dst_am_idx (jit_arg2); reads/writes via
+             * mac_read16/mac_write16 (RAM/MMIO transparent) and
+             * post-increments cpu->a[am] by 2.
+             *
+             * Length 4 (op + d16 ext), cycles 8. No fast path (bridge-
+             * only) — the inline arm just computes src EA and calls the
+             * helper. */
+            int src_an_m242 = w & 7;
+            int dst_am_m242 = (w >> 9) & 7;
+            u16 ext_m242 = mac_read16(cpu->mem, op_pc[i] + 2);
+            i32 d16_m242 = (i16)ext_m242;
+
+            emit_advance_flush(&e);
+            emit_cache_flush(&e, &rc);
+            /* Compute src EA = a[src_an] + d16 into a8. */
+            emit_read_g(&e, &rc, G_A(src_an_m242), 8);
+            if (d16_m242 >= -128 && d16_m242 <= 127) {
+                if (d16_m242 != 0) xt_addi(&e, 8, 8, d16_m242);
+            } else {
+                emit_load_imm(&e, 9, 10, (u32)d16_m242);
+                xt_add (&e, 8, 8, 9);
+            }
+            /* Helper writes to cpu->a[am] (postinc), reads MOVE-family
+             * CCR — sr_mask default 3, arg_mask 3, touched_mask Am. */
+            g_helper_touched_mask = (u16)(1u << G_A(dst_am_m242));
+            g_helper_arg_mask = 3u;
+            emit_jit_fast_helper(&e, 8, dst_am_m242,
+                                 lit_off[HELPER_JIT_MOVE_W_ADDR_TO_POSTINC_MMIO],
+                                 entry_off, &rc);
+            g_helper_touched_mask = 0xFFFFu;
+            g_helper_arg_mask = 3u;
+            emit_advance(&e, 4, 8);
+            sext_memo_invalidate();
+            inline_ops++; done = true;
         } else if (top == 0xD && szf == 2 && ((w >> 8) & 1) == 0 && mode == 6) {
             /* M6.216 — ADD.L (d8,An,Xn),Dn. Speedo bench's 0xD2B1
              * (ADD.L (d8,A1,Xn),D1) at PC=0x408DD8 fires 34 times/100M.

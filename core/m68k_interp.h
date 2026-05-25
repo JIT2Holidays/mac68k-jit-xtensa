@@ -48,6 +48,7 @@ void m68k_jit_move_w_addr_to_dn_mmio(m68k_cpu *cpu);   /* M6.239 */
 void m68k_jit_move_b_postinc_to_dn_mmio(m68k_cpu *cpu); /* M6.240 */
 void m68k_jit_movea_l_addr_to_am_mmio(m68k_cpu *cpu);   /* M6.240d */
 void m68k_jit_cmp_w_addr_dn_mmio(m68k_cpu *cpu);        /* M6.241 */
+void m68k_jit_move_w_addr_to_postinc_mmio(m68k_cpu *cpu); /* M6.242 */
 
 /* Run the pure interpreter until cpu->cycles >= until or the CPU halts.
  * Polls interrupts and ticks the peripherals between instructions. */
