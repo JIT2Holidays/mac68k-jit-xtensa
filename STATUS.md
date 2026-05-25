@@ -12,7 +12,7 @@ is currently exercised against:
 
 | # | Bench target | lx7/cyc | real_helpers/100M | Status |
 |---|--------------|--------:|------------------:|--------|
-| 1 | **speedo-bench** (Speedometer 4.0 mid-run) | **1.179** | 1 256 | ✅ active |
+| 1 | **speedo-bench** (Speedometer 4.0 mid-run) | **1.179** | 1 237 | ✅ active |
 | 2 | **boot-cycle30m** (boot ROM Toolbox init) | **1.334** | 8 | ✅ active |
 | 3 | **thinkc8-folder-open** (Finder mid-state at THINK C 8 folder) | **1.389** | 0 | ✅ active |
 | 4 | **boot-cycle100m** (boot mid INIT/extension load) | **1.634** | 1 422 | ✅ active |
