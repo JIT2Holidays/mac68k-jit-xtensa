@@ -5907,6 +5907,88 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + jorw_pos + 2] = (u8)(jw_orw >> 16);
 
             inline_ops++; done = true;
+        } else if (top == 0x3 && ((w >> 6) & 7) == 3 && ((w >> 3) & 7) == 5) {
+            /* M6.217 — MOVE.W (d16,An),(Am)+. Speedo bench's 0x346E
+             * (MOVE.W (d16,A6),(A2)+) at PC=0x409338 fires 26/100M,
+             * 0x366E (MOVE.W (d16,A6),(A3)+) 27 = ~53 cumulative +
+             * other variants ≈ 70. Absent from boot 100M / cycle100m /
+             * rom-init / cycle30m top-40 helper histos.
+             *
+             * Mem-to-mem MOVE.W: read .W from (d16,An) source, write .W
+             * to (Am)+ destination, post-increment dst An by 2. Both
+             * src and dst must be in RAM for fast path; helper bridge
+             * otherwise. Same dual-bounds-check shape as M6.83/M6.130
+             * MOVE.L (An)+,(Am)+.
+             *
+             * Length 4 (op + d16), cycles 8 (m68k_step base 4 +
+             * handler 4 for .W mem-to-mem). */
+            int dst_am = (w >> 9) & 7;
+            int src_an = w & 7;
+            u16 ext = mac_read16(cpu->mem, op_pc[i] + 2);
+            i32 d16 = (i16)ext;
+
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(src_an), 8);
+            if (d16 >= -128 && d16 <= 127) {
+                xt_addi(&e, 8, 8, d16);
+            } else {
+                emit_load_imm(&e, 11, 12, (u32)d16);
+                xt_add (&e, 8, 8, 11);
+            }
+            emit_read_g(&e, &rc, G_A(dst_am), 13);       /* a13 = dst An */
+
+            /* Source bounds check on a8. */
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);                      /* a10 = src & RAM_MASK */
+            /* Dest bounds folded into a10. */
+            xt_and  (&e, 11, 13, 9);                     /* a11 = dst & RAM_MASK */
+            xt_or   (&e, 10, 10, 11);                    /* a10 == 0 iff both pass */
+
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_mm = 4, op_cyc_mm = 8;
+            /* Mem-to-mem MOVE.W modifies CCR + dst An. */
+            g_helper_touched_mask = (u16)(1u << G_A(dst_am));
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_mm, op_cyc_mm)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_mm, op_cyc_mm);
+            g_helper_touched_mask = 0xFFFFu;
+            u32 jmm_pos = e.len;
+            xt_j    (&e, 4);
+
+            /* Fast path: read 2 BE bytes from src EA, write 2 BE bytes
+             * to dst EA, increment dst An by 2. */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 11, 9, 8);                      /* a11 = ram + src EA */
+            xt_add  (&e, 12, 9, 13);                     /* a12 = ram + dst EA */
+            xt_l8ui (&e, 8, 11, 0);
+            xt_l8ui (&e, 10, 11, 1);
+            xt_s8i  (&e, 8, 12, 0);
+            xt_s8i  (&e, 10, 12, 1);
+            /* Reconstruct .W value for flags: a10 = (a8 << 8) | a10_low */
+            xt_slli (&e, 8, 8, 8);
+            xt_or   (&e, 10, 10, 8);                     /* a10 = .W value */
+
+            /* Increment dst An by 2. */
+            xt_addi (&e, 11, 13, 2);
+            emit_write_g(&e, &rc, G_A(dst_am), 11);
+
+            if (!flags_dead[i]) {
+                xt_slli (&e, 8, 10, 16);                 /* .W sign at bit 31 */
+                emit_logic_flags(&e, 8);
+            }
+            sext_memo_invalidate();
+            emit_advance(&e, op_pc_mm, op_cyc_mm);
+
+            u32 here_mm = e.len;
+            i32 jo_mm = (i32)(here_mm - jmm_pos) - 4;
+            u32 jw_mm = ((u32)((u32)jo_mm & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jmm_pos    ] = (u8)jw_mm;
+            base[entry_off + jmm_pos + 1] = (u8)(jw_mm >> 8);
+            base[entry_off + jmm_pos + 2] = (u8)(jw_mm >> 16);
+
+            inline_ops++; done = true;
         } else if (top == 0x3 && ((w >> 6) & 7) == 3 && ((w >> 3) & 7) == 0) {
             /* M6.214 — MOVE.W Dn,(An)+. Speedo bench's 0x3AC0
              * (MOVE.W D0,(A5)+) at PC=0x4092B0 and 0x3AC6 (MOVE.W
