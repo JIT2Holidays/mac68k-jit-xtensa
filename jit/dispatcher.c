@@ -110,6 +110,7 @@ static u32 helper_addr(literal_id id, void *user) {
         case HELPER_JIT_MOVE_L_ADDR_TO_ADDR_MMIO: return (u32)(uintptr_t)&m68k_jit_move_l_addr_to_addr_mmio;
         case HELPER_JIT_MOVE_W_ADDR_TO_DN_MMIO: return (u32)(uintptr_t)&m68k_jit_move_w_addr_to_dn_mmio;
         case HELPER_JIT_MOVE_B_POSTINC_TO_DN_MMIO: return (u32)(uintptr_t)&m68k_jit_move_b_postinc_to_dn_mmio;
+        case HELPER_JIT_MOVEA_L_ADDR_TO_AM_MMIO: return (u32)(uintptr_t)&m68k_jit_movea_l_addr_to_am_mmio;
         case LITERAL_ROM_BOUNDS:return rom_bounds_mask(cpu);
         case LITERAL_ROM_BASE:  return (cpu && cpu->mem && cpu->mem->rom) ? MAC_ROM_BASE : 0xFFFFFFFFu;
         /* host_ptr - guest_base, so `host_ptr + guest_addr` lands at
@@ -158,6 +159,7 @@ static u32 helper_addr(literal_id id, void *user) {
         case HELPER_JIT_MOVE_L_ADDR_TO_ADDR_MMIO: return (u32)HELPER_JIT_MOVE_L_ADDR_TO_ADDR_MMIO;
         case HELPER_JIT_MOVE_W_ADDR_TO_DN_MMIO: return (u32)HELPER_JIT_MOVE_W_ADDR_TO_DN_MMIO;
         case HELPER_JIT_MOVE_B_POSTINC_TO_DN_MMIO: return (u32)HELPER_JIT_MOVE_B_POSTINC_TO_DN_MMIO;
+        case HELPER_JIT_MOVEA_L_ADDR_TO_AM_MMIO: return (u32)HELPER_JIT_MOVEA_L_ADDR_TO_AM_MMIO;
         case LITERAL_ROM_BOUNDS:return rom_bounds_mask(cpu);
         case LITERAL_ROM_BASE:  return (cpu && cpu->mem && cpu->mem->rom) ? MAC_ROM_BASE : 0xFFFFFFFFu;
         /* The host sim's translate maps HOST_RAM_BASE + (0x400000..rom_top)
@@ -526,6 +528,7 @@ static void sim_call(xt_sim *s, u32 fn_token) {
         case HELPER_JIT_MOVE_L_ADDR_TO_ADDR_MMIO: m68k_jit_move_l_addr_to_addr_mmio(c->cpu); break;
         case HELPER_JIT_MOVE_W_ADDR_TO_DN_MMIO: m68k_jit_move_w_addr_to_dn_mmio(c->cpu); break;
         case HELPER_JIT_MOVE_B_POSTINC_TO_DN_MMIO: m68k_jit_move_b_postinc_to_dn_mmio(c->cpu); break;
+        case HELPER_JIT_MOVEA_L_ADDR_TO_AM_MMIO: m68k_jit_movea_l_addr_to_am_mmio(c->cpu); break;
         default: break;
     }
 }

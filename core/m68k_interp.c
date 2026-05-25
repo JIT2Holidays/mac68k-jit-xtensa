@@ -815,6 +815,27 @@ void m68k_jit_bitop_dn_an_mmio(m68k_cpu *cpu) {
     }
 }
 
+/* M6.240d — MOVEA.L src,Am MMIO fast helper. Generic addr→An.L
+ * variant. Used by MOVEA.L (d16,An),Am / MOVEA.L (An),Am /
+ * MOVEA.L (xxx).W,Am / MOVEA.L (d8,An,Xn),Am arms when source addr
+ * resolves to MMIO. thinkc-bullseye fires (d16,An),Am variants
+ * ~118K combined across 0x206E/0x2A6E/0x286E.
+ *
+ * Args:
+ *   jit_arg1 = src addr
+ *   jit_arg2 = dst Am (0..7)
+ *
+ * Reads .L (4 BE bytes), writes to cpu->a[am]. MOVEA writes full
+ * 32 bits (no sign-extend for .L). MOVEA never touches CCR.
+ * Skips m68k_step's decode + cpu->instrs++. */
+void m68k_jit_movea_l_addr_to_am_mmio(m68k_cpu *cpu) {
+    int am = (int)(cpu->jit_arg2 & 7);
+    u32 addr = cpu->jit_arg1;
+    u32 v = mac_read32(cpu->mem, addr);
+    cpu->a[am] = v;
+    /* MOVEA — no CCR. */
+}
+
 /* M6.240 — MOVE.B (An)+,Dn MMIO fast helper. Sibling of M6.132's
  * m68k_jit_move_l_postinc_to_dn_mmio for the .B variant. Used by the
  * MOVE.B (An)+,Dn arm (M6.94) when An resolves to MMIO. thinkc-bullseye

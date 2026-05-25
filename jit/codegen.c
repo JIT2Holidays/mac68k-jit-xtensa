@@ -5537,9 +5537,20 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             xt_and  (&e, 10, 8, 9);
             emit_cache_flush(&e, &rc);
             i32 op_pc_mAd = 4, op_cyc_mAd = 8;
-            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_mAd, op_cyc_mAd)));
-            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
-                                              entry_off, &rc, op_pc_mAd, op_cyc_mAd);
+            /* M6.240d — slow path uses MOVEA.L addr→Am helper. bullseye
+             * fires (d16,An),Am variants ~118K combined. */
+            g_helper_touched_mask = (u16)(1u << G_A(dst_am));
+            g_helper_sr_mask = 0u;       /* MOVEA touches no SR */
+            g_helper_arg_mask = 3u;
+            u32 mAd_bridge_size = emit_jit_fast_helper_size(&rc);
+            xt_beqz (&e, 10, (i32)(6u + mAd_bridge_size));
+            emit_jit_fast_helper(&e, 8, dst_am,
+                                 lit_off[HELPER_JIT_MOVEA_L_ADDR_TO_AM_MMIO],
+                                 entry_off, &rc);
+            g_helper_touched_mask = 0xFFFFu;
+            g_helper_sr_mask = 3u;
+            g_helper_arg_mask = 3u;
+            (void)op_pc_mAd; (void)op_cyc_mAd;
             u32 jmAd_pos = e.len;
             xt_j    (&e, 4);
             /* Fast path: 4 BE byte loads. */
