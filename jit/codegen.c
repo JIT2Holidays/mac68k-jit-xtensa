@@ -7212,6 +7212,53 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                 g_helper_touched_mask = 0u;
             }
         } else if (top == 0x4 && ((w >> 8) & 0xF) == 0xA && szf == 1
+                   && mode == 7 && (w & 7) == 0) {
+            /* M6.179 — TST.W (xxx).W. thinkc8-folder-open bench's
+             * 0x4A78 at PC=0x402786 ~25K hits/100 M. Absent from boot
+             * 100 M and speedo. Sibling of M6.77 TST.B (xxx).W — same
+             * compile-time RAM check, but .W (2 bytes) instead of .B.
+             *
+             * Length 4 (op + ext), cycles 4 (interp returns early).
+             * .W needs even alignment so abs_addr & 1 == 0. */
+            u16 ext = mac_read16(cpu->mem, op_pc[i] + 2);
+            u32 abs_addr = (u32)(i32)(i16)ext;
+            abs_addr &= 0xFFFFFFu;
+
+            u32 ram_size_tw = cpu->mem ? cpu->mem->ram_size : 0;
+            bool overlay_tw = cpu->mem ? cpu->mem->overlay : true;
+            bool ram_pow2_tw = ram_size_tw > 0 && (ram_size_tw & (ram_size_tw - 1)) == 0;
+            bool addr_in_ram_tw = !overlay_tw && ram_pow2_tw
+                                  && abs_addr < ram_size_tw
+                                  && (abs_addr & 1) == 0;
+
+            if (addr_in_ram_tw) {
+                emit_advance_flush(&e);
+                emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                             entry_off + e.len);
+                if ((i32)abs_addr >= -128 && (i32)abs_addr <= 127) {
+                    xt_addi(&e, 9, 9, (i32)abs_addr);
+                } else if ((i32)abs_addr >= -2048 && (i32)abs_addr <= 2047) {
+                    xt_movi(&e, 10, (i32)abs_addr);
+                    xt_add (&e, 9, 9, 10);
+                } else {
+                    emit_load_imm(&e, 10, 11, abs_addr);
+                    xt_add (&e, 9, 9, 10);
+                }
+                xt_l8ui (&e, 11, 9, 0);
+                xt_l8ui (&e, 12, 9, 1);
+                xt_slli (&e, 10, 11, 8);
+                xt_or   (&e, 10, 10, 12);            /* a10 = .W */
+                if (!flags_dead[i]) {
+                    xt_slli(&e, 10, 10, 16);          /* sign-bit to bit 31 */
+                    emit_logic_flags(&e, 10);
+                }
+                emit_advance(&e, 4, 4);
+                inline_ops++; done = true;
+            } else {
+                /* MMIO falls through; flag-only. */
+                g_helper_touched_mask = 0u;
+            }
+        } else if (top == 0x4 && ((w >> 8) & 0xF) == 0xA && szf == 1
                    && mode == 5) {
             /* M6.177 — TST.W (d16,An). thinkc8-folder-open bench's
              * 0x4A6D at PC=0x3E5760 ~25K hits/100 M. Absent from boot
