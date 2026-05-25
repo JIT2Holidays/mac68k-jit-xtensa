@@ -560,7 +560,7 @@ forward is structural, not piecemeal. Three items, biggest-win-first:
 | Item | State | Notes |
 |------|-------|-------|
 | 1. Full register caching | mostly done | Cache miss rate < 1 % on steady-state (bench/boot 100 M). **thinkc8 is the outlier at 36 % miss** but absolute compile-time counts are tiny (~75 misses across ~200 accesses per the 100 M run). Widening from 4 → 6+ slots requires repurposing a8..a12 scratch or asm trampolines (Item 1 sub). Untestable on host. |
-| 2. Lazy-CC classifier | partial (M6.158 + M6.162-164) | Per-helper SR + arg masks delivered across 7 non-SR helpers + 3 MOVE-family unused-arg1 helpers + F-line trap. MOVE-family X-bit refactor remains (marginal). Per-flag CCR (split N/Z/V/C/X liveness) would be a meaningful step but requires a significant flags_dead[] refactor. |
+| 2. Lazy-CC classifier | partial (M6.158 + M6.162-164) | Per-helper SR + arg masks delivered across 7 non-SR helpers + 3 MOVE-family unused-arg1 helpers + F-line trap. MOVE-family X-bit refactor remains (marginal). **Per-flag CCR (split N/Z/V/C liveness) attempted but blocked: interp always computes all bits, so a masked emit that preserves bits-not-in-mask diverges from interp at block boundaries (per `memory/per-flag-ccr-blocked.md`). The thinkc8 gain measured was −1.7 % lx7/cyc but is unmergeable without an interp lazy-CC refactor or a separate `cpu->sr_lazy` field.** |
 | 3. Native ESP32 chaining | infrastructure ready (M6.54) | Host-unmeasurable. Awaiting on-device benchmark. |
 
 **Most actionable next moves (post-M6.180):**
