@@ -5250,6 +5250,60 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + jcmpaL_pos + 2] = (u8)(cwL >> 16);
 
             inline_ops++; done = true;
+        } else if (top == 0xB && szf == 2 && ((w >> 8) & 1) == 0
+                   && mode == 7 && (w & 7) == 0) {
+            /* M6.180 — CMP.L (xxx).W,Dn. thinkc8-folder-open bench's
+             * 0xB0B8 at PC=0x3E97A4 ~25K hits/100 M. Absent from
+             * boot 100 M and speedo. Sibling of M6.108 MOVE.L (xxx).W,Dn
+             * for the source-side compile-time RAM bound, and M6.178
+             * CMP.L (d16,An),Dn for the CMP flag-set.
+             *
+             * Length 4 (op + ext), cycles 8. Compile-time RAM check;
+             * MMIO falls through to default helper. */
+            int dn = (w >> 9) & 7;
+            u16 ext = mac_read16(cpu->mem, op_pc[i] + 2);
+            u32 abs_addr = (u32)(i32)(i16)ext;
+            abs_addr &= 0xFFFFFFu;
+
+            u32 ram_size_cx = cpu->mem ? cpu->mem->ram_size : 0;
+            bool overlay_cx = cpu->mem ? cpu->mem->overlay : true;
+            bool ram_pow2_cx = ram_size_cx > 0 && (ram_size_cx & (ram_size_cx - 1)) == 0;
+            bool addr_in_ram_cx = !overlay_cx && ram_pow2_cx
+                                  && abs_addr < ram_size_cx
+                                  && (abs_addr & 1) == 0;
+
+            if (addr_in_ram_cx) {
+                emit_advance_flush(&e);
+                emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                             entry_off + e.len);
+                if ((i32)abs_addr >= -128 && (i32)abs_addr <= 127) {
+                    xt_addi(&e, 9, 9, (i32)abs_addr);
+                } else if ((i32)abs_addr >= -2048 && (i32)abs_addr <= 2047) {
+                    xt_movi(&e, 10, (i32)abs_addr);
+                    xt_add (&e, 9, 9, 10);
+                } else {
+                    emit_load_imm(&e, 10, 11, abs_addr);
+                    xt_add (&e, 9, 9, 10);
+                }
+                xt_l8ui (&e, 11, 9, 0);
+                xt_l8ui (&e, 12, 9, 1);
+                xt_slli (&e, 8, 11, 24);
+                xt_slli (&e, 12, 12, 16);
+                xt_or   (&e, 8, 8, 12);
+                xt_l8ui (&e, 11, 9, 2);
+                xt_l8ui (&e, 12, 9, 3);
+                xt_slli (&e, 11, 11, 8);
+                xt_or   (&e, 8, 8, 11);
+                xt_or   (&e, 8, 8, 12);             /* a8 = src .L */
+                emit_read_g(&e, &rc, G_D(dn), 9);   /* a9 = Dn .L */
+                xt_sub  (&e, 10, 9, 8);
+                emit_addsub_flags_long_masked(&e, true, true, 8, 9, 10, flags_needed[i]);
+                emit_advance(&e, 4, 8);
+                inline_ops++; done = true;
+            } else {
+                /* MMIO src — flag-only effect. */
+                g_helper_touched_mask = 0u;
+            }
         } else if (top == 0xB && szf == 2 && ((w >> 8) & 1) == 0 && mode == 5) {
             /* M6.178 — CMP.L (d16,An),Dn. thinkc8-folder-open bench's
              * 0xB0AD (CMP.L (d16,A5),D0) at PC=0x3EA88C ~25K hits/100 M.
