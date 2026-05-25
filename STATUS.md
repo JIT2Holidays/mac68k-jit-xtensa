@@ -93,6 +93,35 @@ produced a sub-window (1.36% diff). Then iterate inside.
 
 These tools are reusable for any future Mac-Plus interactive scripting.
 
+## M6.227 — JMP (d8,An,Xn) inline — boot-system-load 2.022 → 1.955 lx7/cyc (−3.31 %), −114,679 helpers 🎯
+
+Third boot-system-load hotspot landed: 0x4EF0 (`JMP (d8,A0,Xn)`) at
+PC=0x41713A firing 114,679 times. STRICTLY ABSENT from speedo, thinkc8,
+and all boot-cycle / boot-rom-init snapshots.
+
+Block-terminator arm at predicate `(w & 0xFFF8) == 0x4EF0`. Reuses the
+existing brief-extension format decoder (see the MOVEA src EA at
+`jit/codegen.c:1540`): bit 15 = D/A index reg select, bit 11 = sext16
+vs full-32 index width, bits 7-0 = signed 8-bit displacement. Computes
+target into a8, stores to OFF_PC, advances cycles by 12 (base 4 +
+handler 8).
+
+Bench impact:
+| Bench | M6.226 baseline | M6.227 | Δ |
+|---|---:|---:|---:|
+| boot-system-load | 573,395 / 2.022 | 458,716 / 1.955 | **−114,679 / −3.31 %** |
+| all others | unchanged | unchanged | 0 |
+
+ctest 11/11; diff.sh 321 blocks match.
+
+**Cumulative M6.225-M6.227 boot-system-load delta:** 802,753 → 458,716
+helpers (−42.8 %), 2.140 → 1.955 lx7/cyc (−8.6 %). Three sibling-pattern
+extensions in one /loop iteration; the workload had four 100K+ hot
+helpers and three are now inline. Remaining: 0x1F6B
+(`MOVE.B (d16,An),(d16,Am)`, 229K) and 0x2F72 (`MOVE.L (d8,An,Xn),(d16,Am)`,
+229K) — both mem-to-mem MOVE which is significantly more complex EA
+machinery, deferred to next iteration.
+
 ## M6.226 — ADD.L #imm32,Dn inline — boot-system-load 2.070 → 2.022 lx7/cyc (−2.32 %), −114,679 helpers 🎯
 
 Sibling round to M6.225. Boot-system-load helper-histo's #4 entry

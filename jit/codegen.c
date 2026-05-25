@@ -2370,6 +2370,45 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             emit_advance(&e, 0, 12);   /* m68k_step base 4 + handler 8 */
             sext_memo_invalidate();
             inline_ops++; done = true;
+        } else if ((w & 0xFFF8) == 0x4EF0) {
+            /* M6.227 — JMP (d8,An,Xn). boot-system-load 0x4EF0
+             * (JMP (d8,A0,Xn)) at PC=0x41713A fires 114,679 times via
+             * default m68k_step bridge. STRICTLY ABSENT from the other
+             * 6 bench snapshots — trajectory-safe per
+             * [[bridge-only-arms-trajectory-shift]] category 4b.
+             *
+             * EA = a[an] + sext_brief(Xn) + sext8(d8). The brief ext
+             * word format mirrors the (d8,An,Xn) src-EA handling at
+             * line 1540: bit 15 = D/A select, bits 14-12 = index reg,
+             * bit 11 = .W (sext16) vs .L (full 32) index width, bits
+             * 7-0 = signed displacement.
+             *
+             * Length 4 (op + brief ext); cycles 12 (m68k_step base 4
+             * + handler 8 — JMP cycles are flat across EA modes in
+             * the interp at core/m68k_interp.c:1228). Block terminator. */
+            int an_jix = w & 7;
+            u16 ext_jix = mac_read16(cpu->mem, op_pc[i] + 2);
+            int ireg_jix = (ext_jix >> 12) & 7;
+            int g_index_jix = (ext_jix & 0x8000) ? G_A(ireg_jix) : G_D(ireg_jix);
+            bool need_sext_jix = !(ext_jix & 0x0800);
+            i32 d8_jix = (i8)(ext_jix & 0xFF);
+
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(an_jix), 8);    /* a8 = An */
+            if (need_sext_jix) {
+                emit_read_g(&e, &rc, g_index_jix, 13);
+                xt_slli(&e, 13, 13, 16);
+                xt_srai(&e, 13, 13, 16);
+                xt_add (&e, 8, 8, 13);
+            } else {
+                emit_read_g(&e, &rc, g_index_jix, 9);
+                xt_add (&e, 8, 8, 9);
+            }
+            if (d8_jix != 0) xt_addi(&e, 8, 8, d8_jix);
+            xt_s32i(&e, 8, R_CPU, OFF_PC);
+            emit_advance(&e, 0, 12);
+            sext_memo_invalidate();
+            inline_ops++; done = true;
         } else if (w == 0x4EF9) {
             /* JMP (xxx).L — absolute long jump. Block terminator.
              * Target is a compile-time constant; load via the literal pool
