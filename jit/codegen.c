@@ -6650,12 +6650,20 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             xt_and  (&e, 10, 8, 9);
             emit_cache_flush(&e, &rc);
             i32 op_pc_mAW = 4, op_cyc_mAW = 8;
-            /* MOVEA.W writes only Am (no CCR). */
+            /* M6.243 — slow path uses MOVEA.W addr→Am helper. bullseye
+             * fires 0x366E + 0x346E ~37K combined via MMIO bridge. */
             g_helper_touched_mask = (u16)(1u << G_A(dst_am));
-            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_mAW, op_cyc_mAW)));
-            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
-                                              entry_off, &rc, op_pc_mAW, op_cyc_mAW);
+            g_helper_sr_mask = 0u;     /* MOVEA touches no SR */
+            g_helper_arg_mask = 3u;
+            u32 mAW_bridge_size = emit_jit_fast_helper_size(&rc);
+            xt_beqz (&e, 10, (i32)(6u + mAW_bridge_size));
+            emit_jit_fast_helper(&e, 8, dst_am,
+                                 lit_off[HELPER_JIT_MOVEA_W_ADDR_TO_AM_MMIO],
+                                 entry_off, &rc);
             g_helper_touched_mask = 0xFFFFu;
+            g_helper_sr_mask = 3u;
+            g_helper_arg_mask = 3u;
+            (void)op_pc_mAW; (void)op_cyc_mAW;
             u32 jmAW_pos = e.len;
             xt_j    (&e, 4);
 

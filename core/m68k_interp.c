@@ -815,6 +815,24 @@ void m68k_jit_bitop_dn_an_mmio(m68k_cpu *cpu) {
     }
 }
 
+/* M6.243 — MOVEA.W (addr),Am MMIO fast helper. Sibling of M6.240d for
+ * the .W variant: sign-extends .W to 32-bit before writing to An.
+ * thinkc-bullseye fires 0x366E + 0x346E ~37K combined via MMIO bridge.
+ *
+ * Args:
+ *   jit_arg1 = src addr (caller-computed)
+ *   jit_arg2 = dst Am idx (0..7)
+ *
+ * Reads .W from src, sign-extends to 32, writes to cpu->a[am].
+ * MOVEA never touches CCR. */
+void m68k_jit_movea_w_addr_to_am_mmio(m68k_cpu *cpu) {
+    int am = (int)(cpu->jit_arg2 & 7);
+    u32 addr = cpu->jit_arg1;
+    u16 v = mac_read16(cpu->mem, addr);
+    cpu->a[am] = (u32)(i32)(i16)v;
+    /* MOVEA — no CCR. */
+}
+
 /* M6.242 — MOVE.W (addr),(Am)+ MMIO fast helper. Used by the MOVE.W
  * (d16,An),(Am)+ inline arm when src and/or dst resolve to MMIO.
  * thinkc-bullseye fires this pattern heavily (0x32E9 + 0x366E + 0x346E
