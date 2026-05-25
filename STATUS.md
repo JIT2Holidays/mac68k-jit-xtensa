@@ -93,6 +93,36 @@ produced a sub-window (1.36% diff). Then iterate inside.
 
 These tools are reusable for any future Mac-Plus interactive scripting.
 
+## M6.226 — ADD.L #imm32,Dn inline — boot-system-load 2.070 → 2.022 lx7/cyc (−2.32 %), −114,679 helpers 🎯
+
+Sibling round to M6.225. Boot-system-load helper-histo's #4 entry
+(after M6.225 absorbed 0x22B8) is 0xD0BC = `ADD.L #imm32,D0` at
+PC=0xA001B686 firing 114,679 times. STRICTLY ABSENT from speedo,
+thinkc8, boot-cycle30M / 100M, boot-rom-init — perfect category 4b
+candidate per `[[bridge-only-arms-trajectory-shift]]`.
+
+This is a "pure register-op extension" win — the existing M6.104
+arm covers `ADD.L Dm/Am,Dn` (mode 0/1 src). M6.226 just adds the
+`mode==7 && reg==4` (#imm32) src branch. Read the imm32 from
+op_pc+2, do `Dn += imm32`, emit full ADD flags via the standard
+`emit_addsub_flags_long` helper. Length 6, cycles 8 (matches
+m68k_step base 4 + handler 4 from `core/m68k_interp.c:1576`).
+
+Predicate: `top == 0xD && szf == 2 && !((w >> 8) & 1) && mode == 7
+&& (w & 7) == 4`. Distinct from existing 0xD arms by `(w & 7) == 4`.
+
+Bench impact:
+| Bench | M6.225 baseline | M6.226 | Δ |
+|---|---:|---:|---:|
+| boot-system-load | 688,074 / 2.070 | 573,395 / 2.022 | **−114,679 / −2.32 %** |
+| all others | unchanged | unchanged | 0 |
+
+ctest 11/11; diff.sh 321 blocks match. boot 5M det unchanged at
+1.952 lx7/cyc.
+
+This was the same op the M6.225-first attempt failed on with a JIT
+PC offset; the correct length is 6 (op + 4-byte imm), cycles 8.
+
 ## M6.225 — MOVE.L (xxx).W,(An) MMIO fast helper — boot-system-load 2.140 → 2.070 lx7/cyc (−3.27 %), −114,679 helpers 🎯
 
 Boot-system-load's #1 remaining hotspot. Helper-histo top-3 had:

@@ -2678,6 +2678,28 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             /* ADD.L Dm/Am,Dn — M6.104 extends to An source. */
             emit_add_l_dd(&e, (w >> 9) & 7, w & 7, mode == 1, flags_dead[i], &rc);
             inline_ops++; done = true;
+        } else if (top == 0xD && szf == 2 && !((w >> 8) & 1)
+                   && mode == 7 && (w & 7) == 4) {
+            /* M6.226 — ADD.L #imm32,Dn. boot-system-load bench's 0xD0BC
+             * (ADD.L #imm32,D0) at PC=0xA001B686 fires 114,679 times
+             * via default m68k_step bridge. STRICTLY ABSENT from
+             * speedo, thinkc8, boot-cycle30M/100M, boot-rom-init —
+             * trajectory-safe per [[bridge-only-arms-trajectory-shift]]
+             * category 4b (NEW arm WITH a non-bridge fast path, opcode
+             * absent from boot 100M top-40).
+             *
+             * Length 6 (op + imm32 ext), cycles 8 (m68k_step base 4 +
+             * handler 4 — matches the post-cycle handler addition at
+             * core/m68k_interp.c:1576). Full ADD CCR (X/N/Z/V/C). */
+            int dn_adi = (w >> 9) & 7;
+            u32 imm_adi = mac_read32(cpu->mem, op_pc[i] + 2);
+            emit_load_imm(&e, 8, 11, imm_adi);   /* a8 = src imm32 */
+            emit_read_g(&e, &rc, G_D(dn_adi), 9); /* a9 = pre-add Dn */
+            xt_add (&e, 10, 8, 9);                /* a10 = result */
+            emit_write_g(&e, &rc, G_D(dn_adi), 10);
+            if (!flags_dead[i]) emit_addsub_flags_long(&e, false, false);
+            emit_advance(&e, 6, 8);
+            inline_ops++; done = true;
         } else if ((top == 0x9 || top == 0xD) && ((w >> 8) & 1)
                    && szf == 2 && mode == 0) {
             /* M6.142 — ADDX.L / SUBX.L Dm,Dn. Bench-only per the full
