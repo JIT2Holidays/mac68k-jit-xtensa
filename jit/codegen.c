@@ -3243,6 +3243,108 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                 /* M6.131 — MOVE.L (xxx).W,Dn modifies only Dn. */
                 g_helper_touched_mask = (u16)(1u << G_D(dn));
             }
+        } else if (top == 0x2 && ((w >> 6) & 7) == 4 && mode == 7 && (w & 7) == 0) {
+            /* M6.185 — MOVE.L (xxx).W,-(An). thinkc8-folder-open
+             * bench's 0x2F38 (MOVE.L (xxx).W,-(SP)) at PC=0x3E978C ~25K
+             * hits/100 M. Toolbox-style "push abs-resident parameter"
+             * pattern. Absent from boot 100M and speedo. Trajectory-safe.
+             *
+             * Sibling of M6.175 MOVE.L (xxx).W,(d16,An) — same .L read
+             * from compile-time abs.W RAM addr — but destination is
+             * predecrement -(An) instead of (d16,An). The Am pre-decr
+             * (writes a[an] = a[an] - 4) happens before the store.
+             *
+             * Length 4, cycles 8 (interp base 4 + handler 4). */
+            int dst_an = (w >> 9) & 7;
+            u16 src_ext = mac_read16(cpu->mem, op_pc[i] + 2);
+            u32 abs_addr = (u32)(i32)(i16)src_ext;
+            abs_addr &= 0xFFFFFFu;
+
+            u32 ram_size_mp = cpu->mem ? cpu->mem->ram_size : 0;
+            bool overlay_mp = cpu->mem ? cpu->mem->overlay : true;
+            bool ram_pow2_mp = ram_size_mp > 0 && (ram_size_mp & (ram_size_mp - 1)) == 0;
+            bool addr_in_ram_mp = !overlay_mp && ram_pow2_mp
+                                  && abs_addr < ram_size_mp
+                                  && (abs_addr & 1) == 0;
+
+            if (addr_in_ram_mp) {
+                emit_advance_flush(&e);
+                /* Compute new dst An = a[dst_an] - 4 → a11. Bounds check. */
+                emit_read_g(&e, &rc, G_A(dst_an), 11);
+                xt_addi(&e, 11, 11, -4);
+                emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                             entry_off + e.len);
+                xt_and  (&e, 10, 11, 9);
+                emit_cache_flush(&e, &rc);
+                i32 op_pc_mxp = 4, op_cyc_mxp = 8;
+                g_helper_touched_mask = (u16)(1u << G_A(dst_an));
+                xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_mxp, op_cyc_mxp)));
+                emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                                  entry_off, &rc, op_pc_mxp, op_cyc_mxp);
+                g_helper_touched_mask = 0xFFFFu;
+                u32 jmxp_pos = e.len;
+                xt_j    (&e, 4);
+
+                /* Fast path:
+                 *   Read .L from compile-time abs_addr → a8 (the value).
+                 *   Write An ← a11 (post-decremented).
+                 *   Write a8 (4 BE bytes) to RAM_BASE + a11.
+                 *   emit_logic_flags(a8). */
+
+                /* a9 = RAM_BASE + abs_addr (source pointer). */
+                emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                             entry_off + e.len);
+                if ((i32)abs_addr >= -128 && (i32)abs_addr <= 127) {
+                    xt_addi(&e, 9, 9, (i32)abs_addr);
+                } else if ((i32)abs_addr >= -2048 && (i32)abs_addr <= 2047) {
+                    xt_movi(&e, 12, (i32)abs_addr);
+                    xt_add (&e, 9, 9, 12);
+                } else {
+                    emit_load_imm(&e, 12, 10, abs_addr);
+                    xt_add (&e, 9, 9, 12);
+                }
+                xt_l8ui (&e, 12, 9, 0);
+                xt_l8ui (&e, 10, 9, 1);
+                xt_slli (&e, 8, 12, 24);
+                xt_slli (&e, 10, 10, 16);
+                xt_or   (&e, 8, 8, 10);
+                xt_l8ui (&e, 12, 9, 2);
+                xt_l8ui (&e, 10, 9, 3);
+                xt_slli (&e, 12, 12, 8);
+                xt_or   (&e, 8, 8, 12);
+                xt_or   (&e, 8, 8, 10);             /* a8 = .L value */
+
+                /* Update a[dst_an] = a11. */
+                emit_write_g(&e, &rc, G_A(dst_an), 11);
+
+                /* Write a8 to RAM_BASE + a11. a9 reused. */
+                emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                             entry_off + e.len);
+                xt_add  (&e, 9, 9, 11);
+                xt_extui(&e, 12, 8, 24, 7);
+                xt_s8i  (&e, 12, 9, 0);
+                xt_extui(&e, 12, 8, 16, 7);
+                xt_s8i  (&e, 12, 9, 1);
+                xt_extui(&e, 12, 8,  8, 7);
+                xt_s8i  (&e, 12, 9, 2);
+                xt_extui(&e, 12, 8,  0, 7);
+                xt_s8i  (&e, 12, 9, 3);
+
+                if (!flags_dead[i]) emit_logic_flags(&e, 8);
+                emit_advance(&e, op_pc_mxp, op_cyc_mxp);
+
+                u32 here_mxp = e.len;
+                i32 jo_mxp = (i32)(here_mxp - jmxp_pos) - 4;
+                u32 jw_mxp = ((u32)((u32)jo_mxp & 0x3FFFFu) << 6) | 0x06u;
+                base[entry_off + jmxp_pos    ] = (u8)jw_mxp;
+                base[entry_off + jmxp_pos + 1] = (u8)(jw_mxp >> 8);
+                base[entry_off + jmxp_pos + 2] = (u8)(jw_mxp >> 16);
+
+                inline_ops++; done = true;
+            } else {
+                /* MMIO src — touches dst An. */
+                g_helper_touched_mask = (u16)(1u << G_A(dst_an));
+            }
         } else if (top == 0x2 && ((w >> 6) & 7) == 5 && mode == 7 && (w & 7) == 0) {
             /* M6.175 — MOVE.L (xxx).W,(d16,An). thinkc8-folder-open
              * bench's 0x2178 at PC=0x402746 — Toolbox dispatcher
