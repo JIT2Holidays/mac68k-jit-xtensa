@@ -2169,6 +2169,59 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
         if (top == 0x7) {                  /* MOVEQ */
             emit_moveq(&e, w, flags_dead[i], &rc);
             inline_ops++; done = true;
+        } else if ((w & 0xFFF8) == 0x40E0) {
+            /* M6.192 — MOVE SR,-(An). thinkc8-folder-open bench's
+             * 0x40E7 (MOVE SR,-(A7)) at PC=0x402768 ~25K hits/100 M
+             * (critical-section SR-save pattern). Absent from boot
+             * 100 M and speedo.
+             *
+             * Semantics (per m68k_interp.c:1165):
+             *   ea = a[an] - 2;     (mode 4 = predec, sz=2)
+             *   mac_write16(cpu->mem, ea, cpu->sr);
+             *   cpu->a[an] = ea;
+             *
+             * Length 2, cycles 4 (interp returns early). No CCR effect.
+             * Pure SR-from-register write; no super-mode change. */
+            int an = w & 7;
+
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(an), 8);
+            xt_addi(&e, 8, 8, -2);                      /* a8 = new EA */
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_mse = 2, op_cyc_mse = 4;
+            g_helper_touched_mask = (u16)(1u << G_A(an));
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_mse, op_cyc_mse)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_mse, op_cyc_mse);
+            g_helper_touched_mask = 0xFFFFu;
+            u32 jmse_pos = e.len;
+            xt_j    (&e, 4);
+
+            /* Fast path: write R_SR.W (2 BE bytes) to RAM_BASE + a8. */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);
+            xt_extui(&e, 11, R_SR, 8, 7);              /* a11 = SR high byte */
+            xt_s8i  (&e, 11, 9, 0);
+            xt_extui(&e, 11, R_SR, 0, 7);              /* a11 = SR low byte */
+            xt_s8i  (&e, 11, 9, 1);
+
+            /* Update a[an] = a8 (predec). */
+            emit_write_g(&e, &rc, G_A(an), 8);
+
+            emit_advance(&e, op_pc_mse, op_cyc_mse);
+
+            u32 here_mse = e.len;
+            i32 jo_mse = (i32)(here_mse - jmse_pos) - 4;
+            u32 jw_mse = ((u32)((u32)jo_mse & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jmse_pos    ] = (u8)jw_mse;
+            base[entry_off + jmse_pos + 1] = (u8)(jw_mse >> 8);
+            base[entry_off + jmse_pos + 2] = (u8)(jw_mse >> 16);
+
+            inline_ops++; done = true;
         } else if (w == 0x007C) {
             /* M6.191 — ORI.W #imm,SR. thinkc8-folder-open bench's
              * 0x007C at PC=0x40276A ~25K hits/100 M. The imm at
