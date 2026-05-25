@@ -5928,6 +5928,64 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + jcmpaL_pos + 2] = (u8)(cwL >> 16);
 
             inline_ops++; done = true;
+        } else if (top == 0xB && szf == 3 && ((w >> 8) & 1) == 1 && mode == 2) {
+            /* M6.206 — CMPA.L (An),An. Sibling of M6.170 (which handles
+             * the (d16,An) variant). Speedo bench's 0xB3D6 (CMPA.L (A6),A1)
+             * at PC=0x4106C2 fires 49 times/100M. Absent from boot 100M /
+             * cycle100m / rom-init / cycle30m top-40 helper histos.
+             *
+             * Length 2 (just opword), 10 cycles (m68k_step base 4 + handler
+             * 6 — CMPA.L handler adds 6 per m68k_interp.c:1527).
+             *
+             * Same fast path / helper bridge shape as M6.170; just drops
+             * the d16 fetch / addition. */
+            int dst_an = (w >> 9) & 7;
+            int src_an = w & 7;
+
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(src_an), 8);
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_cmpaL2 = 2, op_cyc_cmpaL2 = 10;
+            g_helper_touched_mask = 0u;
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_cmpaL2, op_cyc_cmpaL2)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_cmpaL2, op_cyc_cmpaL2);
+            g_helper_touched_mask = 0xFFFFu;
+
+            u32 jcmpaL2_pos = e.len;
+            xt_j    (&e, 4);
+
+            /* Fast path: 4 BE byte loads → .L src in a8; CMP against
+             * dst An; emit full flag set. */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);
+            xt_l8ui (&e, 11, 9, 0);
+            xt_l8ui (&e, 12, 9, 1);
+            xt_slli (&e, 8, 11, 24);
+            xt_slli (&e, 12, 12, 16);
+            xt_or   (&e, 8, 8, 12);
+            xt_l8ui (&e, 11, 9, 2);
+            xt_l8ui (&e, 12, 9, 3);
+            xt_slli (&e, 11, 11, 8);
+            xt_or   (&e, 8, 8, 11);
+            xt_or   (&e, 8, 8, 12);                /* a8 = src .L */
+            emit_read_g(&e, &rc, G_A(dst_an), 9);  /* a9 = dst .L */
+            xt_sub  (&e, 10, 9, 8);
+            emit_addsub_flags_long_masked(&e, true, true, 8, 9, 10, flags_needed[i]);
+            emit_advance(&e, op_pc_cmpaL2, op_cyc_cmpaL2);
+
+            u32 cmpaL2_here = e.len;
+            i32 cmpaL2_off = (i32)(cmpaL2_here - jcmpaL2_pos) - 4;
+            u32 cwL2 = ((u32)((u32)cmpaL2_off & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jcmpaL2_pos    ] = (u8)cwL2;
+            base[entry_off + jcmpaL2_pos + 1] = (u8)(cwL2 >> 8);
+            base[entry_off + jcmpaL2_pos + 2] = (u8)(cwL2 >> 16);
+
+            inline_ops++; done = true;
         } else if (top == 0xC && szf == 1 && ((w >> 8) & 1) == 0
                    && mode == 7 && (w & 7) == 0) {
             /* M6.183 — AND.W (xxx).W,Dn. thinkc8-folder-open bench's
