@@ -3623,6 +3623,97 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                 /* MMIO src — touches dst An. */
                 g_helper_touched_mask = (u16)(1u << G_A(dst_an));
             }
+        } else if (top == 0x2 && ((w >> 6) & 7) == 4 && mode == 5) {
+            /* M6.219 — MOVE.L (d16,An),-(Am). Speedo bench's 0x2F2E
+             * (MOVE.L (d16,A6),-(A7)) at PC=0x03873C fires 26 times/
+             * 100M. Absent from boot 100M / cycle100m / rom-init /
+             * cycle30m top-40 helper histos (M6.142 trajectory-safe).
+             *
+             * Sibling of M6.185 MOVE.L (xxx).W,-(An) — same .L copy
+             * with predec dst, but the source is (d16,An) (runtime
+             * EA via An + sext(d16)) instead of compile-time abs.W.
+             * Both src and dst need RAM bounds check (M6.83/M6.130
+             * dual-bounds pattern). Length 4 (op + d16), cycles 8.
+             *
+             * Bridge's touched_mask includes G_A(dst_an) — m68k_step's
+             * ea_decode predec'es cpu->a[dst_an]. */
+            int dst_an = (w >> 9) & 7;
+            int src_an = w & 7;
+            u16 ext = mac_read16(cpu->mem, op_pc[i] + 2);
+            i32 d16 = (i16)ext;
+
+            emit_advance_flush(&e);
+            /* a8 = src EA = a[src_an] + d16 */
+            emit_read_g(&e, &rc, G_A(src_an), 8);
+            if (d16 >= -128 && d16 <= 127) {
+                xt_addi(&e, 8, 8, d16);
+            } else {
+                emit_load_imm(&e, 11, 12, (u32)d16);
+                xt_add (&e, 8, 8, 11);
+            }
+            /* a11 = new dst An = a[dst_an] - 4 */
+            emit_read_g(&e, &rc, G_A(dst_an), 11);
+            xt_addi(&e, 11, 11, -4);
+
+            /* Bounds: a10 == 0 iff both src and dst are in RAM. */
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);                    /* a10 = src & RAM_MASK */
+            xt_and  (&e, 12, 11, 9);                   /* a12 = dst & RAM_MASK */
+            xt_or   (&e, 10, 10, 12);                  /* a10 == 0 iff both OK */
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_mlp = 4, op_cyc_mlp = 8;
+            g_helper_touched_mask = (u16)(1u << G_A(dst_an));
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_mlp, op_cyc_mlp)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_mlp, op_cyc_mlp);
+            g_helper_touched_mask = 0xFFFFu;
+            u32 jmlp_pos = e.len;
+            xt_j    (&e, 4);
+
+            /* Fast path:
+             *   Read 4 BE bytes from src (RAM_BASE + a8) → a10 (.L value).
+             *   Write An ← a11 (post-decremented).
+             *   Write a10 (4 BE bytes) to RAM_BASE + a11.
+             *   emit_logic_flags(a10). */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);                     /* a9 = ram + src EA */
+            xt_l8ui (&e, 8, 9, 0);
+            xt_l8ui (&e, 12, 9, 1);
+            xt_slli (&e, 10, 8, 24);
+            xt_slli (&e, 12, 12, 16);
+            xt_or   (&e, 10, 10, 12);
+            xt_l8ui (&e, 8, 9, 2);
+            xt_l8ui (&e, 12, 9, 3);
+            xt_slli (&e, 8, 8, 8);
+            xt_or   (&e, 10, 10, 8);
+            xt_or   (&e, 10, 10, 12);                  /* a10 = .L value */
+
+            /* Update a[dst_an] = a11. */
+            emit_write_g(&e, &rc, G_A(dst_an), 11);
+
+            /* Write a10 to RAM_BASE + a11. */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 11);
+            xt_extui(&e, 12, 10, 24, 7); xt_s8i(&e, 12, 9, 0);
+            xt_extui(&e, 12, 10, 16, 7); xt_s8i(&e, 12, 9, 1);
+            xt_extui(&e, 12, 10,  8, 7); xt_s8i(&e, 12, 9, 2);
+            xt_extui(&e, 12, 10,  0, 7); xt_s8i(&e, 12, 9, 3);
+
+            if (!flags_dead[i]) emit_logic_flags(&e, 10);
+            sext_memo_invalidate();
+            emit_advance(&e, op_pc_mlp, op_cyc_mlp);
+
+            u32 here_mlp = e.len;
+            i32 jo_mlp = (i32)(here_mlp - jmlp_pos) - 4;
+            u32 jw_mlp = ((u32)((u32)jo_mlp & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jmlp_pos    ] = (u8)jw_mlp;
+            base[entry_off + jmlp_pos + 1] = (u8)(jw_mlp >> 8);
+            base[entry_off + jmlp_pos + 2] = (u8)(jw_mlp >> 16);
+
+            inline_ops++; done = true;
         } else if (top == 0x1 && ((w >> 6) & 7) == 5 && mode == 7 && (w & 7) == 0) {
             /* M6.189 — MOVE.B (xxx).W,(d16,An). thinkc8-folder-open
              * bench's 0x1178 at PC=0x40275C ~25K hits/100 M. Absent
