@@ -1,9 +1,14 @@
 # 68000 Instruction Coverage in the JIT
 
-State at **M6.161**. This document inventories every 68000 instruction
-class the JIT recognises in `jit/codegen.c` and the translation strategy
-used. The Mac Plus is plain MC68000 — no 68010/020+ extensions (BFEXTU,
-MOVES, divs.l etc.) — so the table below is the complete ISA target.
+Reflects coverage through **M6.204**. Bulk-tabular state was captured
+at M6.161; subsequent inline series (M6.169-M6.193 thinkc8 hotspots,
+M6.196 fusion, M6.198-M6.204 boot tuning) are summarized in the
+"M6.169+ delta" section at the bottom rather than re-flowed through
+every row. This document inventories every 68000 instruction class
+the JIT recognises in `jit/codegen.c` and the translation strategy
+used. The Mac Plus is plain MC68000 — no 68010/020+ extensions
+(BFEXTU, MOVES, divs.l etc.) — so the table below is the complete
+ISA target.
 
 > If you're hunting for a hot helper to inline, **search this file first**:
 > the "m68k_step" rows are the remaining opportunities. The "inline-pure"
@@ -317,3 +322,77 @@ quick-reference index — keep it dense and current.
 If a row's Style changes (e.g. m68k_step → ⚡ inline+helper), update the
 "Remaining opportunities" lists too — they're the project's shopping list,
 not just a static report.
+
+---
+
+## M6.169+ delta (summary)
+
+Twenty-five thinkc8 inline arms (M6.169-M6.193) plus seven boot-tuning
+arms (M6.196, M6.198-M6.200, M6.202, M6.204) and tooling (M6.197, M6.201,
+M6.203, M6.205) landed since the M6.161 bulk-table state. Rather than
+re-flow every row, this section catalogs which opcode rows above are
+now updated.
+
+### Thinkc8 series (M6.169-M6.193)
+
+Inline arms targeting thinkc8-folder-open bench helpers. All
+trajectory-safe per [[bridge-only-arms-trajectory-shift]] absence-from-
+boot-100M predicate.
+
+| MS | Opcode shape | Replaces "🐢" row |
+|----|--------------|-------------------|
+| M6.169 | `4A28` TST.B (d16,An) | (new ⚡) |
+| M6.170 | `B1ED` CMPA.L (d16,An),An | (new ✅) |
+| M6.171 | `302D 322D` MOVE.W (d16,An),Dn | extends MOVE.W (d16,An) ✅ |
+| M6.172 | `0C50` CMPI.W #imm,(An) | extends CMPI.W ⚡ |
+| M6.173 | `4E58` UNLK An | `UNLK` row now ✅ |
+| M6.174 | `4E50` LINK An,#d16 | `LINK` row now ✅ |
+| M6.175 | `2178` MOVE.L (xxx).W,(d16,An) | (new ⚡) |
+| M6.176 | `200D` MOVE.L Am,Dn | (new ✅) |
+| M6.177 | `4A6D` TST.W (d16,An) | (new ⚡) |
+| M6.178 | `B0AD` CMP.L (d16,An),Dn | (new ✅) |
+| M6.179 | `4A78` TST.W (xxx).W | (new ✅) |
+| M6.180 | `B0B8` CMP.L (xxx).W,Dn | (new ✅) |
+| M6.181 | `4250` CLR.W (An) | extends CLR.W mem ⚡ |
+| M6.182 | `42A8` CLR.L (d16,An) | (new ⚡) |
+| M6.183 | `C078` AND.W (xxx).W,Dn | (new ✅) |
+| M6.184 | `486E` PEA (d16,An) | `PEA` row partly ⚡ now |
+| M6.185 | `2F38` MOVE.L (xxx).W,-(An) | (new ⚡) |
+| M6.186 | `2472` MOVEA.L (d8,An,Xn),Am | first (d8,An,Xn) ⚡ |
+| M6.187 | `0C70` CMPI.W #imm,(d8,An,Xn) | second (d8,An,Xn) ⚡ |
+| M6.188 | `1141` MOVE.B Dn,(d16,An) | extends MOVE.B Dn,mem ⚡ |
+| M6.189 | `1178` MOVE.B (xxx).W,(d16,An) | (new ⚡) |
+| M6.190 | `A0xx` line-A trap | `TRAP` family — now ⚡ (m68k_jit_aline_trap) |
+| M6.191 | `007C` ORI.W #imm,SR (S=0 only) | `ORI to SR` row partly ✅ |
+| M6.192 | `40E7` MOVE SR,-(An) | (new ⚡) |
+| M6.193 | `46DF` MOVE (An)+,SR | (new ⚡ m68k_jit_move_anpi_to_sr) |
+
+Effect: thinkc8 helpers dropped 2 093 K → 0 (−100%); other benches
+unchanged.
+
+### Boot tuning series (M6.196-M6.204)
+
+| MS | Opcode shape | Impact |
+|----|--------------|--------|
+| M6.196 | CMP.L (d16,An),Dn + Bcc.S/W fusion | thinkc8 −149K xt |
+| M6.198 | RTE inline (m68k_jit_rte fast helper) | boot 100M real_helpers −142 |
+| M6.199 | ADDQ.L #imm,(xxx).W with skip_flags | boot 100M helpers −320 |
+| M6.200 | MOVE.B (xxx).L,Dn | boot 100M real_helpers −196 |
+| M6.202 | BTST/BCHG/BCLR/BSET Dn,(An) variable-shift mask | boot 100M helpers −893 |
+| M6.204 | M6.202 MMIO slow-path → m68k_jit_bitop_dn_an_mmio | boot 100M real_helpers −831 |
+
+### Tooling (M6.197 / M6.201 / M6.203 / M6.205)
+
+| MS | What |
+|----|------|
+| M6.197 | Add boot-cycle100m.snap (5th bench target) |
+| M6.201 | Extend boot-snap diff_jit_trace window 11K → 100K cycles |
+| M6.203 | Add boot-cycle30m.snap (6th bench target) |
+| M6.205 | Widen helper-histo dump 20 → 40 entries |
+
+### Current saturation state (post-M6.205)
+
+See `memory/host-perf-saturation.md` for the saturation analysis. The
+host-measurable frontier is genuinely saturated; further wins require
+deeper architectural moves (variable-count shifts in the encoder,
+native ESP32 chain measurement, or M6.66 root-cause fix).
