@@ -8326,6 +8326,88 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             }
             emit_advance(&e, 2, 8);   /* m68k_step base 4 + handler 4 = 8 */
             inline_ops++; done = true;
+        } else if ((top == 0xD || top == 0x9) && szf == 0
+                   && !((w >> 8) & 1) && mode == 5) {
+            /* M6.220 — ADD.B / SUB.B (d16,An),Dn. .B sibling of M6.80
+             * ADD.W/SUB.W (d16,An),Dn. Speedo bench's 0xDE2E (ADD.B
+             * (d16,A6),D7) at PC=0x409344 fires 26 times/100M. Absent
+             * from boot 100M / cycle100m / rom-init / cycle30m top-40
+             * helper histos.
+             *
+             * "Shift to high 8" trick (×24 instead of ×16): operands
+             * placed at bit 24+ so bit 31 = byte's sign. Use byte-only
+             * bounds (LITERAL_RAM_BOUNDS_BYTE / LITERAL_ROM_BOUNDS_BYTE)
+             * to admit odd addresses too. Length 4, cycles 8. */
+            bool is_sub = (top == 0x9);
+            int dn = (w >> 9) & 7;
+            int src_an = w & 7;
+            u16 ext = mac_read16(cpu->mem, op_pc[i] + 2);
+            i32 d16 = (i16)ext;
+
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(src_an), 8);
+            if (d16 >= -128 && d16 <= 127) {
+                xt_addi(&e, 8, 8, d16);
+            } else {
+                emit_load_imm(&e, 11, 12, (u32)d16);
+                xt_add (&e, 8, 8, 11);
+            }
+            /* Unified RAM-or-ROM byte bounds. */
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS_BYTE],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_l32r_at(&e, 9, lit_off[LITERAL_ROM_BOUNDS_BYTE],
+                         entry_off + e.len);
+            xt_and  (&e, 11, 8, 9);
+            emit_l32r_at(&e, 9, lit_off[LITERAL_ROM_BASE],
+                         entry_off + e.len);
+            xt_xor  (&e, 11, 11, 9);
+            xt_and  (&e, 12, 10, 11);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_abd = 4, op_cyc_abd = 8;
+            xt_beqz (&e, 12, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_abd, op_cyc_abd)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_abd, op_cyc_abd);
+            u32 jabd_pos = e.len;
+            xt_j    (&e, 4);
+
+            /* Fast path: pick base via a10. */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_beqz (&e, 10, 6);
+            emit_l32r_at(&e, 9, lit_off[ADDR_ROM_HOST_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);
+            /* Read 1 byte → a11 (.B src zero-ext). */
+            xt_l8ui (&e, 11, 9, 0);
+            /* s = mem.B shifted to high 8 (bit 31 = sign) → a8. */
+            xt_slli (&e, 8, 11, 24);
+            /* d = Dn.B shifted to high 8 → a9; keep full Dn in a11. */
+            emit_read_g(&e, &rc, G_D(dn), 11);
+            xt_slli (&e, 9, 11, 24);
+            /* r = d ± s → a10. */
+            if (is_sub) xt_sub(&e, 10, 9, 8);
+            else        xt_add(&e, 10, 9, 8);
+            /* Write back: Dn[31:8] preserved, Dn[7:0] = bits 24..31 of r. */
+            xt_srli (&e, 11, 11, 8);
+            xt_slli (&e, 11, 11, 8);
+            xt_extui(&e, 12, 10, 24, 7);
+            xt_or   (&e, 11, 11, 12);
+            emit_write_g(&e, &rc, G_D(dn), 11);
+            if (!flags_dead[i]) {
+                emit_addsub_flags_long(&e, is_sub, false);
+            }
+            sext_memo_invalidate();
+            emit_advance(&e, op_pc_abd, op_cyc_abd);
+
+            u32 here_abd = e.len;
+            i32 jo_abd = (i32)(here_abd - jabd_pos) - 4;
+            u32 jw_abd = ((u32)((u32)jo_abd & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jabd_pos    ] = (u8)jw_abd;
+            base[entry_off + jabd_pos + 1] = (u8)(jw_abd >> 8);
+            base[entry_off + jabd_pos + 2] = (u8)(jw_abd >> 16);
+
+            inline_ops++; done = true;
         } else if ((top == 0xD || top == 0x9) && szf == 1
                    && !((w >> 8) & 1) && mode == 5) {
             /* ADD.W / SUB.W (d16,An),Dn — bench-warm 0xD06D (ADD.W
