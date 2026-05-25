@@ -5708,6 +5708,113 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + jm229_pos + 2] = (u8)(jw_m229 >> 16);
 
             inline_ops++; done = true;
+        } else if (top == 0x2 && ((w >> 6) & 7) == 5 && mode == 5) {
+            /* M6.236 — MOVE.L (d16,An),(d16,Am) mem-to-mem .L.
+             * thinkc-bullseye fires 0x2369 (MOVE.L (d16,A1),(d16,A1))
+             * at PC=0x4084E6 27,024 times. Speedo 8 fires, all others 0.
+             * Bullseye-specific hotspot — the THINK C bullseye demo's
+             * inner loop manipulates a struct via two displacement-
+             * computed pointers.
+             *
+             * Sibling of M6.229 MOVE.L (d8,An,Xn),(d16,Am) with src
+             * EA simplified from mode 6 to mode 5 (just `(d16,An)`).
+             * Reuses the M6.229 helper m68k_jit_move_l_addr_to_addr_mmio
+             * (two-register-arg pattern for src/dst MMIO bridging).
+             *
+             * Length 6 (op + d16 src + d16 dst), cycles 8 (m68k_step
+             * base 4 + MOVE handler 4). */
+            int src_an_m236 = w & 7;
+            int dst_an_m236 = (w >> 9) & 7;
+            u16 src_ext_m236 = mac_read16(cpu->mem, op_pc[i] + 2);
+            u16 dst_ext_m236 = mac_read16(cpu->mem, op_pc[i] + 4);
+            i32 src_d16_m236 = (i16)src_ext_m236;
+            i32 dst_d16_m236 = (i16)dst_ext_m236;
+
+            emit_advance_flush(&e);
+            /* Compute src EA into a8 (a[src_an] + d16_src). */
+            emit_read_g(&e, &rc, G_A(src_an_m236), 8);
+            if (src_d16_m236 >= -128 && src_d16_m236 <= 127) {
+                if (src_d16_m236 != 0) xt_addi(&e, 8, 8, src_d16_m236);
+            } else {
+                emit_load_imm(&e, 11, 12, (u32)src_d16_m236);
+                xt_add (&e, 8, 8, 11);
+            }
+            /* Compute dst EA into a15. */
+            emit_read_g(&e, &rc, G_A(dst_an_m236), 15);
+            if (dst_d16_m236 >= -128 && dst_d16_m236 <= 127) {
+                if (dst_d16_m236 != 0) xt_addi(&e, 15, 15, dst_d16_m236);
+            } else {
+                emit_load_imm(&e, 11, 12, (u32)dst_d16_m236);
+                xt_add (&e, 15, 15, 11);
+            }
+
+            /* Both bounds .L RAM-only (even-aligned). */
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            xt_and  (&e, 11, 15, 9);
+            xt_or   (&e, 12, 10, 11);
+
+            emit_cache_flush(&e, &rc);
+
+            /* Manual 2-reg helper bridge (M6.228/M6.229 pattern). */
+            u32 m236_bridge_size = 3u*5u;
+            m236_bridge_size += 3u;
+            if (g_sr_dirty) m236_bridge_size += 3u;
+            xt_beqz (&e, 12, (i32)(6u + m236_bridge_size));
+            sext_memo_invalidate();
+            if (g_sr_dirty) emit_sr_flush(&e);
+            xt_s32i(&e, 8,  R_CPU, OFF_JIT_ARG1);
+            xt_s32i(&e, 15, R_CPU, OFF_JIT_ARG2);
+            xt_mov (&e, R_ARG, R_CPU);
+            emit_l32r_at(&e, R_HELP,
+                         lit_off[HELPER_JIT_MOVE_L_ADDR_TO_ADDR_MMIO],
+                         entry_off + e.len);
+            xt_callx0(&e, R_HELP);
+            g_block_emitted_callx0 = true;
+            emit_sr_reload(&e);
+            u32 jm236_pos = e.len;
+            xt_j    (&e, 4);
+
+            /* Fast path: read 4 BE bytes from src into a10. */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);
+            xt_l8ui (&e, 11, 9, 0);
+            xt_l8ui (&e, 12, 9, 1);
+            xt_slli (&e, 10, 11, 24);
+            xt_slli (&e, 12, 12, 16);
+            xt_or   (&e, 10, 10, 12);
+            xt_l8ui (&e, 11, 9, 2);
+            xt_l8ui (&e, 12, 9, 3);
+            xt_slli (&e, 11, 11, 8);
+            xt_or   (&e, 10, 10, 11);
+            xt_or   (&e, 10, 10, 12);
+
+            /* Write 4 BE bytes to dst. */
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 15);
+            xt_extui(&e, 11, 10, 24, 7);
+            xt_s8i  (&e, 11, 9, 0);
+            xt_extui(&e, 11, 10, 16, 7);
+            xt_s8i  (&e, 11, 9, 1);
+            xt_extui(&e, 11, 10,  8, 7);
+            xt_s8i  (&e, 11, 9, 2);
+            xt_extui(&e, 11, 10,  0, 7);
+            xt_s8i  (&e, 11, 9, 3);
+
+            if (!flags_dead[i]) emit_logic_flags(&e, 10);
+            emit_advance(&e, 6, 8);
+
+            u32 here_m236 = e.len;
+            i32 jo_m236 = (i32)(here_m236 - jm236_pos) - 4;
+            u32 jw_m236 = ((u32)((u32)jo_m236 & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jm236_pos    ] = (u8)jw_m236;
+            base[entry_off + jm236_pos + 1] = (u8)(jw_m236 >> 8);
+            base[entry_off + jm236_pos + 2] = (u8)(jw_m236 >> 16);
+
+            inline_ops++; done = true;
         } else if (top == 0xD && szf == 2 && ((w >> 8) & 1) == 0 && mode == 6) {
             /* M6.216 — ADD.L (d8,An,Xn),Dn. Speedo bench's 0xD2B1
              * (ADD.L (d8,A1,Xn),D1) at PC=0x408DD8 fires 34 times/100M.
