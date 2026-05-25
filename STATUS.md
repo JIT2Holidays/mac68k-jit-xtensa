@@ -275,14 +275,24 @@ hot-code regions (0x40032C ROM init, 0x401F6E post-System-load, and
 0x41E0E6 Speedometer ALU) so a JIT regression in any of them surfaces
 on `ctest` instead of slipping through to a boot/bench run.
 
-## Where things stand right now (post-M6.164)
+## Where things stand right now (post-M6.200)
 
-| Engine | lx7 / cyc | real_lx7 / cyc | × interp baseline (host) |
-|--------|----------:|---------------:|-------------------------:|
-| **Bench** (Speedometer frozen snapshot, 20 M cycles)                | **1.162** | **1.163** | **5.56 ×** ✅ |
-| **Bench** (Speedometer frozen snapshot, 100 M cycles)               | **1.179** | **1.179** | **5.48 ×** ✅ |
-| **Boot** (Mac Plus ROM, 100 M cycles)                               | **1.657** | **1.657** | **3.89 ×** |
-| **Boot** (Mac Plus ROM, 5 M cycles, PC=`0x40032C` deterministic)    | **2.195** | **2.195** | **2.94 ×** |
+The bench rotation now spans 5 snapshots + boot:
+
+| Workload | lx7/cyc | real_lx7/cyc | helpers/100M | Notes |
+|----------|--------:|-------------:|-------------:|-------|
+| **Bench** speedo-bench frozen snapshot, 100 M cycles | **1.179** | **1.179** | 1 993 | tight ALU loop; ALU-bound |
+| **Boot** Mac Plus ROM, 100 M cycles | **1.657** | **1.657** | 176 757 | full Mac-boot trajectory (M6.66 chaos region) |
+| **Boot** boot-rom-init.snap, 100 M (continued boot) | **1.662** | **1.662** | 232 914 | post-RAM-test ROM init |
+| **Boot** boot-system-load.snap, 100 M | **2.280** | **2.280** | 1 146 790 | post-System-load ROM phase (high helpers) |
+| **Boot** boot-cycle100m.snap, 100 M (new M6.197) | **1.635** | **1.635** | 2 124 | mid-System-startup INIT phase |
+| **Boot** boot-rom-init.snap, 5 M det (no IRQ) | **1.952** | **1.952** | 54 | deterministic RAM-test loop |
+| **thinkc8** thinkc8-folder-open.snap, 100 M | **1.389** | **1.389** | 0 ✓ | Finder steady-state, all opcodes inlined |
+
+The M6.197 cycle100m snapshot is the newest deterministic bench
+target (passes the 11K diff-jit-trace window, ctest 10/10).
+M6.198-M6.200 dropped boot 100M real_helpers from 177 546 → 176 888
+via RTE/ADDQ.L (xxx).W/MOVE.B (xxx).L,Dn inlines.
 
 ## M6.149-M6.152 — pure register-op inline series 🎯
 
@@ -555,37 +565,36 @@ divergence chaotic region (see `memory/m6.66-trajectory-traps.md`), so
 new inline arms shift the trajectory more than they shave LX7. The path
 forward is structural, not piecemeal. Three items, biggest-win-first:
 
-**Progress summary (post-M6.180):**
+**Progress summary (post-M6.200):**
 
 | Item | State | Notes |
 |------|-------|-------|
-| 1. Full register caching | mostly done | Cache miss rate < 1 % on steady-state (bench/boot 100 M). **thinkc8 is the outlier at 36 % miss** but absolute compile-time counts are tiny (~75 misses across ~200 accesses per the 100 M run). Widening from 4 → 6+ slots requires repurposing a8..a12 scratch or asm trampolines (Item 1 sub). Untestable on host. |
-| 2. Lazy-CC classifier | partial (M6.158 + M6.162-164) | Per-helper SR + arg masks delivered across 7 non-SR helpers + 3 MOVE-family unused-arg1 helpers + F-line trap. MOVE-family X-bit refactor remains (marginal). **Per-flag CCR (split N/Z/V/C liveness) attempted but blocked: interp always computes all bits, so a masked emit that preserves bits-not-in-mask diverges from interp at block boundaries (per `memory/per-flag-ccr-blocked.md`). The thinkc8 gain measured was −1.7 % lx7/cyc but is unmergeable without an interp lazy-CC refactor or a separate `cpu->sr_lazy` field.** |
-| 3. Native ESP32 chaining | infrastructure ready (M6.54) | Host-unmeasurable. Awaiting on-device benchmark. |
+| 1. Full register caching | mostly done | Cache miss rate < 1 % on steady-state. **thinkc8 36 % miss** but absolute count tiny (~75/200). M6.197 cache-slot canonicalization (sort `rc.guest[]` by guest reg index after picking) was tried — functionally correct but zero measurable chain_cache_matches change because most blocks have ≤1 slot and are already trivially canonical. Widening to 6+ slots needs asm trampolines on ESP32 or repurposing a8..a12. Untestable on host. |
+| 2. Lazy-CC classifier | partial (M6.158/162-164 + M6.198/199) | Per-helper SR + arg masks delivered across 7 non-SR helpers + 3 MOVE-family unused-arg1 helpers + F-line/A-line traps. M6.198 RTE custom helper. M6.199 ADDQ.L (xxx).W skip_flags inline (with the necessary lazy-CC whitelist entry at `~codegen.c:1995`). **Per-flag CCR liveness (split N/Z/V/C liveness) blocked by diff_jit_trace** (`memory/per-flag-ccr-blocked.md`): interp always computes all bits, so masked emits diverge at block boundaries. The measured thinkc8 gain was −1.7 % lx7/cyc but is unmergeable without (a) an interp lazy-CC mode or (b) a `cpu->sr_lazy` field. |
+| 3. Native ESP32 chaining | infrastructure ready (M6.54) | Host-unmeasurable. Awaiting on-device benchmark. The infrastructure (`predicted_next_entry`, `chain_entry_addr`, `cache_sig` compat) is in place and used. ESP32 boot 100M should see ~5–15 LX7 saved per chained block. |
 
-**Most actionable next moves (post-M6.180):**
+**Most actionable next moves (post-M6.200):**
 
-Continued inline arms remain the highest-yield gap. The thinkc8
-helper-histo post-M6.180 still has 13 opcodes at ~25 K hits each
-(CLR.W/L variants, PEA, index-mode MOVE/CMPI, MOVE-from-SR / ORI #imm,SR,
-AND.L (xxx).W). Each matches the M6.142 trajectory-safety predicate
-(absent from boot 100 M and speedo). Cumulative cap: another ~10 %
-on thinkc8 lx7/cyc.
+The remaining productive inline-arm work is in the LOW-FIRE-COUNT region:
+* `BCHG/BSET/BCLR Dn,(An)` (0x09D1/0x08D1) — 700+ boot fires, requires
+  a variable-shift workaround (Xtensa LX7 only has immediate shifts):
+  8-entry mask lookup table OR 9-op MOVNEZ chain. ~50 K LX7 savings if
+  implemented.
+* `MOVE.L Dn,(d16,An)` (0x22AE) — ~32 boot+cycle100m fires. ~1 K LX7.
+* `MOVE.B (d16,An),(Am)` mem-to-mem variants beyond M6.91.
 
-Structural targets that would unlock new ground beyond the current
-saturation:
+Each is small. Capturing additional bench-target snapshots (different
+mid-Mac states) has historically been more productive — the M6.168
+thinkc8 snapshot unlocked the M6.169-M6.193 series (−42 % lx7/cyc,
+−100 % helpers); M6.197 cycle100m unlocked M6.198-M6.200.
+
+Structural targets that would unlock new ground beyond saturation:
 * MOVE-family X-bit pass-through (Item 2 refinement) — requires
   splitting `cpu->sr` low byte from the T/S/IPL high byte to avoid
-  the RMW. Worth ~3 LX7/fire across MOVE.B/W/L helpers. ~50 LX7
-  bytes of helper rework.
-* Per-flag CCR liveness (Item 2 follow-up) — replace `flags_dead[k]`
-  bool with 5-bit mask, propagate through `flags_needed[]` per flag.
-  Lets ADDQ/SUBQ-then-Bcc.NE patterns elide V/C computation. ~80 LX7
-  bytes of liveness pass rework.
-* Cache widening to 5-6 slots (Item 1 sub) — repurpose `a8` or `a13`
-  conditionally when block analysis shows no inline emit needs the
-  scratch. ~5-10 % of the host xt_instrs cost on thinkc8 is the
-  l32i/s32i emits the cache would eliminate.
+  the RMW. Worth ~3 LX7/fire across MOVE.B/W/L helpers.
+* Per-flag CCR liveness with a `cpu->sr_lazy` field (Item 2 unblock).
+* Cache widening to 5-6 slots via asm trampolines on ESP32 (Item 1 sub).
+* Native ESP32 chain measurement (Item 3) — needs on-device profiling.
 
 **Host-perf saturation (memory/host-perf-saturation.md):** post-M6.164
 the host-measurable optimization frontier is saturated. Cataloged
