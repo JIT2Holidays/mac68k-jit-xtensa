@@ -70,7 +70,10 @@ typedef struct via6522 {
     u16 t2c;               /* timer 2 counter                   */
     u8  t2l_lo;            /* timer 2 low latch                 */
     bool t1_irq_armed;     /* T1 will raise IRQ on next timeout */
+    bool t2_irq_armed;     /* T2 is one-shot: armed by T2C-H write,
+                            * cleared when the IRQ fires            */
     u64 last_cycle;        /* cycle stamp of the last timer step */
+    u32 via_tick_rem;      /* CPU-cycle remainder for the /10 divider */
     u64 next_vbl;          /* next CA1 / vertical-blank edge     */
 } via6522;
 

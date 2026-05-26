@@ -220,6 +220,7 @@ static void via_write(mac_mem *m, u32 addr, u8 val) {
         case 8:  v->t2l_lo = val; break;
         case 9:                                          /* T2C-H: load + start */
             v->t2c = (u16)((v->t2l_lo) | ((u16)val << 8));
+            v->t2_irq_armed = true;
             v->ifr &= (u8)~VIA_IRQ_T2;
             mac_via_recalc_irq(m);
             break;
@@ -469,31 +470,39 @@ void mac_mem_tick(mac_mem *m, u64 cycles) {
     via6522 *v = &m->via;
     bool irq_changed = false;
 
-    /* T1 timer: counts down at the CPU clock; on underflow it raises the
-     * T1 interrupt and (free-run mode) reloads from the latch. */
+    /* T1/T2 tick at the VIA Phi2 clock, which is CPU_CLK / 10 on the
+     * Mac Plus (783.36 kHz). Accumulate fractional CPU cycles in
+     * via_tick_rem so the timer count is exact over the long run.
+     * Earlier this counted at the full CPU rate, making timers fire 10×
+     * too fast — Strategic Conquest's Sound-Manager async completion
+     * polls on T2 and hung within one round of Auto Play. */
     if (v->last_cycle == 0) v->last_cycle = cycles;
-    u64 elapsed = cycles - v->last_cycle;
+    u64 elapsed_cyc = cycles - v->last_cycle;
     v->last_cycle = cycles;
+    v->via_tick_rem += elapsed_cyc;
+    u32 elapsed = (u32)(v->via_tick_rem / 10u);
+    v->via_tick_rem %= 10u;
     if (elapsed > 0) {
-        if ((u32)elapsed >= v->t1c) {
+        /* T1: free-running or one-shot per ACR bit 6. */
+        if (elapsed >= v->t1c) {
             if (v->t1_irq_armed) {
                 v->ifr |= VIA_IRQ_T1;
                 irq_changed = true;
                 if (!(v->acr & 0x40)) v->t1_irq_armed = false;  /* one-shot */
             }
-            u32 rem = (u32)elapsed - v->t1c;
+            u32 rem = elapsed - v->t1c;
             v->t1c = (u16)(v->t1l ? (rem % (v->t1l + 1u)) : 0);
         } else {
-            v->t1c = (u16)(v->t1c - (u32)elapsed);
+            v->t1c = (u16)(v->t1c - elapsed);
         }
-        /* T2 is one-shot. */
-        if ((u32)elapsed >= v->t2c) {
+        /* T2 is one-shot: fires exactly once per T2C-H arm. Subsequent
+         * underflows wrap the counter but do NOT re-raise the IRQ. */
+        if (v->t2_irq_armed && elapsed >= v->t2c) {
             v->ifr |= VIA_IRQ_T2;
+            v->t2_irq_armed = false;
             irq_changed = true;
-            v->t2c = (u16)(v->t2c - (u32)elapsed);
-        } else {
-            v->t2c = (u16)(v->t2c - (u32)elapsed);
         }
+        v->t2c = (u16)(v->t2c - elapsed);
     }
 
     /* Vertical-blank edge -> VIA CA1, ~60 Hz. Also paces the .Sony
