@@ -2,7 +2,7 @@
 # Launch the SDL GUI front-end with the Mac Plus ROM + a boot disk.
 # Usage: ./scripts/gui.sh [rom] [disk]
 #
-# Defaults: ROM = roms/MacPlus.ROM, disk = roms/disks/System6.dsk.
+# Defaults: ROM = roms/MacPlus.ROM, disk = roms/disks/System6.0.5.dsk.
 # Override via positional args, e.g.:
 #   ./scripts/gui.sh roms/MacPlus.ROM roms/disks/ssw608_d1.img
 #
@@ -11,15 +11,15 @@
 # reference interpreter set MAC_GUI_INTERP=1.
 #
 # The InfiniteHD6.dsk (if present at roms/disks/InfiniteHD6.dsk) is
-# auto-inserted as drive 2 ~25 seconds after boot — long enough for
-# the Finder to be up but short enough that the icon appears while
-# you're still watching. Override the timing with MAC68K_DISK2_CYCLE
-# (in 68k cycles; default 200_000_000) or disable with MAC68K_NO_HD=1.
+# auto-inserted as drive 2 ~13 seconds after boot — the .Sony driver
+# queues the insert until the Finder is up and shows the icon.
+# Override the timing with MAC68K_DISK2_CYCLE (in 68k cycles;
+# default 100_000_000) or disable with MAC68K_NO_HD=1.
 set -e
 cd "$(dirname "$0")/.."
 
 ROM=${1:-roms/MacPlus.ROM}
-DISK=${2:-roms/disks/System6.dsk}
+DISK=${2:-roms/disks/System6.0.5.dsk}
 
 [ -f build/mac_gui ] || { echo "build/mac_gui missing — run scripts/build.sh" >&2; exit 1; }
 [ -f "$ROM" ] || { echo "ROM not found: $ROM" >&2; exit 1; }

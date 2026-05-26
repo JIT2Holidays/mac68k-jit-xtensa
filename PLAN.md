@@ -155,7 +155,7 @@ A 512×342 1bpp framebuffer is carved from the top of RAM.
    snippets, the test_jit branch. Subsequent passes do each
    optimisation behind that gate one at a time.
 6. **M6 — real Mac ROM** ✅ boots a real Macintosh Plus ROM with
-   System 6.0.8 to the Finder desktop. Needed: the Mac Plus
+   System 6.0.5 to the Finder desktop. Needed: the Mac Plus
    peripheral model (VIA / RTC / SCC / SCSI), CPU bug fixes
    (line-A traps, MOVEP, ABCD / SBCD / NBCD), mini vMac's `.Sony`
    driver patch for floppy I/O, and JIT self-modifying-code

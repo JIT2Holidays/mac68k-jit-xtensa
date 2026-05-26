@@ -11,7 +11,7 @@ cd "$(dirname "$0")/.."
 
 [ -f build/mac68k_host ]            || { echo "build/mac68k_host missing" >&2; exit 1; }
 [ -f roms/MacPlus.ROM ]             || { echo "roms/MacPlus.ROM not found" >&2; exit 1; }
-[ -f roms/disks/System6.dsk ]       || { echo "roms/disks/System6.dsk not found" >&2; exit 1; }
+[ -f roms/disks/System6.0.5.dsk ]       || { echo "roms/disks/System6.0.5.dsk not found" >&2; exit 1; }
 
 if [ $# -gt 0 ]; then CYCS="$*"
 else                  CYCS="100000000 500000000 1000000000 2000000000 3000000000"
@@ -22,11 +22,11 @@ trap 'rm -rf "$TMP"' EXIT
 fail=0
 for cyc in $CYCS; do
     ./build/mac68k_host --jit    --rom roms/MacPlus.ROM \
-        --disk roms/disks/System6.dsk --ram-mb 4 \
+        --disk roms/disks/System6.0.5.dsk --ram-mb 4 \
         --max-cycles "$cyc" --screenshot "$TMP/j.bmp" \
         --audio "$TMP/j.raw" >/dev/null 2>&1
     ./build/mac68k_host --interp --rom roms/MacPlus.ROM \
-        --disk roms/disks/System6.dsk --ram-mb 4 \
+        --disk roms/disks/System6.0.5.dsk --ram-mb 4 \
         --max-cycles "$cyc" --screenshot "$TMP/i.bmp" \
         --audio "$TMP/i.raw" >/dev/null 2>&1
     bmp_ok=0; aud_ok=0

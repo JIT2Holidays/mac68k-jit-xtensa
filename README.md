@@ -65,7 +65,7 @@ Each script `--help`-style block sits in its first comment. Direct
 # drive 2 (auto-inserted post-boot), with a tuned JIT arena + LRU evict
 # and static-successor prefetch on:
 ./build/mac68k_host --jit --rom roms/MacPlus.ROM \
-    --disk roms/disks/System6.dsk \
+    --disk roms/disks/System6.0.5.dsk \
     --evict lru --arena-kb 256 \
     --prefetch static \
     --max-cycles 100000000
@@ -124,7 +124,7 @@ JIT-tuning flags:
   VBL), the Apple RTC, the IWM floppy controller with Apple 3.5″
   GCR synthesis, and reduced SCC / NCR 5380 SCSI. mini vMac is the
   reference.
-- **Boots a real Macintosh Plus ROM with System 6.0.8 to the
+- **Boots a real Macintosh Plus ROM with System 6.0.5 to the
   Finder desktop** — under both the interpreter and the JIT. Full
   power-on self test, Toolbox trap dispatch, QuickDraw, 800 KB
   floppy boot via mini vMac's `.Sony` driver patch

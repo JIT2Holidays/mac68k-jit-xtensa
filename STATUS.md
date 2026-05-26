@@ -36,7 +36,7 @@ compatibility wall. From the InfiniteHD6 disk's own About-MacBench text:
 >   - System 7.5 or better.
 >   - 12 MB or more of physical RAM.
 
-We emulate a **Mac Plus** (68000, System 6.0.8, max 4 MB RAM). MacBench
+We emulate a **Mac Plus** (68000, System 6.0.5, max 4 MB RAM). MacBench
 will refuse to start regardless of how it's launched. The InfiniteHD6
 also doesn't include older MacBench versions (3.0 / 2.0 / etc.) that
 would be compatible.
@@ -149,12 +149,12 @@ exercising a rich opcode mix (variable LSR.L 210K, MOVE.W (d8,An,Xn),Dn
 
 The MacBench 4.0 directive was concluded **infeasible** during this
 work — MacBench 4.0 requires 68030+ / System 7.5+ / 12 MB RAM; the
-Mac Plus emulation is 68000 / System 6.0.8 / max 4 MB RAM. Confirmed
+Mac Plus emulation is 68000 / System 6.0.5 / max 4 MB RAM. Confirmed
 empirically: the OS rejects the launch with "9,500K needed, 3,621K
 available" before MacBench's own CPU/System version checks fire.
 
 Navigation recipe codified in `scripts/snap-thinkc-bullseye.sh`:
-1. Boot Mac Plus from System6.dsk + InfiniteHD6.dsk.
+1. Boot Mac Plus from System6.0.5.dsk + InfiniteHD6.dsk.
 2. Finder navigation: Infinite HD → Developer → scroll → THINK C 8.
 3. View menu → by Name (list view, much more reliable than icon view).
 4. Double-click THINK C 5.0 to launch the IDE.
@@ -603,7 +603,7 @@ The arm series (each is one commit):
 The series methodology (replicates cleanly per [[thinkc8-helper-hotspots]]):
 1. Identify next opcode in helper-histo (~25 K hits or more).
 2. Verify ABSENT from boot 100 M (lookup in `--rom roms/MacPlus.ROM
-   --disk roms/disks/System6.dsk --max-cycles 100000000` histo).
+   --disk roms/disks/System6.0.5.dsk --max-cycles 100000000` histo).
 3. Find sibling arm (similar EA shape + flag pattern). Adapt body.
 4. Triple-lockstep: ctest, scripts/diff.sh.
 5. Re-measure all four benches; commit + push.
@@ -3296,7 +3296,7 @@ init, Finder launch — a much broader opcode mix):
 
 ```
 MAC68K_NO_HD=1 ./build/mac68k_host --jit --rom \
-    --disk roms/disks/System6.dsk --max-cycles 1200000000 roms/MacPlus.ROM
+    --disk roms/disks/System6.0.5.dsk --max-cycles 1200000000 roms/MacPlus.ROM
 ```
 
 The metric for both is **`lx7_per_cyc`** — estimated native Xtensa-LX7
@@ -3312,7 +3312,7 @@ the Speedometer loop at the boot path's expense (or vice versa).
 `speedo-bench.snap` is a machine snapshot frozen inside Speedometer's
 benchmark run (captured with `MAC68K_SNAP`; see core/sony.c + the
 mouse-script host mode). It is gitignored — copyrighted ROM bytes — so
-it is regenerated locally, not distributed. `System6.dsk` / `MacPlus.ROM`
+it is regenerated locally, not distributed. `System6.0.5.dsk` / `MacPlus.ROM`
 come from `roms/get_infinite.sh`.
 
 **Correctness gate.** `ctest` only differential-tests the tiny demo,
@@ -3708,7 +3708,7 @@ EOF
     MAC68K_MOUSESCRIPT=/tmp/probe.mscript MAC68K_FRAMEDIR=/tmp/macframes \
         MAC68K_FRAME_EVERY=50000000 MAC68K_END_CYCLE=1700000000 \
         ./build/mac68k_host --jit --rom roms/macplus.rom \
-            --disk roms/disks/System6.dsk --server >/dev/null 2>&1
+            --disk roms/disks/System6.0.5.dsk --server >/dev/null 2>&1
     sips -s format png /tmp/macframes/frame_031.bmp --out /tmp/probe_y\$y.png
 done
 ```

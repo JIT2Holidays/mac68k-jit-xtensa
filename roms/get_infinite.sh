@@ -4,7 +4,7 @@
 #
 # Downloads, into ./roms/, the three files a fresh clone needs:
 #   roms/MacPlus.ROM            128 KB  Macintosh Plus ROM
-#   roms/disks/System6.dsk       10 MB  bootable System 6.0 hard disk
+#   roms/disks/System6.0.5.dsk   10 MB  bootable System 6.0.5 hard disk
 #   roms/disks/InfiniteHD6.dsk    1 GB  the "Infinite HD" software disk
 #
 # All three come from the Infinite Mac project (https://infinitemac.org,
@@ -18,7 +18,7 @@
 #
 #   cmake -B build && cmake --build build
 #   ./build/mac68k_host --server --rom --ram-mb 4 \
-#       --disk roms/disks/System6.dsk roms/MacPlus.ROM
+#       --disk roms/disks/System6.0.5.dsk roms/MacPlus.ROM
 #
 # (the host auto-mounts InfiniteHD6.dsk sitting next to the boot disk).
 #
@@ -27,7 +27,7 @@ cd "$(dirname "$0")/.."                       # repo root
 mkdir -p roms/disks
 
 ROM="roms/MacPlus.ROM"
-SYS="roms/disks/System6.dsk"
+SYS="roms/disks/System6.0.5.dsk"
 HD="roms/disks/InfiniteHD6.dsk"
 RAW="https://raw.githubusercontent.com/mihaip/infinite-mac/main"
 
@@ -43,12 +43,12 @@ else
     mv "$ROM.tmp" "$ROM"
 fi
 
-# --- 2. System 6.0 boot disk (10 MB, a bootable HFS hard-disk image) -----
+# --- 2. System 6.0.5 boot disk (10 MB, a bootable HFS hard-disk image) ---
 if [ -f "$SYS" ]; then
     echo "* $SYS already present — skipping"
 else
-    echo "* Downloading System 6.0 boot disk ..."
-    curl -fL --progress-bar -o "$SYS.tmp" "$RAW/Images/System%206.0%20HD.dsk"
+    echo "* Downloading System 6.0.5 boot disk ..."
+    curl -fL --progress-bar -o "$SYS.tmp" "$RAW/Images/System%206.0.5%20HD.dsk"
     mv "$SYS.tmp" "$SYS"
 fi
 

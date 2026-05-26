@@ -19,7 +19,7 @@ cd "$(dirname "$0")/.."
 
 [ -f build/mac68k_host ]            || { echo "build/mac68k_host missing — run scripts/build.sh" >&2; exit 1; }
 [ -f roms/MacPlus.ROM ]             || { echo "roms/MacPlus.ROM not found" >&2; exit 1; }
-[ -f roms/disks/System6.dsk ]       || { echo "roms/disks/System6.dsk not found" >&2; exit 1; }
+[ -f roms/disks/System6.0.5.dsk ]       || { echo "roms/disks/System6.0.5.dsk not found" >&2; exit 1; }
 [ -f roms/disks/InfiniteHD6.dsk ]   || { echo "roms/disks/InfiniteHD6.dsk not found" >&2; exit 1; }
 
 TMP=$(mktemp -d)
@@ -39,7 +39,7 @@ MAC68K_SNAP_CYCLE=30000000 \
 MAC68K_END_CYCLE=40000000 \
     ./build/mac68k_host --server \
         --rom roms/MacPlus.ROM \
-        --disk roms/disks/System6.dsk \
+        --disk roms/disks/System6.0.5.dsk \
         --disk roms/disks/InfiniteHD6.dsk \
         --ram-mb 4 \
         --max-cycles 40000000 \

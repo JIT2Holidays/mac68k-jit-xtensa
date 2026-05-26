@@ -14,7 +14,7 @@
 # Output: roms/disks/thinkc8-folder-open.snap (cycle 1.9B, pc=0x3E97C0)
 #
 # Recipe (see [[finder-navigation-cookbook]] in agent memory):
-#   1. Boot from System6.dsk, with InfiniteHD6.dsk inserted at 0.5B cyc.
+#   1. Boot from System6.0.5.dsk, with InfiniteHD6.dsk inserted at 0.5B cyc.
 #   2. Double-click the Infinite HD icon at (465, 170) at 0.6B.
 #   3. Double-click the 'Developer' folder at (228, 119) at 0.9B.
 #   4. Drag the vertical scroll thumb from (412, 132) to (412, 215),
@@ -29,7 +29,7 @@ cd "$(dirname "$0")/.."
 
 [ -f build/mac68k_host ]            || { echo "build/mac68k_host missing — run scripts/build.sh" >&2; exit 1; }
 [ -f roms/MacPlus.ROM ]             || { echo "roms/MacPlus.ROM not found" >&2; exit 1; }
-[ -f roms/disks/System6.dsk ]       || { echo "roms/disks/System6.dsk not found" >&2; exit 1; }
+[ -f roms/disks/System6.0.5.dsk ]       || { echo "roms/disks/System6.0.5.dsk not found" >&2; exit 1; }
 [ -f roms/disks/InfiniteHD6.dsk ]   || { echo "roms/disks/InfiniteHD6.dsk not found" >&2; exit 1; }
 
 TMP=$(mktemp -d)
@@ -75,7 +75,7 @@ MAC68K_SNAP="$TMP/thinkc8.snap" \
 MAC68K_SNAP_CYCLE=1900000000 \
     ./build/mac68k_host --server \
         --rom roms/MacPlus.ROM \
-        --disk roms/disks/System6.dsk \
+        --disk roms/disks/System6.0.5.dsk \
         --disk roms/disks/InfiniteHD6.dsk \
         --ram-mb 4 \
         --max-cycles 2000000000 \

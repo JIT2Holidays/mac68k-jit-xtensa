@@ -20,7 +20,7 @@
 # Output: roms/disks/thinkc-bullseye.snap (cycle 9.5B, pc=0x401F72)
 #
 # Recipe — extends [[finder-navigation-cookbook]]:
-#   1. Boot from System6.dsk, insert InfiniteHD6.dsk at 0.5B cyc.
+#   1. Boot from System6.0.5.dsk, insert InfiniteHD6.dsk at 0.5B cyc.
 #   2. Double-click Infinite HD at (465, 170)        — open desktop.
 #   3. Double-click Developer at (228, 119)          — open Developer.
 #   4. Drag vertical scroll thumb (412, 132)→(412, 215) — reveal THINK C.
@@ -39,7 +39,7 @@ cd "$(dirname "$0")/.."
 
 [ -f build/mac68k_host ]            || { echo "build/mac68k_host missing — run scripts/build.sh" >&2; exit 1; }
 [ -f roms/MacPlus.ROM ]             || { echo "roms/MacPlus.ROM not found" >&2; exit 1; }
-[ -f roms/disks/System6.dsk ]       || { echo "roms/disks/System6.dsk not found" >&2; exit 1; }
+[ -f roms/disks/System6.0.5.dsk ]       || { echo "roms/disks/System6.0.5.dsk not found" >&2; exit 1; }
 [ -f roms/disks/InfiniteHD6.dsk ]   || { echo "roms/disks/InfiniteHD6.dsk not found" >&2; exit 1; }
 
 TMP=$(mktemp -d)
@@ -119,7 +119,7 @@ MAC68K_SNAP="$TMP/thinkc-bullseye.snap" \
 MAC68K_SNAP_CYCLE=9500000000 \
     ./build/mac68k_host --server \
         --rom roms/MacPlus.ROM \
-        --disk roms/disks/System6.dsk \
+        --disk roms/disks/System6.0.5.dsk \
         --disk roms/disks/InfiniteHD6.dsk \
         --ram-mb 4 \
         --max-cycles 10000000000 \
