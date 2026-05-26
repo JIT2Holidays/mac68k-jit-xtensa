@@ -3,6 +3,7 @@
 
 #include "m68k_types.h"
 #include "mac_scsi.h"
+#include "mac_snd.h"
 #include "m68k_cpu.h"
 
 /* Macintosh Plus hardware model — memory map and peripherals.
@@ -182,6 +183,7 @@ typedef struct mac_mem {
      * NULL = silent. */
     void (*snd_sink)(void *ctx, const u8 *samples, u32 n);
     void *snd_ctx;
+    mac_snd_filter snd_filter;
 
     struct m68k_cpu *cpu;
 

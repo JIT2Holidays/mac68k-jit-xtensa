@@ -51,6 +51,26 @@ void mac_mem_init(mac_mem *m, u32 ram_size) {
     mac_scsi_init(&m->scsi);
     sony_init(m);
     mac_input_init(m);
+
+    /* Audio band-pass: LPF anti-alias (default ≈11.13 kHz, the Mac's
+     * Nyquist) + HPF DC-blocker (default 20 Hz, subsonic — removes
+     * the sustained DC the Sound Manager leaves in the buffer at
+     * idle, which would otherwise peg the host VU meter without
+     * producing audible sound).
+     *
+     *   MAC68K_AUDIO_FILTER=off bypasses both
+     *   MAC68K_AUDIO_CUTOFF=<hz> overrides the LPF cutoff
+     *   MAC68K_AUDIO_HPF=<hz>    overrides the HPF cutoff (0 = disable HPF) */
+    double fc_lp = MAC_SND_SAMPLE_RATE * 0.5;
+    double fc_hp = 20.0;
+    const char *cs = getenv("MAC68K_AUDIO_CUTOFF");
+    if (cs) { double v = atof(cs); if (v > 0.0) fc_lp = v; }
+    const char *hs = getenv("MAC68K_AUDIO_HPF");
+    if (hs) fc_hp = atof(hs);    /* 0 → biquad clamps to 1 Hz (≈ passthrough) */
+    mac_snd_filter_init(&m->snd_filter, fc_lp, fc_hp, MAC_SND_SAMPLE_RATE);
+    const char *fs = getenv("MAC68K_AUDIO_FILTER");
+    if (fs && (fs[0] == '0' || fs[0] == 'o' /*off*/ || fs[0] == 'n' /*no*/))
+        m->snd_filter.enabled = false;
 }
 
 void mac_mem_free(mac_mem *m) {

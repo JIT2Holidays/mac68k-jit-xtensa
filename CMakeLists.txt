@@ -27,6 +27,7 @@ add_library(mac68k_core STATIC
     core/demo_rom.c
 )
 target_include_directories(mac68k_core PUBLIC include core)
+target_link_libraries(mac68k_core PUBLIC m)        # mac_snd LPF uses libm
 
 # JIT codegen: Xtensa LX7 emitter, code cache, codegen, dispatcher, and
 # (host only) the in-tree Xtensa simulator that executes JIT output.
