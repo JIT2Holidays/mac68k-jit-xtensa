@@ -86,6 +86,13 @@ static void send_packet(u8 type, const u8 *payload, u32 len) {
     if (len) write_all(payload, len);
 }
 
+/* Server pacing multiplier: real-Mac speed × g_speed_mult / 100.
+ *   100 = 1× (7.83 MHz, the default — Mac Plus original clock)
+ *   200 = 2×, 400 = 4×, 800 = 8×
+ *     0 = uncapped (let the JIT/interp run as fast as the host can)
+ * Set via the GUI's Speed menu button, which sends MACGUI_PKT_SPEED. */
+static u32 g_speed_mult = 100;
+
 static void server_apply_packet(mac_mem *m, u8 type, const u8 *p, u32 len) {
     if (type == MACGUI_PKT_MOUSE && len >= 5) {
         i16 x = (i16)(p[0] | (p[1] << 8));
@@ -93,6 +100,11 @@ static void server_apply_packet(mac_mem *m, u8 type, const u8 *p, u32 len) {
         mac_set_mouse(m, x, y, p[4] != 0);
     } else if (type == MACGUI_PKT_KEY && len >= 2) {
         mac_key_event(m, p[0], p[1] != 0);
+    } else if (type == MACGUI_PKT_SPEED && len >= 2) {
+        (void)m;
+        g_speed_mult = (u32)(p[0] | (p[1] << 8));
+        fprintf(stderr, "[server] speed multiplier = %u (%.2f× real Mac)\n",
+                g_speed_mult, g_speed_mult / 100.0);
     }
 }
 
@@ -269,13 +281,14 @@ static int read_file(const char *path, u8 **out, u32 *len);
  * event, exactly as if the user had connected an external drive. The
  * path is resolved in main(); g_hd_cycle is when to insert it.
  *
- * Default = 200M cycles ≈ 25 s of real time at the GUI's 7.83 MHz
- * pacing. The Finder is reliably up by ~175M cycles (the .Sony
- * driver's first mount-pseudo-exception fires at ~172M); 200M gives
- * a small safety margin. Override with MAC68K_DISK2_CYCLE if you
- * need to insert later (e.g. when scripting a slow-boot scenario). */
+ * Default = 100M cycles ≈ 13 s of real time at the GUI's 7.83 MHz
+ * pacing. The Finder is up by ~175M cycles in the headless path but
+ * we insert sooner here — the Sony mount queue tolerates a pending
+ * insert before the first floppy is mounted. Override with
+ * MAC68K_DISK2_CYCLE if you need to insert later (e.g. when scripting
+ * a slow-boot scenario). */
 static const char *g_hd_path;
-static u64  g_hd_cycle = 200000000ull;
+static u64  g_hd_cycle = 100000000ull;
 static bool g_hd_inserted;
 
 static void service_hd_insert(mac_mem *m, m68k_cpu *cpu) {
@@ -498,9 +511,16 @@ static int server_loop(mac_mem *m, m68k_cpu *cpu) {
 
     while (!cpu->halted) {
         double now = mono_seconds() - t0;
-        /* Pace the Mac to real time (7.8336 MHz). */
-        u64 target = (u64)(now * 7833600.0);
-        if (cpu->cycles < target) m68k_run_until(cpu, target);
+        /* Pace the Mac to real time (7.8336 MHz) × g_speed_mult/100.
+         * g_speed_mult==0 means "uncapped" — advance in fixed chunks
+         * with no sleep so the interp/JIT runs as fast as the host
+         * can go. The GUI's Speed menu changes g_speed_mult live. */
+        if (g_speed_mult == 0) {
+            m68k_run_until(cpu, cpu->cycles + 200000ull);
+        } else {
+            u64 target = (u64)(now * 7833600.0 * (double)g_speed_mult / 100.0);
+            if (cpu->cycles < target) m68k_run_until(cpu, target);
+        }
         service_hd_insert(m, cpu);
         if (now - last_log >= 3.0) {
             last_log = now;

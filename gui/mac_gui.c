@@ -199,13 +199,18 @@ static void spawn_host_backend(const char *self, const char *rom,
          * runs the reference interpreter instead. The JIT renders the
          * same frames as the interpreter (verified post-M6.244) and is
          * the more representative target since real hardware is the
-         * JIT path. */
+         * JIT path.
+         *
+         * --ram-mb 4 is the Mac Plus's hardware maximum (4 × 1 MB SIMM
+         * sockets); override with MAC_GUI_RAM_MB=<n>. */
+        const char *ram_mb = getenv("MAC_GUI_RAM_MB");
+        if (!ram_mb || !*ram_mb) ram_mb = "4";
         if (getenv("MAC_GUI_INTERP")) {
-            execl(exe, exe, "--server", "--rom", "--disk", disk, rom,
-                  (char *)NULL);
+            execl(exe, exe, "--server", "--ram-mb", ram_mb,
+                  "--rom", "--disk", disk, rom, (char *)NULL);
         } else {
-            execl(exe, exe, "--server", "--jit", "--rom",
-                  "--disk", disk, rom, (char *)NULL);
+            execl(exe, exe, "--server", "--jit", "--ram-mb", ram_mb,
+                  "--rom", "--disk", disk, rom, (char *)NULL);
         }
         fprintf(stderr, "exec %s failed: %s\n", exe, strerror(errno));
         _exit(127);
@@ -360,6 +365,9 @@ int main(int argc, char **argv) {
     else          spawn_host_backend(argv[0], rom, disk);
     fcntl(g_fd, F_SETFL, O_NONBLOCK);
 
+    /* Nearest-neighbour scaling on the Mac framebuffer — anti-aliased
+     * black-on-white text looks worse than crisp blocky pixels. */
+    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "0");
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) != 0) {
         fprintf(stderr, "SDL_Init: %s\n", SDL_GetError()); return 1;
     }
@@ -382,24 +390,86 @@ int main(int argc, char **argv) {
             SDL_PauseAudioDevice(g_audio, 0);
     }
     TTF_Init();
-    TTF_Font *font = TTF_OpenFont("/System/Library/Fonts/Monaco.ttf", 13);
+    /* Try a handful of common font paths so the GUI gets labels on
+     * both macOS and Linux. MAC_GUI_FONT=path overrides. */
+    TTF_Font *font = NULL;
+    if (getenv("MAC_GUI_FONT"))
+        font = TTF_OpenFont(getenv("MAC_GUI_FONT"), 13);
+    static const char *font_paths[] = {
+        "/System/Library/Fonts/Monaco.ttf",                              /* macOS */
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",          /* Debian/Ubuntu */
+        "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",                    /* Fedora */
+        "/usr/share/fonts/TTF/DejaVuSansMono.ttf",                      /* Arch */
+        "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+        "/usr/share/fonts/liberation/LiberationMono-Regular.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeMono.ttf",
+        NULL
+    };
+    for (int i = 0; !font && font_paths[i]; i++)
+        font = TTF_OpenFont(font_paths[i], 13);
+    if (!font) fprintf(stderr,
+        "[gui] no TTF font found — labels will be missing. "
+        "Set MAC_GUI_FONT=/path/to/font.ttf to override.\n");
 
-    const int scale = 2;
-    const int sw = MACGUI_SCREEN_W * scale, sh = MACGUI_SCREEN_H * scale;
-    const float unit = sw / 28.0f;          /* keyboard key unit */
-    const int kh = (int)(unit * 0.9f);
-    const int kbd_y = sh + 12;
-    const int win_w = sw;
-    const int win_h = kbd_y + 5 * (kh + 4) + 12;
+    /* --- Scale ------------------------------------------------------------
+     * Integer multiplier from one Mac pixel to one host window pixel.
+     * Note: on display servers that apply fractional scaling (e.g. Gnome
+     * at 133% / 150%), the compositor will further resample the window,
+     * which may blur the rendering. For crisp output, prefer integer
+     * compositor scaling (100% / 200%).
+     * MAC_GUI_SCALE=1|2|3 overrides the initial scale; the menu changes
+     * it at runtime. */
+    int mac_scale = 2;
+    if (getenv("MAC_GUI_SCALE")) {
+        int s = atoi(getenv("MAC_GUI_SCALE"));
+        if (s >= 1 && s <= 3) mac_scale = s;
+    }
+    const int MENU_BAR_PX = 22;      /* physical pixels for the menu bar  */
+    int sw = MACGUI_SCREEN_W * mac_scale;
+    int sh = MACGUI_SCREEN_H * mac_scale;
+    float unit = sw / 28.0f;
+    int   kh   = (int)(unit * 0.9f);
+    int   screen_y = MENU_BAR_PX;
+    int   kbd_y = screen_y + sh + 12;
+    int   win_phys_w = sw;
+    int   win_phys_h = kbd_y + 5 * (kh + 4) + 12;
     build_keyboard(unit, 8, (float)kbd_y, (float)kh);
 
     SDL_Window *win = SDL_CreateWindow("Macintosh — mac68k-jit-xtensa",
-        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, win_w, win_h, 0);
+        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+        win_phys_w, win_phys_h, 0);
     SDL_Renderer *ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED);
     SDL_Texture *screen = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888,
         SDL_TEXTUREACCESS_STREAMING, MACGUI_SCREEN_W, MACGUI_SCREEN_H);
 
-    /* render the key labels once */
+    /* --- Menu bar items ------------------------------------------------- */
+    /* Scale buttons + speed button + quit. */
+    struct MenuBtn { const char *label; SDL_Rect r; SDL_Texture *tex;
+                     int tw, th; int action; };
+    enum { ACT_NONE, ACT_SCALE1, ACT_SCALE2, ACT_SCALE3, ACT_SPEED, ACT_QUIT };
+    /* The Speed button starts wide enough to fit the longest label
+     * ("Speed: Max"); subsequent re-renders may produce narrower text
+     * but the rect itself never shrinks. */
+    struct MenuBtn menu[5] = {
+        { "100%",       {0}, NULL, 0, 0, ACT_SCALE1 },
+        { "200%",       {0}, NULL, 0, 0, ACT_SCALE2 },
+        { "300%",       {0}, NULL, 0, 0, ACT_SCALE3 },
+        { "Speed: Max", {0}, NULL, 0, 0, ACT_SPEED  },
+        { "Quit",       {0}, NULL, 0, 0, ACT_QUIT   },
+    };
+    const int N_MENU = 5;
+
+    /* Speed presets the Speed button cycles through. mult_x100 = 100
+     * means 1× real-Mac speed (7.83 MHz). 0 = uncapped. */
+    static const struct { const char *label; uint16_t mult_x100; } SPEEDS[] = {
+        { "1x", 100 }, { "2x", 200 }, { "4x", 400 }, { "8x", 800 }, { "Max", 0 },
+    };
+    const int N_SPEEDS = (int)(sizeof(SPEEDS) / sizeof(SPEEDS[0]));
+    int g_speed_idx = 0;     /* default 1× */
+
+    /* Render the key labels + menu button labels once (optional —
+     * if no font is available we still draw the buttons so they're
+     * clickable, just without text). */
     if (font) {
         SDL_Color fg = { 30, 30, 30, 255 };
         for (int i = 0; i < g_nkeys; i++) {
@@ -411,6 +481,52 @@ int main(int argc, char **argv) {
                 SDL_FreeSurface(s);
             }
         }
+        SDL_Color mfg = { 20, 20, 20, 255 };
+        for (int i = 0; i < N_MENU; i++) {
+            SDL_Surface *s = TTF_RenderUTF8_Blended(font, menu[i].label, mfg);
+            if (s) {
+                menu[i].tex = SDL_CreateTextureFromSurface(ren, s);
+                menu[i].tw = s->w; menu[i].th = s->h;
+                SDL_FreeSurface(s);
+            }
+        }
+    }
+    /* Lay out the menu buttons unconditionally — they're clickable
+     * even without text. */
+    {
+        int mx = 8;
+        for (int i = 0; i < N_MENU; i++) {
+            int btn_w = (menu[i].tw ? menu[i].tw : 48) + 16;
+            menu[i].r.x = mx;
+            menu[i].r.y = (MENU_BAR_PX - 18) / 2;
+            menu[i].r.w = btn_w;
+            menu[i].r.h = 18;
+            mx += btn_w + 4;
+        }
+    }
+    /* Initial Speed button label = "Speed: 1x" (rect was sized using
+     * "Speed: Max" above so subsequent re-renders fit). Also push the
+     * initial speed to the backend so its pacing matches the GUI. */
+    if (font) {
+        for (int i = 0; i < N_MENU; i++) {
+            if (menu[i].action != ACT_SPEED) continue;
+            char lbl[32];
+            snprintf(lbl, sizeof(lbl), "Speed: %s", SPEEDS[g_speed_idx].label);
+            if (menu[i].tex) SDL_DestroyTexture(menu[i].tex);
+            SDL_Color fg = { 20, 20, 20, 255 };
+            SDL_Surface *s = TTF_RenderUTF8_Blended(font, lbl, fg);
+            if (s) {
+                menu[i].tex = SDL_CreateTextureFromSurface(ren, s);
+                menu[i].tw = s->w; menu[i].th = s->h;
+                SDL_FreeSurface(s);
+            }
+            break;
+        }
+    }
+    {
+        uint16_t m = SPEEDS[g_speed_idx].mult_x100;
+        uint8_t p[2] = { (uint8_t)m, (uint8_t)(m >> 8) };
+        send_packet(MACGUI_PKT_SPEED, p, 2);
     }
 
     for (int i = 0; i < MACGUI_SCREEN_W * MACGUI_SCREEN_H; i++)
@@ -418,14 +534,34 @@ int main(int argc, char **argv) {
 
     int mouse_btn = 0, osk_key = -1;
     bool running = true;
+    int  pending_scale = mac_scale;     /* deferred resize until next frame */
     while (running) {
+        if (pending_scale != mac_scale) {
+            mac_scale = pending_scale;
+            sw = MACGUI_SCREEN_W * mac_scale;
+            sh = MACGUI_SCREEN_H * mac_scale;
+            unit = sw / 28.0f;
+            kh   = (int)(unit * 0.9f);
+            screen_y = MENU_BAR_PX;
+            kbd_y    = screen_y + sh + 12;
+            win_phys_w = sw;
+            win_phys_h = kbd_y + 5 * (kh + 4) + 12;
+            build_keyboard(unit, 8, (float)kbd_y, (float)kh);
+            SDL_SetWindowSize(win, win_phys_w, win_phys_h);
+        }
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_QUIT) running = false;
             else if (e.type == SDL_MOUSEMOTION) {
-                if (e.motion.y < sh) {           /* over the Mac screen */
+                /* SDL gives motion in logical-window coords; map to
+                 * our physical-pixel render space first, then into Mac
+                 * pixels (or menu/keyboard coords). */
+                int phx = e.motion.x;
+                int phy = e.motion.y;
+                if (phy >= screen_y && phy < screen_y + sh) {
                     uint8_t p[5];
-                    int mx = e.motion.x / scale, my = e.motion.y / scale;
+                    int mx = (phx) / mac_scale;
+                    int my = (phy - screen_y) / mac_scale;
                     p[0]=(uint8_t)mx; p[1]=(uint8_t)(mx>>8);
                     p[2]=(uint8_t)my; p[3]=(uint8_t)(my>>8); p[4]=mouse_btn;
                     send_packet(MACGUI_PKT_MOUSE, p, 5);
@@ -433,19 +569,57 @@ int main(int argc, char **argv) {
             }
             else if (e.type == SDL_MOUSEBUTTONDOWN || e.type == SDL_MOUSEBUTTONUP) {
                 bool down = (e.type == SDL_MOUSEBUTTONDOWN);
-                if (e.button.y < sh) {           /* Mac screen — mouse click */
+                int phx = e.button.x;
+                int phy = e.button.y;
+                if (phy < MENU_BAR_PX) {
+                    /* Menu bar click — only act on press. */
+                    if (down) {
+                        for (int i = 0; i < N_MENU; i++) {
+                            SDL_Rect *r = &menu[i].r;
+                            if (phx >= r->x && phx < r->x + r->w &&
+                                phy >= r->y && phy < r->y + r->h) {
+                                if (menu[i].action == ACT_QUIT) running = false;
+                                else if (menu[i].action == ACT_SCALE1) pending_scale = 1;
+                                else if (menu[i].action == ACT_SCALE2) pending_scale = 2;
+                                else if (menu[i].action == ACT_SCALE3) pending_scale = 3;
+                                else if (menu[i].action == ACT_SPEED) {
+                                    g_speed_idx = (g_speed_idx + 1) % N_SPEEDS;
+                                    uint16_t m = SPEEDS[g_speed_idx].mult_x100;
+                                    uint8_t p[2] = { (uint8_t)m, (uint8_t)(m >> 8) };
+                                    send_packet(MACGUI_PKT_SPEED, p, 2);
+                                    /* Re-render the label texture. */
+                                    if (font) {
+                                        char lbl[32];
+                                        snprintf(lbl, sizeof(lbl), "Speed: %s",
+                                                 SPEEDS[g_speed_idx].label);
+                                        if (menu[i].tex) SDL_DestroyTexture(menu[i].tex);
+                                        SDL_Color fg = { 20, 20, 20, 255 };
+                                        SDL_Surface *s = TTF_RenderUTF8_Blended(font, lbl, fg);
+                                        if (s) {
+                                            menu[i].tex = SDL_CreateTextureFromSurface(ren, s);
+                                            menu[i].tw = s->w; menu[i].th = s->h;
+                                            SDL_FreeSurface(s);
+                                        }
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+                } else if (phy < screen_y + sh) {
                     mouse_btn = down ? 1 : 0;
                     uint8_t p[5];
-                    int mx = e.button.x / scale, my = e.button.y / scale;
+                    int mx = phx / mac_scale;
+                    int my = (phy - screen_y) / mac_scale;
                     p[0]=(uint8_t)mx; p[1]=(uint8_t)(mx>>8);
                     p[2]=(uint8_t)my; p[3]=(uint8_t)(my>>8); p[4]=mouse_btn;
                     send_packet(MACGUI_PKT_MOUSE, p, 5);
-                } else {                         /* on-screen keyboard */
+                } else {
                     if (down) {
                         for (int i = 0; i < g_nkeys; i++) {
                             KeyDef *k = &g_keys[i];
-                            if (e.button.x >= k->x && e.button.x < k->x + k->w &&
-                                e.button.y >= k->y && e.button.y < k->y + kh) {
+                            if (phx >= k->x && phx < k->x + k->w &&
+                                phy >= k->y && phy < k->y + kh) {
                                 uint8_t p[2] = { (uint8_t)k->mkc, 1 };
                                 send_packet(MACGUI_PKT_KEY, p, 2);
                                 osk_key = i;
@@ -475,12 +649,44 @@ int main(int argc, char **argv) {
 
         /* hide the host cursor over the Mac screen — the Mac draws its own */
         int hx, hy; SDL_GetMouseState(&hx, &hy);
-        SDL_ShowCursor(hy < sh ? SDL_DISABLE : SDL_ENABLE);
+        int hphy = hy;
+        SDL_ShowCursor((hphy >= screen_y && hphy < screen_y + sh)
+                       ? SDL_DISABLE : SDL_ENABLE);
 
         SDL_UpdateTexture(screen, NULL, g_pixels, MACGUI_SCREEN_W * 4);
+
+        /* Background. */
         SDL_SetRenderDrawColor(ren, 0xC0, 0xC0, 0xC0, 0xFF);
         SDL_RenderClear(ren);
-        SDL_Rect dst = { 0, 0, sw, sh };
+
+        /* Menu bar. */
+        SDL_Rect bar = { 0, 0, win_phys_w, MENU_BAR_PX };
+        SDL_SetRenderDrawColor(ren, 0xE8, 0xE8, 0xE8, 0xFF);
+        SDL_RenderFillRect(ren, &bar);
+        SDL_SetRenderDrawColor(ren, 0x80, 0x80, 0x80, 0xFF);
+        SDL_RenderDrawLine(ren, 0, MENU_BAR_PX - 1, win_phys_w, MENU_BAR_PX - 1);
+        for (int i = 0; i < N_MENU; i++) {
+            bool current = (menu[i].action == ACT_SCALE1 && mac_scale == 1)
+                        || (menu[i].action == ACT_SCALE2 && mac_scale == 2)
+                        || (menu[i].action == ACT_SCALE3 && mac_scale == 3);
+            SDL_SetRenderDrawColor(ren, current ? 0xC8 : 0xF0,
+                                        current ? 0xC8 : 0xF0,
+                                        current ? 0xC8 : 0xF0, 0xFF);
+            SDL_RenderFillRect(ren, &menu[i].r);
+            SDL_SetRenderDrawColor(ren, 0x50, 0x50, 0x50, 0xFF);
+            SDL_RenderDrawRect(ren, &menu[i].r);
+            if (menu[i].tex) {
+                SDL_Rect lr = {
+                    menu[i].r.x + (menu[i].r.w - menu[i].tw) / 2,
+                    menu[i].r.y + (menu[i].r.h - menu[i].th) / 2,
+                    menu[i].tw, menu[i].th
+                };
+                SDL_RenderCopy(ren, menu[i].tex, NULL, &lr);
+            }
+        }
+
+        /* Mac framebuffer — exactly mac_scale physical pixels per Mac pixel. */
+        SDL_Rect dst = { 0, screen_y, sw, sh };
         SDL_RenderCopy(ren, screen, NULL, &dst);
 
         /* the on-screen keyboard */
@@ -509,6 +715,8 @@ int main(int argc, char **argv) {
     }
 
     if (g_child > 0) { kill(g_child, SIGTERM); waitpid(g_child, NULL, 0); }
+    for (int i = 0; i < N_MENU; i++)
+        if (menu[i].tex) SDL_DestroyTexture(menu[i].tex);
     if (font) TTF_CloseFont(font);
     TTF_Quit();
     SDL_Quit();

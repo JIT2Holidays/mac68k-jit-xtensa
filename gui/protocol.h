@@ -20,6 +20,10 @@
  *   'M'  mouse   payload = {i16 x, i16 y, u8 buttons}
  *   'K'  key     payload = {u8 mac_keycode, u8 down}
  *   'R'  reset   payload = none
+ *   'S'  speed   payload = {u16 mult_x100, little-endian}
+ *                          mult_x100 = 100 → 1× real Mac speed (7.83 MHz)
+ *                          mult_x100 = 200 → 2×, 400 → 4×, 800 → 8×, …
+ *                          mult_x100 = 0   → uncapped (run as fast as host)
  *
  * The framebuffer is the raw Macintosh 1-bit screen (a set bit = a black
  * pixel). RLE keeps the UART backend tractable — a mostly-static Mac
@@ -38,6 +42,7 @@
 #define MACGUI_PKT_MOUSE  'M'
 #define MACGUI_PKT_KEY    'K'
 #define MACGUI_PKT_RESET  'R'
+#define MACGUI_PKT_SPEED  'S'
 
 /* RLE-encode `n` bytes of `src` into `dst`; returns the encoded length.
  * `dst` must hold at least 2*n bytes (worst case). Encoding is a stream
