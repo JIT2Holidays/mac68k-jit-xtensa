@@ -507,10 +507,22 @@ static int server_loop(mac_mem *m, m68k_cpu *cpu) {
     memset(prevfb, 0x55, sizeof(prevfb));     /* force the first frame */
 
     double t0 = mono_seconds(), last_frame = 0, last_log = 0;
+    /* Pacing baseline: target = pace_cyc0 + (now - pace_t0) * rate.
+     * Rebased on every speed change so the CPU doesn't have to wait
+     * for wallclock to catch up after a Max-speed burst. */
+    double pace_t0 = t0;
+    u64    pace_cyc0 = cpu->cycles;
+    u32    last_speed_mult = g_speed_mult;
     fprintf(stderr, "[server] running — protocol on stdin/stdout\n");
 
     while (!cpu->halted) {
-        double now = mono_seconds() - t0;
+        double mono_now = mono_seconds();
+        double now = mono_now - t0;
+        if (g_speed_mult != last_speed_mult) {
+            pace_t0 = mono_now;
+            pace_cyc0 = cpu->cycles;
+            last_speed_mult = g_speed_mult;
+        }
         /* Pace the Mac to real time (7.8336 MHz) × g_speed_mult/100.
          * g_speed_mult==0 means "uncapped" — advance in fixed chunks
          * with no sleep so the interp/JIT runs as fast as the host
@@ -518,7 +530,9 @@ static int server_loop(mac_mem *m, m68k_cpu *cpu) {
         if (g_speed_mult == 0) {
             m68k_run_until(cpu, cpu->cycles + 200000ull);
         } else {
-            u64 target = (u64)(now * 7833600.0 * (double)g_speed_mult / 100.0);
+            double dt = mono_now - pace_t0;
+            u64 target = pace_cyc0 +
+                (u64)(dt * 7833600.0 * (double)g_speed_mult / 100.0);
             if (cpu->cycles < target) m68k_run_until(cpu, target);
         }
         service_hd_insert(m, cpu);
