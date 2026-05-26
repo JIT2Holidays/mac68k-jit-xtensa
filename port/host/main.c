@@ -269,13 +269,13 @@ static int read_file(const char *path, u8 **out, u32 *len);
  * event, exactly as if the user had connected an external drive. The
  * path is resolved in main(); g_hd_cycle is when to insert it.
  *
- * Default = 300M cycles ≈ 38 s of real time at the GUI's 7.83 MHz
- * pacing. The Finder is reliably up by ~250M cycles, so 300M gives a
- * small safety margin without making the user wait two minutes for
- * the icon to appear. Override with MAC68K_DISK2_CYCLE if you need
- * to insert later (e.g. when scripting a slow-boot scenario). */
+ * Default = 200M cycles ≈ 25 s of real time at the GUI's 7.83 MHz
+ * pacing. The Finder is reliably up by ~175M cycles (the .Sony
+ * driver's first mount-pseudo-exception fires at ~172M); 200M gives
+ * a small safety margin. Override with MAC68K_DISK2_CYCLE if you
+ * need to insert later (e.g. when scripting a slow-boot scenario). */
 static const char *g_hd_path;
-static u64  g_hd_cycle = 300000000ull;
+static u64  g_hd_cycle = 200000000ull;
 static bool g_hd_inserted;
 
 static void service_hd_insert(mac_mem *m, m68k_cpu *cpu) {
