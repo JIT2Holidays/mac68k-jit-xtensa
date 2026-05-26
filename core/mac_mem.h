@@ -2,6 +2,7 @@
 #define MAC_MEM_H
 
 #include "m68k_types.h"
+#include "mac_scsi.h"
 #include "m68k_cpu.h"
 
 /* Macintosh Plus hardware model — memory map and peripherals.
@@ -122,12 +123,33 @@ typedef struct mac_iwm {
     u64  dbg_data_reads;   /* diagnostic: GCR nibbles handed out */
 } mac_iwm;
 
-/* --- SCC (Zilog 8530) — reduced model ---------------------------------- */
+/* --- SCC (Zilog 8530) ------------------------------------------------- */
+/* Two channels (A = modem port, B = printer port). Each has its own
+ * 16-entry WR / RR file plus a tiny Tx/Rx FIFO. The Mac touches the
+ * control port through the address-low pattern: bit 1 = data/control,
+ * bit 2 = channel (A=1, B=0). */
+typedef struct mac_scc_chan {
+    u8   wr[16];           /* write-register file                       */
+    u8   rr[16];           /* read-register file (status, vector, etc.) */
+    u8   rx_byte;          /* last byte buffered from external source   */
+    u8   tx_byte;          /* last byte the guest wrote to data reg     */
+    bool rx_avail;         /* set by external source; cleared on data read */
+    bool tx_pending;       /* set by guest Tx; cleared by sink callback  */
+} mac_scc_chan;
+
 typedef struct mac_scc {
-    u8   wr_ptr;           /* control-port register pointer     */
+    u8   wr_ptr;           /* control-port register pointer (channel-shared) */
     bool irq_on;           /* guest enabled SCC interrupts (WR9 MIE) —
                             * the Mac Plus mouse rides the SCC IRQ, so
                             * this gates host mouse injection */
+    mac_scc_chan ch[2];    /* [0] = B (printer), [1] = A (modem) — index
+                            * matches the address-bit-2 wiring */
+
+    /* Tx callback fired whenever the guest writes a byte to a data port.
+     * `channel` is 0 (B / printer) or 1 (A / modem). Set by the host;
+     * NULL means bytes are dropped. */
+    void (*tx_sink)(void *ctx, int channel, u8 byte);
+    void *tx_ctx;
 } mac_scc;
 
 struct m68k_cpu;
@@ -144,6 +166,7 @@ typedef struct mac_mem {
     mac_rtc  rtc;
     mac_iwm  iwm;
     mac_scc  scc;
+    mac_scsi scsi;
 
     u32  fb_base;          /* active framebuffer address          */
     u8   mouse_btn;        /* 0 = pressed, 1 = up                 */
@@ -151,6 +174,14 @@ typedef struct mac_mem {
 
     mac_serial_fn serial_sink;
     void         *serial_ctx;
+
+    /* Sound: called from mac_mem_tick at each VBL with 370 bytes of
+     * 8-bit unsigned PCM mono samples pulled from the active sound
+     * buffer at the top of RAM (see mac_snd.c). The sink is responsible
+     * for whatever happens next (queue to SDL audio, drop, file, ...).
+     * NULL = silent. */
+    void (*snd_sink)(void *ctx, const u8 *samples, u32 n);
+    void *snd_ctx;
 
     struct m68k_cpu *cpu;
 
@@ -176,6 +207,12 @@ bool mac_insert_disk(mac_mem *m, const u8 *img, u32 len, bool write_protected);
 /* As above, but into a specific drive (0-based). The Mac Plus has two. */
 bool mac_insert_disk_drive(mac_mem *m, int drive, const u8 *img, u32 len,
                            bool write_protected);
+
+/* SCC external I/O. Inject one received byte on `channel` (0=B/printer,
+ * 1=A/modem) — sets the Rx-char-available bit and raises an IRQ if
+ * Rx interrupts are enabled. Tx bytes from the guest are delivered to
+ * `mac_scc.tx_sink` (set directly on the struct). */
+void mac_scc_rx(mac_mem *m, int channel, u8 byte);
 
 u8  mac_read8 (mac_mem *m, u32 addr);
 u16 mac_read16(mac_mem *m, u32 addr);

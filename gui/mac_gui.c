@@ -195,7 +195,17 @@ static void spawn_host_backend(const char *self, const char *rom,
     if (pid == 0) {
         dup2(sv[1], 0); dup2(sv[1], 1);
         close(sv[0]); close(sv[1]);
-        execl(exe, exe, "--server", "--rom", "--disk", disk, rom, (char *)NULL);
+        /* MAC_GUI_JIT=1 spawns the backend with --jit instead of the
+         * default --interp, so the SDL front-end can drive the JIT
+         * end-to-end (Finder, real workloads). Verified to render the
+         * same frames as the interpreter post-MOVE.B-A7-fix. */
+        if (getenv("MAC_GUI_JIT")) {
+            execl(exe, exe, "--server", "--jit", "--rom",
+                  "--disk", disk, rom, (char *)NULL);
+        } else {
+            execl(exe, exe, "--server", "--rom", "--disk", disk, rom,
+                  (char *)NULL);
+        }
         fprintf(stderr, "exec %s failed: %s\n", exe, strerror(errno));
         _exit(127);
     }
@@ -258,6 +268,13 @@ static void send_packet(int type, const uint8_t *p, int len) {
 static uint8_t g_inbuf[2 * MACGUI_FB_BYTES + 1024];
 static int     g_inlen;
 
+/* SDL audio device id (0 = no audio / opening failed). */
+static SDL_AudioDeviceID g_audio = 0;
+
+static void audio_handler(const uint8_t *samples, int n) {
+    if (g_audio) SDL_QueueAudio(g_audio, samples, (Uint32)n);
+}
+
 /* Drain the socket; for each complete packet, invoke the handler. */
 static void poll_backend(void (*on_frame)(const uint8_t *, int)) {
     for (;;) {
@@ -273,6 +290,8 @@ static void poll_backend(void (*on_frame)(const uint8_t *, int)) {
         if (g_inlen - off - 4 < len) break;
         if (g_inbuf[off] == MACGUI_PKT_FRAME)
             on_frame(g_inbuf + off + 4, len);
+        else if (g_inbuf[off] == MACGUI_PKT_AUDIO)
+            audio_handler(g_inbuf + off + 4, len);
         off += 4 + len;
     }
     if (off > 0) {
@@ -340,8 +359,26 @@ int main(int argc, char **argv) {
     else          spawn_host_backend(argv[0], rom, disk);
     fcntl(g_fd, F_SETFL, O_NONBLOCK);
 
-    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) != 0) {
         fprintf(stderr, "SDL_Init: %s\n", SDL_GetError()); return 1;
+    }
+    /* Mac Plus sound: 22255 Hz, 8-bit unsigned mono. Open with a
+     * matching spec so SDL doesn't resample. The backend emits exactly
+     * one VBL's worth of samples (370 bytes) per packet at 60Hz, so
+     * the effective rate is 22200 Hz — within SDL's resampler tolerance
+     * if the spec is unavailable. MAC_GUI_NO_AUDIO disables. */
+    if (!getenv("MAC_GUI_NO_AUDIO")) {
+        SDL_AudioSpec want = {0}, have = {0};
+        want.freq = 22255;
+        want.format = AUDIO_U8;
+        want.channels = 1;
+        want.samples = 1024;
+        g_audio = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+        if (g_audio == 0)
+            fprintf(stderr, "[gui] SDL_OpenAudioDevice failed: %s — silent\n",
+                    SDL_GetError());
+        else
+            SDL_PauseAudioDevice(g_audio, 0);
     }
     TTF_Init();
     TTF_Font *font = TTF_OpenFont("/System/Library/Fonts/Monaco.ttf", 13);

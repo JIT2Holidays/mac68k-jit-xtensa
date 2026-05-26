@@ -8,6 +8,7 @@
 #include "m68k_interp.h"
 #include "mac_mem.h"
 #include "mac_input.h"
+#include "mac_snd.h"
 #include "sony.h"
 #include "demo_rom.h"
 #include "dispatcher.h"
@@ -430,6 +431,38 @@ static int scripted_run_file(mac_mem *m, m68k_cpu *cpu, const char *spath) {
     return 0;
 }
 
+/* Headless audio dump: write raw samples straight to a file. Reads
+ * back with `play -t u8 -r 22255 -c 1 path`. */
+static void fwrite_audio_cb(FILE *f, const u8 *samples, u32 n) {
+    fwrite(samples, 1, n, f);
+}
+
+/* Headless serial Tx sink: prefix each byte with the channel letter
+ * (A=modem, B=printer) so a single capture file shows both. */
+static void scc_tx_cb(void *ctx, int channel, u8 byte) {
+    FILE *f = (FILE *)ctx;
+    fputc(channel == 1 ? 'A' : 'B', f);
+    fputc((int)byte, f);
+}
+
+/* Sound sink: append 8-bit PCM samples to a shared ring buffer that
+ * the server loop drains as MACGUI_PKT_AUDIO packets. ~6 VBLs of
+ * buffer (≈100ms) is plenty for the GUI's SDL queue to smooth over
+ * network/scheduling jitter. */
+static u8     g_snd_buf[MAC_SND_SAMPLES_PER_VBL * 16];
+static u32    g_snd_len;
+static void server_snd_sink(void *ctx, const u8 *samples, u32 n) {
+    (void)ctx;
+    if (g_snd_len + n > sizeof(g_snd_buf)) {
+        /* Drop oldest to avoid runaway latency if the GUI isn't draining. */
+        u32 drop = g_snd_len + n - (u32)sizeof(g_snd_buf);
+        memmove(g_snd_buf, g_snd_buf + drop, g_snd_len - drop);
+        g_snd_len -= drop;
+    }
+    memcpy(g_snd_buf + g_snd_len, samples, n);
+    g_snd_len += n;
+}
+
 static int server_loop(mac_mem *m, m68k_cpu *cpu) {
     if (getenv("MAC68K_MOUSESCRIPT"))
         return scripted_run_file(m, cpu, getenv("MAC68K_MOUSESCRIPT"));
@@ -440,6 +473,8 @@ static int server_loop(mac_mem *m, m68k_cpu *cpu) {
      * Input is polled per-call with recv(MSG_DONTWAIT); output writes
      * stay blocking so whole packets always go out intact. */
     m->serial_sink = NULL;     /* stdout is the protocol stream now */
+    m->snd_sink = server_snd_sink;
+    m->snd_ctx  = NULL;
 
     u8 hello[4] = { (u8)MACGUI_SCREEN_W, (u8)(MACGUI_SCREEN_W >> 8),
                     (u8)MACGUI_SCREEN_H, (u8)(MACGUI_SCREEN_H >> 8) };
@@ -496,6 +531,11 @@ static int server_loop(mac_mem *m, m68k_cpu *cpu) {
                 if (getenv("MAC_SERVER_DUMP"))
                     write_screen_bmp(m, getenv("MAC_SERVER_DUMP"));
             }
+        }
+        /* Drain any accumulated sound samples (~370 bytes per VBL). */
+        if (g_snd_len > 0) {
+            send_packet(MACGUI_PKT_AUDIO, g_snd_buf, g_snd_len);
+            g_snd_len = 0;
         }
         usleep(2000);
     }
@@ -593,6 +633,11 @@ int main(int argc, char **argv) {
     const char *disk_path[2] = { NULL, NULL };
     int  n_disks = 0;
     const char *shot_path = NULL;
+    const char *audio_path = NULL;
+    const char *serial_out_path = NULL;
+    const char *serial_in_path  = NULL;
+    const char *scsi_path = NULL;
+    int         scsi_id   = 0;
     const char *snap_load = NULL;
     bool profile = false;
     bool diff_jit = false;
@@ -617,6 +662,16 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(argv[i], "--screenshot") && i + 1 < argc)
             shot_path = argv[++i];
+        else if (!strcmp(argv[i], "--audio") && i + 1 < argc)
+            audio_path = argv[++i];
+        else if (!strcmp(argv[i], "--serial-out") && i + 1 < argc)
+            serial_out_path = argv[++i];
+        else if (!strcmp(argv[i], "--serial-in") && i + 1 < argc)
+            serial_in_path = argv[++i];
+        else if (!strcmp(argv[i], "--scsi") && i + 1 < argc)
+            scsi_path = argv[++i];
+        else if (!strcmp(argv[i], "--scsi-id") && i + 1 < argc)
+            scsi_id = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--max-cycles") && i + 1 < argc)
             max_cycles = strtoull(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--ram-mb") && i + 1 < argc)
@@ -931,6 +986,68 @@ int main(int argc, char **argv) {
         return rc;
     }
 
+    /* --audio PATH: stream 8-bit unsigned PCM samples (22.255 kHz mono)
+     * to a raw file as the Mac plays sound. Verify with `play -t u8
+     * -r 22255 -c 1 PATH`. */
+    FILE *audio_f = NULL;
+    if (audio_path) {
+        audio_f = fopen(audio_path, "wb");
+        if (!audio_f) {
+            fprintf(stderr, "[host] failed to open %s for audio: %s\n",
+                    audio_path, strerror(errno));
+            return 5;
+        }
+        mem.snd_sink = (void (*)(void *, const u8 *, u32))fwrite_audio_cb;
+        mem.snd_ctx  = audio_f;
+    }
+
+    /* --scsi PATH [--scsi-id N]: attach a raw disk-image file as a SCSI
+     * HD at target N (default 0). The image must be a multiple of 512
+     * bytes; what's at it is up to you (an Apple-formatted HFS+driver
+     * image will boot, a blank file works for write tests). */
+    if (scsi_path) {
+        u8 *img = NULL; u32 il = 0;
+        if (read_file(scsi_path, &img, &il) != 0 || il == 0) {
+            fprintf(stderr, "[host] failed to read SCSI image %s\n", scsi_path);
+            return 5;
+        }
+        if (!mac_scsi_attach_disk(&mem.scsi, scsi_id, img, il, false)) {
+            fprintf(stderr, "[host] SCSI attach failed (id=%d size=%u)\n",
+                    scsi_id, il);
+            free(img);
+            return 5;
+        }
+        fprintf(stderr, "[host] SCSI target %d = %s (%u bytes / %u blocks)\n",
+                scsi_id, scsi_path, il, il / 512u);
+    }
+
+    /* --serial-out PATH: capture SCC Tx (both channels) into one file
+     * prefixed with the channel letter. --serial-in PATH: pre-load Rx
+     * bytes for channel A (modem) — useful for scripted MIDI/printer
+     * smoke tests. */
+    FILE *ser_out_f = NULL;
+    if (serial_out_path) {
+        ser_out_f = fopen(serial_out_path, "wb");
+        if (!ser_out_f) {
+            fprintf(stderr, "[host] failed to open %s for serial out: %s\n",
+                    serial_out_path, strerror(errno));
+            return 5;
+        }
+        mem.scc.tx_sink = scc_tx_cb;
+        mem.scc.tx_ctx  = ser_out_f;
+    }
+    if (serial_in_path) {
+        FILE *sin = fopen(serial_in_path, "rb");
+        if (!sin) {
+            fprintf(stderr, "[host] failed to open %s for serial in: %s\n",
+                    serial_in_path, strerror(errno));
+            return 5;
+        }
+        int b;
+        while ((b = fgetc(sin)) != EOF) mac_scc_rx(&mem, 1 /* A */, (u8)b);
+        fclose(sin);
+    }
+
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
@@ -1032,6 +1149,18 @@ int main(int argc, char **argv) {
     if (shot_path) {
         write_screen_bmp(&mem, shot_path);
         fprintf(stderr, "[host] screenshot written to %s\n", shot_path);
+    }
+    if (audio_f) {
+        long sz = ftell(audio_f);
+        fclose(audio_f);
+        fprintf(stderr, "[host] audio written to %s (%ld samples, %.2fs @22.255 kHz)\n",
+                audio_path, sz, (double)sz / 22255.0);
+    }
+    if (ser_out_f) {
+        long sz = ftell(ser_out_f);
+        fclose(ser_out_f);
+        fprintf(stderr, "[host] serial out: %ld bytes (each pair = chan+byte) -> %s\n",
+                sz, serial_out_path);
     }
 
     /* exit_code mirrors the value the guest wrote to the debug exit port. */

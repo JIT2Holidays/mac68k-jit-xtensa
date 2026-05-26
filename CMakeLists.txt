@@ -21,6 +21,8 @@ add_library(mac68k_core STATIC
     core/mac_mem.c
     core/mac_iwm.c
     core/mac_input.c
+    core/mac_snd.c
+    core/mac_scsi.c
     core/sony.c
     core/demo_rom.c
 )

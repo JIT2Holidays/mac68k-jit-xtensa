@@ -14,6 +14,7 @@
  * Backend -> GUI:
  *   'H'  hello   payload = {u16 width, u16 height}  (little-endian)
  *   'F'  frame   payload = RLE-encoded 1bpp framebuffer (width/8 * height)
+ *   'A'  audio   payload = N bytes of 8-bit unsigned PCM mono @22050 Hz
  *
  * GUI -> backend:
  *   'M'  mouse   payload = {i16 x, i16 y, u8 buttons}
@@ -33,6 +34,7 @@
 
 #define MACGUI_PKT_HELLO  'H'
 #define MACGUI_PKT_FRAME  'F'
+#define MACGUI_PKT_AUDIO  'A'
 #define MACGUI_PKT_MOUSE  'M'
 #define MACGUI_PKT_KEY    'K'
 #define MACGUI_PKT_RESET  'R'

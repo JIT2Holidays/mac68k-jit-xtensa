@@ -9,6 +9,7 @@
 
 #include "mac_mem.h"
 #include "mac_iwm.h"
+#include "mac_snd.h"
 #include "sony.h"
 #include "mac_input.h"
 #include <stdlib.h>
@@ -47,6 +48,7 @@ void mac_mem_init(mac_mem *m, u32 ram_size) {
 
     m->mouse_btn = 1;          /* not pressed */
     iwm_init(&m->iwm);
+    mac_scsi_init(&m->scsi);
     sony_init(m);
     mac_input_init(m);
 }
@@ -55,6 +57,7 @@ void mac_mem_free(mac_mem *m) {
     free(m->ram);
     free(m->rom);
     free(m->iwm.disk);
+    mac_scsi_free(&m->scsi);
     m->ram = m->rom = m->iwm.disk = NULL;
 }
 
@@ -217,41 +220,95 @@ static void via_write(mac_mem *m, u32 addr, u8 val) {
     }
 }
 
-/* --- SCC (reduced) ----------------------------------------------------- */
+/* --- SCC (Zilog 8530) -------------------------------------------------
+ * Mac Plus address layout (low byte of MMIO addr):
+ *   bit 1 = data (1) / control (0)
+ *   bit 2 = channel A (1) / B (0)
+ * So control-port writes follow the standard 8530 register-pointer
+ * protocol (WR0 sets the pointer, the next control write hits WRn);
+ * data-port writes/reads are the Tx/Rx FIFO byte.
+ *
+ * RR0 bits we model:
+ *   0x01 Rx Char Available
+ *   0x04 Tx Buffer Empty   (always set — host Tx is instant)
+ *   0x08 DCD
+ *   0x20 CTS               (asserted when an Rx is queued, mini-vMac-ish)
+ *
+ * Interrupts: WR1 bits 0..4 control Rx/Tx IRQs, WR9 bit 3 = MIE.
+ * The Mac Plus boot ROM polls without IRQs until the OS sets MIE; we
+ * keep the existing `irq_on` gate so the keyboard / mouse plumbing
+ * doesn't change behaviour. */
 
-/* The ROM resets and probes the SCC; it never needs real serial I/O to
- * boot. Reads of RR0 report "Tx buffer empty" so the ROM does not spin. */
-static u8 scc_read(mac_mem *m, u32 addr) {
-    /* Address bit 1 selects channel, bit 2 data vs control (approx). */
-    int ctrl = !((addr >> 1) & 1);
-    if (ctrl) return 0x2Cu;     /* RR0: Tx empty | CTS | DCD */
-    return 0;
+#define SCC_RR0_RX_AVAIL  0x01u
+#define SCC_RR0_TX_EMPTY  0x04u
+#define SCC_RR0_DCD       0x08u
+#define SCC_RR0_CTS       0x20u
+
+static int scc_chan(u32 addr) { return (int)((addr >> 1) & 1); }
+static int scc_is_data(u32 addr) { return (int)((addr >> 2) & 1); }
+
+void mac_scc_rx(mac_mem *m, int channel, u8 byte) {
+    if (channel < 0 || channel > 1) return;
+    mac_scc_chan *c = &m->scc.ch[channel];
+    c->rx_byte  = byte;
+    c->rx_avail = true;
+    c->rr[0]   |= SCC_RR0_RX_AVAIL;
 }
+
+static u8 scc_read(mac_mem *m, u32 addr) {
+    mac_scc_chan *c = &m->scc.ch[scc_chan(addr)];
+    if (scc_is_data(addr)) {
+        u8 v = c->rx_byte;
+        c->rx_avail = false;
+        c->rr[0] &= (u8)~SCC_RR0_RX_AVAIL;
+        return v;
+    }
+    /* Control read of RR<wr_ptr>. RR0 is always live status. */
+    int ptr = m->scc.wr_ptr & 0xF;
+    m->scc.wr_ptr = 0;          /* next access starts at WR0 again */
+    if (ptr == 0) {
+        u8 rr0 = SCC_RR0_TX_EMPTY | SCC_RR0_DCD;
+        if (c->rx_avail) rr0 |= SCC_RR0_RX_AVAIL | SCC_RR0_CTS;
+        return rr0;
+    }
+    return c->rr[ptr];
+}
+
 static void scc_write(mac_mem *m, u32 addr, u8 v) {
-    (void)addr;
-    /* Follow the 8530 control-port register-pointer protocol just far
-     * enough to spot WR9 with the master-interrupt-enable bit — the OS
-     * sets that when it is ready for mouse/serial interrupts. */
+    int ch = scc_chan(addr);
+    mac_scc_chan *c = &m->scc.ch[ch];
+    if (scc_is_data(addr)) {
+        c->tx_byte = v;
+        if (m->scc.tx_sink) m->scc.tx_sink(m->scc.tx_ctx, ch, v);
+        c->tx_pending = false;
+        c->rr[0] |= SCC_RR0_TX_EMPTY;
+        return;
+    }
+    /* Control write — register pointer protocol. */
     if (m->scc.wr_ptr == 0) {
-        m->scc.wr_ptr = v & 0x0Fu;          /* register select */
+        /* WR0: low nibble is the next register pointer; high bits encode
+         * a command (reset Tx pending IRQ, etc.). We just latch the
+         * pointer — commands are no-ops for this model. */
+        m->scc.wr_ptr = v & 0x0Fu;
+        c->wr[0] = v;
     } else {
-        if (m->scc.wr_ptr == 9 && (v & 0x08u)) m->scc.irq_on = true;
+        int ptr = m->scc.wr_ptr & 0xF;
+        c->wr[ptr] = v;
+        if (ptr == 9 && (v & 0x08u)) m->scc.irq_on = true;
         m->scc.wr_ptr = 0;
     }
 }
 
-/* --- SCSI (reduced) ---------------------------------------------------- */
-
-/* NCR 5380 stub: the ROM probes the SCSI bus at boot; with no target
- * responding it times out cleanly to "no SCSI devices". */
+/* --- SCSI (NCR 5380) --------------------------------------------------- */
+/* Register decode: Mac Plus places each NCR 5380 register at a 16-byte
+ * stride starting at MAC_SCSI_BASE. Address bits 4..6 pick the
+ * register; bit 9 distinguishes the pseudo-DMA window (treated as
+ * normal accesses for now). */
 static u8 scsi_read(mac_mem *m, u32 addr) {
-    (void)m;
-    int reg = (addr >> 4) & 7;
-    if (reg == 4) return 0x02;  /* Bus & Status: no BSY, no phase match */
-    return 0;
+    return mac_scsi_reg_read(&m->scsi, (addr >> 4) & 7);
 }
 static void scsi_write(mac_mem *m, u32 addr, u8 v) {
-    (void)m; (void)addr; (void)v;
+    mac_scsi_reg_write(&m->scsi, (addr >> 4) & 7, v);
 }
 
 /* --- address decode ---------------------------------------------------- */
@@ -420,12 +477,17 @@ void mac_mem_tick(mac_mem *m, u64 cycles) {
     }
 
     /* Vertical-blank edge -> VIA CA1, ~60 Hz. Also paces the .Sony
-     * driver's disk-insert timer. */
+     * driver's disk-insert timer and the sound DMA scanout. */
     while (cycles >= v->next_vbl) {
         v->ifr |= VIA_IRQ_CA1;
         v->next_vbl += MAC_VBL_CYCLES;
         irq_changed = true;
         sony_tick();
+        if (m->snd_sink) {
+            u8 samples[MAC_SND_SAMPLES_PER_VBL];
+            mac_snd_extract_vbl(m, samples);
+            m->snd_sink(m->snd_ctx, samples, MAC_SND_SAMPLES_PER_VBL);
+        }
     }
 
     if (irq_changed) mac_via_recalc_irq(m);
