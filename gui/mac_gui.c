@@ -195,16 +195,17 @@ static void spawn_host_backend(const char *self, const char *rom,
     if (pid == 0) {
         dup2(sv[1], 0); dup2(sv[1], 1);
         close(sv[0]); close(sv[1]);
-        /* MAC_GUI_JIT=1 spawns the backend with --jit instead of the
-         * default --interp, so the SDL front-end can drive the JIT
-         * end-to-end (Finder, real workloads). Verified to render the
-         * same frames as the interpreter post-MOVE.B-A7-fix. */
-        if (getenv("MAC_GUI_JIT")) {
-            execl(exe, exe, "--server", "--jit", "--rom",
-                  "--disk", disk, rom, (char *)NULL);
-        } else {
+        /* JIT is the default in the GUI; MAC_GUI_INTERP=1 opts out and
+         * runs the reference interpreter instead. The JIT renders the
+         * same frames as the interpreter (verified post-M6.244) and is
+         * the more representative target since real hardware is the
+         * JIT path. */
+        if (getenv("MAC_GUI_INTERP")) {
             execl(exe, exe, "--server", "--rom", "--disk", disk, rom,
                   (char *)NULL);
+        } else {
+            execl(exe, exe, "--server", "--jit", "--rom",
+                  "--disk", disk, rom, (char *)NULL);
         }
         fprintf(stderr, "exec %s failed: %s\n", exe, strerror(errno));
         _exit(127);
