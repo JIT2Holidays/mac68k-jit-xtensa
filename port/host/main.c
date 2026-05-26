@@ -781,7 +781,16 @@ int main(int argc, char **argv) {
             u32 pc_before = cj.pc;
             u64 cyc_before = cj.cycles;
             pre_cj = cj;
+            /* sony.c uses a single global S.vm pointer for its
+             * mac_mem accesses; in lockstep we must re-point it
+             * to whichever engine's memory is about to run, or
+             * a sony_service pseudo-exception / extension-trap
+             * write would fire into the wrong mac_mem and report
+             * a false divergence. (SONY_EXTN_BASE = 0xF40000 is
+             * a real address Mac OS writes to via MOVE.L An,(An).) */
+            sony_set_vm(&mj);
             m68k_dispatcher_run_until(&dd, cj.cycles + 1);   /* ≈ 1 block */
+            sony_set_vm(&mem);
             m68k_run_until(&cpu, cj.cycles);
             int bad = 0;
             for (int r = 0; r < 8; r++) {

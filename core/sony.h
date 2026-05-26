@@ -27,6 +27,13 @@ struct m68k_cpu;
 
 void sony_init(struct mac_mem *m);
 
+/* Re-point the driver's mac_mem pointer without resetting state. Used
+ * by the diff-jit-trace lockstep to keep sony's writes routed to the
+ * engine currently running (sony.c's S.vm is global; without this
+ * re-pointing, sony_service / extension-trap writes from one engine's
+ * run loop would land in the other engine's memory). */
+void sony_set_vm(struct mac_mem *m);
+
 /* Patch the ROM: install the replacement .Sony driver, the extension
  * trap, and the disk icon, then repair the ROM checksum. Call once after
  * the ROM image is loaded. Returns false if the ROM is too small. */

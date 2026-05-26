@@ -202,6 +202,14 @@ void sony_init(mac_mem *m) {
     S.vm = m;
 }
 
+/* Re-point S.vm without resetting the driver state. Used by
+ * diff-jit-trace to keep the lockstep's two mac_mem copies in
+ * sync — sony_service would otherwise write to whichever vm was
+ * last init'd, leaking writes across engines. */
+void sony_set_vm(mac_mem *m) {
+    S.vm = m;
+}
+
 bool sony_insert_disk_drive(mac_mem *m, int d, const u8 *img, u32 len,
                             bool wprot) {
     (void)m;

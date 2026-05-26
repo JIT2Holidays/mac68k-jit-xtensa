@@ -909,6 +909,11 @@ static void emit_adda_w_reg(xt_emit *e, int an, int src, bool src_is_an, regcach
  * by the CMP-Bcc peephole: cc_mask = whatever_bits_bcc_reads. */
 static void emit_addsub_flags_long_masked(xt_emit *e, bool is_sub, bool keep_x,
                                           u8 s, u8 d, u8 r, u8 cc_mask) {
+    /* Force full natural CCR write — lazy-CCR (cc_mask < natural) leaks
+     * stale bits into R_SR, which propagate through interrupt SR-push /
+     * RTE on the Mac Plus boot. CMP semantics: NZVC, X preserved.
+     * ADD/SUB semantics (keep_x=false): NZVCX, X = C. */
+    cc_mask |= CCR_BIT_N | CCR_BIT_Z | CCR_BIT_V | CCR_BIT_C;
     bool need_c = (cc_mask & CCR_BIT_C) != 0;
     bool need_v = (cc_mask & CCR_BIT_V) != 0;
     bool need_z = (cc_mask & CCR_BIT_Z) != 0;
@@ -1321,20 +1326,66 @@ static u32 fused_helper_bcc_tail_size(int cc) {
 
 /* CMP+Bcc fused condition compute. Given s/d/r registers (shifted-to-high
  * for .W compares, so bit 31 is the sign/result-of-interest), produces
- * `cond` (0 or 1) in a8 without writing R_SR. Saves the ~12 ops of
- * emit_addsub_flags_long_masked's pack/mask + the 3-5 ops of emit_cond's
- * R_SR extraction. Clobbers a8, a11, a12. */
+ * `cond` (0 or 1) in a8 AND materialises the CMP/TST CCR into R_SR.
+ *
+ * Materialising the SR is required for correctness: lazy-CCR leaves
+ * stale CCR bits in R_SR that propagate through IRQ save/restore
+ * (interrupt pushes SR; RTE restores it; the next time code reads CCR
+ * — Bcc on other bits, MOVE-from-SR, ADDX/SUBX reading X — it sees
+ * stale values). Without the write the Mac Plus live boot stays at the
+ * black framebuffer because the leak compounds across thousands of IRQs.
+ *
+ * Two flavours, chosen by compile-time register equality:
+ *   - s == d == r → TST semantics (N from r, Z from r, V=C=0, X kept)
+ *   - otherwise   → CMP semantics (N/Z/V/C from sub formula, X kept)
+ *
+ * s/d/r are preserved across the SR write so the cond compute below
+ * can still read them. Clobbers a8, a11, a12, a13, a15. */
 static void emit_cmp_cond_fused(xt_emit *e, int cc, u8 s, u8 d, u8 r) {
-    /* For .W CMP, the operands are shifted to bit 31 = high bit, so:
-     *   V at bit 31 = (s^d) & (d^r)
-     *   N at bit 31 = r itself
-     *   Z = (r == 0)
-     * Supported:
-     *   NE (6)  = !Z  — cond = (r != 0)
-     *   EQ (7)  = Z   — cond = (r == 0)
-     *   BLT (13) = N^V
-     *   BLE (15) = Z | (N^V)
-     */
+    /* --- SR materialisation (preserves s, d, r) ----------------------- */
+    if (s == d && d == r) {
+        /* TST: clear NZVC, then OR in N (bit 3) and Z (bit 2). */
+        xt_movi(e, 11, -16);                 /* keep X (bit 4) and up */
+        xt_and (e, R_SR, R_SR, 11);
+        xt_extui(e, 11, r, 31, 1);           /* a11 = N (0/1) */
+        xt_slli(e, 11, 11, 3);
+        xt_or  (e, R_SR, R_SR, 11);
+        xt_movi(e, 11, 0x04);                /* Z bit position */
+        xt_bnez(e, r, 6);                    /* skip if r != 0 */
+        xt_or  (e, R_SR, R_SR, 11);
+        g_sr_dirty = true;
+    } else {
+        /* CMP: compute NZVC inline. Uses a11, a12, a13, a15 as scratch.
+         *   C = bit31((~d & s) | ((~d|s) & r))
+         *   V = bit31((s^d) & (d^r))
+         *   N = bit31(r)
+         *   Z = (r == 0)
+         * X is preserved (CMP doesn't touch X). */
+        xt_movi (e, 15, -1);
+        xt_xor  (e, 15, d, 15);              /* a15 = ~d */
+        xt_and  (e, 11, 15, s);              /* a11 = ~d & s */
+        xt_or   (e, 15, 15, s);              /* a15 = ~d | s */
+        xt_and  (e, 15, 15, r);              /* a15 = (~d|s) & r */
+        xt_or   (e, 11, 11, 15);             /* a11 = C at MSB */
+        xt_extui(e, 11, 11, 31, 1);          /* a11 = C (0/1) */
+        xt_xor  (e, 15, s, d);
+        xt_xor  (e, 12, d, r);
+        xt_and  (e, 15, 15, 12);             /* a15 = V at MSB */
+        xt_extui(e, 12, 15, 31, 1);          /* a12 = V (0/1) */
+        xt_extui(e, 13, r, 31, 1);           /* a13 = N (0/1) */
+        xt_slli (e, 12, 12, 1);              /* V<<1 */
+        xt_or   (e, 15, 11, 12);             /* a15 = C | V<<1 */
+        xt_slli (e, 13, 13, 3);              /* N<<3 */
+        xt_or   (e, 15, 15, 13);             /* a15 |= N<<3 */
+        xt_movi (e, 11, 0x04);               /* Z bit */
+        xt_bnez (e, r, 6);
+        xt_or   (e, 15, 15, 11);
+        xt_movi (e, 12, -16);
+        xt_and  (e, R_SR, R_SR, 12);
+        xt_or   (e, R_SR, R_SR, 15);
+        g_sr_dirty = true;
+    }
+    /* --- Cond compute (existing logic; s/d/r still valid) ------------- */
     if (cc == 6) {                     /* NE: r != 0 */
         xt_movi(e, 8, 1);
         xt_bnez(e, r, 6);              /* if r != 0, skip the movi below */
@@ -1718,13 +1769,29 @@ static u32 classify_op(u16 w) {
 
 m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                                jit_helper_addr_fn helper_addr, void *user) {
-    /* 1. Walk the instruction stream to discover the block extent. */
+    /* 1. Walk the instruction stream to discover the block extent.
+     *
+     * Boot-ROM (PC >= MAC_ROM_BASE, or low-mem during the boot overlay)
+     * runs cycle-tight POST tests that depend on per-instruction IRQ
+     * delivery. The dispatcher polls IRQs only between blocks, so a
+     * multi-op block delays IRQ delivery by up to block-length cycles
+     * — enough to fail the Mac Plus ROM's timing self-tests and leave
+     * the live boot at a blank framebuffer.
+     *
+     * Workaround: cap ROM blocks at 1 op so the dispatcher polls every
+     * instruction, matching the interpreter's granularity. RAM (OS,
+     * apps, benches) keeps full block size — its code paths are not
+     * cycle-tight in the same way. */
+    bool tight_irq = (pc >= MAC_ROM_BASE) ||
+                     (cpu->mem && cpu->mem->overlay && cpu->mem->rom &&
+                      pc < cpu->mem->rom_size);
+    u32 block_cap = tight_irq ? 1u : M68K_MAX_OPS_PER_BLOCK;
     u16 op_word[M68K_MAX_OPS_PER_BLOCK];
     u32 op_pc  [M68K_MAX_OPS_PER_BLOCK];
     u32 n_ops = 0;
     u32 cur = pc;
     for (;;) {
-        if (n_ops >= M68K_MAX_OPS_PER_BLOCK) break;
+        if (n_ops >= block_cap) break;
         m68k_decoded d = m68k_decode_at(cpu, cur);
         op_word[n_ops] = d.opcode;
         op_pc[n_ops] = cur;
@@ -1849,97 +1916,29 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
         /* Cross-block lazy-CC: if the block ends with a control-flow op
          * (BRA.S unconditional or a fall-through ender) and the next
          * block's first op is a SETTER-without-CONSUMER class, the
-         * current block's last setter's flags are dead. Bench's hot
-         * block at 0x03DF40 falls through to 0x03DF58 which starts with
-         * MOVE.W D5,D4 (a setter) — without this, the MOVE.W (d8,An,Xn)
-         * deep inside 0x03DF40 emits a full flag computation every
-         * iteration even though nothing observable reads it. */
-        bool need_initial = true;
-        u16 last_op = op_word[n_ops - 1];
-        if (n_ops >= 1) {
-            int t = (last_op >> 12) & 0xF;
-            int cc = (last_op >> 8) & 0xF;
-            /* Helper: walk forward from `pc`, skipping CCR-neutral ops
-             * (classify_op returns 0). Returns true if we find a
-             * SET-without-CONS op before any CONS or unknown op. That
-             * means CCR set before this point is dead — overwritten
-             * without ever being read. */
-            #define PC_OVERWRITES_CCR(pc_) ({ \
-                u32 _pc = (pc_); \
-                bool _r = false; \
-                for (int _k = 0; _k < 8; _k++) { \
-                    m68k_decoded _nd = m68k_decode_at(cpu, _pc); \
-                    u32 _c = classify_op(_nd.opcode); \
-                    if (_c == 0) { _pc += _nd.length; continue; } \
-                    _r = ((_c & 1u) && !(_c & 2u)); \
-                    break; \
-                } \
-                _r; })
-            if (t == 0x6 && cc == 0 && (last_op & 0xFF) != 0
-                && (last_op & 0xFF) != 0xFF) {
-                /* BRA.S — single known target. (0x6000 = BRA.W, 0x60FF =
-                 * BRA.L — both have multi-word displacements and were
-                 * mis-handled by the i8-cast; gate on the i8-form here.) */
-                i32 disp = (i8)(last_op & 0xFF);
-                u32 next_pc = op_pc[n_ops - 1] + 2 + (u32)disp;
-                if (PC_OVERWRITES_CCR(next_pc)) need_initial = false;
-            } else if (t == 0x6 && cc == 0 && (last_op & 0xFF) == 0) {
-                /* M6.140 — BRA.W — disp16 follows the opcode. */
-                i32 disp = (i16)mac_read16(cpu->mem, op_pc[n_ops - 1] + 2);
-                u32 next_pc = op_pc[n_ops - 1] + 2 + (u32)disp;
-                if (PC_OVERWRITES_CCR(next_pc)) need_initial = false;
-            } else if (t == 0x6 && cc >= 2 && (last_op & 0xFF) != 0
-                       && (last_op & 0xFF) != 0xFF) {
-                /* Bcc.S — two targets (taken and fall-through). CCR set
-                 * by upstream setter is dead AFTER the Bcc iff BOTH
-                 * destinations overwrite CCR with their first op. The
-                 * Bcc itself still reads CCR — that's handled by the
-                 * within-block scan when Bcc is marked CONS. */
-                i32 disp = (i8)(last_op & 0xFF);
-                u32 taken_pc = op_pc[n_ops - 1] + 2 + (u32)disp;
-                u32 ft_pc    = op_pc[n_ops - 1] + 2;
-                if (PC_OVERWRITES_CCR(taken_pc) && PC_OVERWRITES_CCR(ft_pc))
-                    need_initial = false;
-            } else if (t == 0x6 && cc >= 2 && (last_op & 0xFF) == 0) {
-                /* M6.140 — Bcc.W — disp16 in the ext word. */
-                i32 disp = (i16)mac_read16(cpu->mem, op_pc[n_ops - 1] + 2);
-                u32 taken_pc = op_pc[n_ops - 1] + 2 + (u32)disp;
-                u32 ft_pc    = op_pc[n_ops - 1] + 4;
-                if (PC_OVERWRITES_CCR(taken_pc) && PC_OVERWRITES_CCR(ft_pc))
-                    need_initial = false;
-            } else if (last_op == 0x4EF9) {
-                /* M6.140 — JMP (xxx).L — target is the 32-bit absolute
-                 * long following the opcode. Sibling of BRA.S cross-block
-                 * analysis: if the target's first op overwrites CCR, the
-                 * current block's last setter's flags are dead. */
-                u32 target = mac_read32(cpu->mem, op_pc[n_ops - 1] + 2);
-                if (PC_OVERWRITES_CCR(target)) need_initial = false;
-            } else if (last_op == 0x4EFA) {
-                /* M6.140 — JMP (d16,PC) — target = op_pc + 2 + sext16(d16). */
-                i32 disp = (i16)mac_read16(cpu->mem, op_pc[n_ops - 1] + 2);
-                u32 target = op_pc[n_ops - 1] + 2 + (u32)disp;
-                if (PC_OVERWRITES_CCR(target)) need_initial = false;
-            } else if (t != 0x6 && (last_op != 0x4E75) && (last_op != 0x4E73)
-                       && (last_op != 0x4E77) && ((last_op & 0xFFC0) != 0x4EC0)
-                       && ((last_op & 0xFFC0) != 0x4E80)
-                       && (last_op != 0x4E72)) {
-                /* Fall-through: not Bcc/BSR, not RTS/RTE/RTR/JMP/JSR/STOP. */
-                if (PC_OVERWRITES_CCR(cur)) need_initial = false;
-            }
-            #undef PC_OVERWRITES_CCR
-        }
-        bool need = need_initial;
-        u8 need_bits = need_initial ? CCR_MASK_ALL : 0;
+         * current block's last setter's flags would historically be
+         * dropped. That optimisation has been removed (see comment on
+         * `need = true` below) — interrupts can fire between blocks
+         * and read SR via exception push, so the "dead" flags are
+         * still observable. */
+        /* Lazy-CCR is unsound in the presence of interrupts and CCR-
+         * preserving ops (MOVE.L preserves X, AND/OR clear V/C, ...)
+         * that "let bits flow through" without a clear overwrite. The
+         * per-bit overwrite analysis would need to know each op's
+         * preserve/write mask per bit; instead, force every setter to
+         * materialise its full natural CCR. Costs a few LX7 ops per
+         * setter; restores correctness on Mac Plus boot. */
+        bool need = true;
+        u8 need_bits = CCR_MASK_ALL;
         for (int i = (int)n_ops - 1; i >= 0; i--) {
             u16 w = op_word[i];
             u32 cls = classify_op(w);
             bool is_setter   = (cls & 1u) != 0;
             bool is_consumer = (cls & 2u) != 0;
             if (is_setter) {
-                flags_dead[i] = !need;
-                flags_needed[i] = need_bits;
-                need = false;
-                need_bits = 0;
+                flags_dead[i] = false;             /* never dead */
+                flags_needed[i] = CCR_MASK_ALL;    /* always full */
+                (void)need; (void)need_bits;
             }
             if (is_consumer) {
                 need = true;
@@ -2059,35 +2058,16 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
         (void)inline_count; (void)helper_count;
     }
 
-    /* 5d. Determine whether the prologue's R_SR reload is needed. Skip
-     * when no inline op reads or writes R_SR — for fused-CMP+Bcc-
-     * terminated blocks where every other op has flags_dead, the
-     * prologue load is dead (helper-bridge fallbacks reload R_SR on
-     * their own). Saves 1 op per execution of such blocks. */
+    /* 5d. Determine whether the prologue's R_SR reload is needed.
+     *
+     * Historically the "fused CMP+Bcc terminator" skipped this load
+     * because emit_cmp_cond_fused didn't touch R_SR. After the
+     * correctness fix that makes emit_cmp_cond_fused materialise the
+     * CMP/TST CCR (read-modify-write on R_SR), the fused fast path
+     * needs R_SR loaded — so we no longer skip the CMP/Bcc here.
+     * The load is one LX7 op per execution of such blocks. */
     bool block_needs_sr_load = false;
-    bool terminator_fused = false;
-    if (n_ops >= 2) {
-        u16 last = op_word[n_ops - 1];
-        u16 prev = op_word[n_ops - 2];
-        if ((last >> 12) == 0x6) {
-            int cc = (last >> 8) & 0xF;
-            i32 disp = (i8)(last & 0xFF);
-            if ((cc == 6 || cc == 7 || cc == 13 || cc == 15) && disp != 0 && disp != -1) {
-                int ptop = (prev >> 12) & 0xF;
-                int pmode = (prev >> 3) & 7;
-                int pszf = (prev >> 6) & 3;
-                int pbit8 = (prev >> 8) & 1;
-                if (ptop == 0xB && pszf == 1 && pbit8 == 0 && (pmode == 2 || pmode == 5)) {
-                    terminator_fused = true;
-                }
-            }
-        }
-    }
     for (u32 k = 0; k < n_ops; k++) {
-        /* Skip the fused CMP and Bcc — their fast path does no R_SR
-         * access, and the helper-path bridge reloads R_SR before
-         * touching it. */
-        if (terminator_fused && k >= n_ops - 2) continue;
         u16 w = op_word[k];
         u32 cls = classify_op(w);
         /* SET op writes R_SR via read-modify-write unless flags are dead. */
@@ -3316,7 +3296,11 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
              * drift hadn't accumulated enough yet; boot 100M caught it. */
             int dn = (w >> 9) & 7;
             int dm = w & 7;
-            u8 src_reg = emit_read_g_in(&e, &rc, G_D(dm), 9);
+            /* Load src into a8 (not a9): the dst load below uses a9 as
+             * its scratch, and emit_read_g_in returns its scratch arg
+             * when the guest reg isn't cached — so using a9 for both
+             * collided and the dst load overwrote the src byte. */
+            u8 src_reg = emit_read_g_in(&e, &rc, G_D(dm), 8);
             int dst_xt = cache_lookup(&rc, G_D(dn));
             u8 dst_slot = (dst_xt >= 0) ? (u8)dst_xt : 9;
             if (dst_xt < 0) emit_read_g(&e, &rc, G_D(dn), 9);
@@ -5330,8 +5314,10 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                          entry_off + e.len);
             xt_add  (&e, 9, 9, 8);
             xt_l8ui (&e, 10, 9, 0);
-            /* Post-incr An — commit AFTER read. */
-            xt_addi (&e, 8, 8, 1);
+            /* Post-incr An — commit AFTER read. For An=A7 (SP) the
+             * 68k forces a 2-byte step in .B mode to keep the stack
+             * aligned (per m68k_interp.c ea_decode case 3 step calc). */
+            xt_addi (&e, 8, 8, (an == 7) ? 2 : 1);
             emit_write_g(&e, &rc, G_A(an), 8);
             /* Merge byte into Dn[7:0]. */
             emit_read_g(&e, &rc, G_D(dn), 11);
@@ -5975,7 +5961,11 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                          entry_off + e.len);
             xt_and  (&e, 10, 8, 9);
             emit_cache_flush(&e, &rc);
-            i32 op_pc_addxL = 4, op_cyc_addxL = 10;
+            /* m68k_interp adds cpu->cycles += 4 for plain ADD/SUB
+             * regardless of EA mode (m68k_interp.c:1758), plus 4
+             * m68k_step base = 8 total. The previous "10" overcounted
+             * by 2 and caused JIT/interp cycle drift. */
+            i32 op_pc_addxL = 4, op_cyc_addxL = 8;
             g_helper_touched_mask = (u16)(1u << G_D(dn));
             xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_addxL, op_cyc_addxL)));
             emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
@@ -7173,8 +7163,11 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
              * (and the MMIO bridge via emit_helper_step_after_flush_undo
              * — CMP is flag-only so g_helper_touched_mask = 0u).
              *
-             * Length 4 (opword + d16), 14 cycles (interp base 4 +
-             * handler 10 for CMPA.L vs CMPA.W's 6). */
+             * Length 4 (opword + d16), 10 cycles (interp m68k_step base 4
+             * + handler 6 — m68k_interp.c:1773 adds 6 for CMPA regardless
+             * of size and EA. The previous "14" overcounted by 4 and
+             * caused JIT/interp cycle drift that compounded over millions
+             * of cycles into VIA-timer-fed boot path divergence). */
             int dst_an = (w >> 9) & 7;
             int src_an = w & 7;
             u16 ext  = mac_read16(cpu->mem, op_pc[i] + 2);
@@ -7192,7 +7185,7 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                          entry_off + e.len);
             xt_and  (&e, 10, 8, 9);
             emit_cache_flush(&e, &rc);
-            i32 op_pc_cmpaL = 4, op_cyc_cmpaL = 14;
+            i32 op_pc_cmpaL = 4, op_cyc_cmpaL = 10;
             g_helper_touched_mask = 0u;
             xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_cmpaL, op_cyc_cmpaL)));
 
@@ -11938,8 +11931,14 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             int top_shift = size_bits - top_bits_count;
             xt_extui(&e, 11, 9, (u8)top_shift, top_bits_count - 1);
             xt_movi (&e, 12, (1 << top_bits_count) - 1);
-            xt_xor  (&e, 12, 11, 12);
-            xt_and  (&e, 13, 11, 12);    /* a13 != 0 iff overflow (V=1) */
+            xt_xor  (&e, 12, 11, 12);    /* a12 = top_bits ^ mask (= 0 iff top_bits == mask) */
+            /* V = (top_bits != 0) AND (top_bits != mask). The original
+             * xt_and gave 0 always (top_bits AND (top_bits XOR mask) =
+             * top_bits AND ~top_bits within mask = 0), silently zeroing
+             * V. xt_mull is nonzero iff both operands are nonzero, no
+             * overflow because each operand fits in `top_bits_count`
+             * bits (≤9 → product ≤ ~262K, well within 32-bit). */
+            xt_mull (&e, 13, 11, 12);    /* a13 != 0 iff overflow (V=1) */
 
             /* result = (src << imm) & size_mask. Done in a9 in place. */
             xt_slli (&e, 9, 9, imm);
@@ -12019,12 +12018,13 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             xt_extui(&e, 10, src_reg, (u8)(32 - imm), 0);
 
             /* V flag scratch: top (imm+1) bits of src in a11; XOR-self-
-             * test result in a13 (!=0 iff any sign change). */
+             * test result in a13 (!=0 iff any sign change).
+             * See M6.151 comment — xt_mull replaces buggy xt_and. */
             int top_shift = 32 - top_bits_count;
             xt_extui(&e, 11, src_reg, (u8)top_shift, (u8)(top_bits_count - 1));
             xt_movi (&e, 12, (1 << top_bits_count) - 1);
             xt_xor  (&e, 12, 11, 12);
-            xt_and  (&e, 13, 11, 12);
+            xt_mull (&e, 13, 11, 12);
 
             /* result = src << imm — full 32-bit in-place. */
             u8 dst_reg = (dn_xt >= 0) ? (u8)dn_xt : 8;
