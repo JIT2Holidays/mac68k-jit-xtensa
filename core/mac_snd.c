@@ -84,6 +84,24 @@ void mac_snd_extract_vbl(mac_mem *m, u8 *out) {
         for (unsigned i = 0; i < MAC_SND_SAMPLES_PER_VBL; i++) out[i] = 0x80;
         return;
     }
+    /* VIA PB7 = vSndEnb (active low). When set, the PWM output is
+     * suppressed by the analog mixer regardless of buffer contents.
+     * Mac Plus boot ROM keeps it high through the RAM test, then
+     * clears it to play the chime — without this gate the user hears
+     * the memory-test patterns as ~20 s of PWM buzz. */
+    bool snd_enabled = (m->via.orb & 0x80u) == 0;
+    if (!snd_enabled) {
+        /* Feed silence (centred sample) through the filter so its
+         * state decays cleanly rather than holding the previous
+         * window's value when we re-enable. */
+        for (unsigned i = 0; i < MAC_SND_SAMPLES_PER_VBL; i++) {
+            double s = snd_filter_step(&m->snd_filter, 0.0);
+            int q = (int)(s + 128.5);
+            if (q < 0) q = 0; else if (q > 255) q = 255;
+            out[i] = (u8)q;
+        }
+        return;
+    }
     /* PA3 set = main buffer, clear = alt. The Mac ROM and Sound Manager
      * default to the main buffer; the alternate is for double-buffered
      * playback. */
