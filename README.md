@@ -6,7 +6,7 @@ Xtensa LX7 machine code** — targeting the ESP32-S3 microcontroller.
 68000 instructions are translated at runtime into native Xtensa code that
 runs directly on the LX7 core; the generated blocks live in an executable
 IRAM code cache and are entered through a CALL0 ⇄ windowed-ABI bridge. This
-mirrors the design of the sister project [`gbjit-xtensa`](../gbjit-xtensa)
+mirrors the design of the sister project [`gb-jit-xtensa`](https://github.com/JIT2Holidays/gb-jit-xtensa)
 (a Game Boy JIT), reusing its Xtensa encoder, code cache and host Xtensa
 simulator.
 
