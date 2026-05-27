@@ -10669,6 +10669,66 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             emit_logic_l_dd_kind(&e, (w >> 9) & 7, w & 7, (w >> 9) & 7,
                                  0, flags_dead[i], &rc);
             inline_ops++; done = true;
+        } else if ((w & 0xF1F8) == 0x8140) {
+            /* M7.5r — PACK Dn,Dn,#adj16 (68020+, Dn-Dn form).
+             * Take low 16 bits of source Dn, add 16-bit adjustment,
+             * pack high nibble of result high byte + low nibble into
+             * a single byte in dest Dn[7:0]. Preserve upper 24 bits
+             * of dest. No flags affected. */
+            u16 adj = mac_read16(cpu->mem, op_pc[i] + 2);
+            int src_dn = w & 7;
+            int dst_dn = (w >> 9) & 7;
+
+            emit_read_g(&e, &rc, G_D(src_dn), 8);
+            xt_extui(&e, 8, 8, 0, 15);                 /* a8 = src & 0xFFFF (16 bits; maskimm=bits-1) */
+            if ((i16)adj >= -128 && (i16)adj <= 127) {
+                xt_addi(&e, 8, 8, (i8)adj);
+            } else {
+                emit_load_imm(&e, 9, 10, (u32)(i32)(i16)adj);
+                xt_add(&e, 8, 8, 9);
+            }
+            /* PACK takes the LOW nibble of the high byte (bits 11-8 of sum)
+             * for the result's high nibble (bits 7-4), and the low nibble
+             * (bits 3-0 of sum) for the result's low nibble. */
+            xt_extui(&e, 9, 8, 8, 3);                  /* a9 = bits 11-8 of sum (4 bits @ offset 8) */
+            xt_slli (&e, 9, 9, 4);                     /* shift to bits 7-4 */
+            xt_extui(&e, 10, 8, 0, 3);                 /* a10 = bits 3-0 of sum (low nibble) */
+            xt_or   (&e, 9, 9, 10);                    /* a9 = packed byte */
+            emit_read_g(&e, &rc, G_D(dst_dn), 11);
+            xt_srli (&e, 11, 11, 8);                   /* clear low 8 bits of dst */
+            xt_slli (&e, 11, 11, 8);
+            xt_or   (&e, 8, 11, 9);
+            emit_write_g(&e, &rc, G_D(dst_dn), 8);
+            emit_advance(&e, 4, 10);   /* m68k_step base 4 + do_pack 6 */
+            inline_ops++; done = true;
+        } else if ((w & 0xF1F8) == 0xC180) {
+            /* M7.5r — UNPK Dn,Dn,#adj16 (68020+, Dn-Dn form).
+             * Take low byte of source Dn, unpack into two nibbles:
+             * src[7-4] → bits 11-8 of intermediate; src[3-0] → bits 3-0.
+             * Add 16-bit adjustment, write low 16 bits to dest Dn. */
+            u16 adj = mac_read16(cpu->mem, op_pc[i] + 2);
+            int src_dn = w & 7;
+            int dst_dn = (w >> 9) & 7;
+
+            emit_read_g(&e, &rc, G_D(src_dn), 8);
+            xt_extui(&e, 9, 8, 4, 3);                  /* a9 = bits 7-4 of src (high nibble of low byte) */
+            xt_slli (&e, 9, 9, 8);                     /* shifted to bits 11-8 */
+            xt_extui(&e, 10, 8, 0, 3);                 /* a10 = bits 3-0 of src */
+            xt_or   (&e, 9, 9, 10);                    /* a9 = unpacked 16-bit value (high bits 0) */
+            if ((i16)adj >= -128 && (i16)adj <= 127) {
+                xt_addi(&e, 9, 9, (i8)adj);
+            } else {
+                emit_load_imm(&e, 10, 11, (u32)(i32)(i16)adj);
+                xt_add(&e, 9, 9, 10);
+            }
+            xt_extui(&e, 9, 9, 0, 15);                 /* a9 = sum & 0xFFFF */
+            emit_read_g(&e, &rc, G_D(dst_dn), 11);
+            xt_srli (&e, 11, 11, 16);                  /* clear low 16 bits of dst */
+            xt_slli (&e, 11, 11, 16);
+            xt_or   (&e, 8, 11, 9);
+            emit_write_g(&e, &rc, G_D(dst_dn), 8);
+            emit_advance(&e, 4, 12);   /* m68k_step base 4 + do_unpk 8 */
+            inline_ops++; done = true;
         } else if ((top == 0xC || top == 0x8) && szf == 2 && !((w >> 8) & 1)
                    && mode == 7 && (w & 7) == 0) {
             /* M6.111 — AND.L (xxx).W,Dn  /  OR.L (xxx).W,Dn — bench-hot
