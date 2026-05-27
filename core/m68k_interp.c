@@ -17,6 +17,7 @@
 #include "mac_mem.h"
 #include "sony.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* ---- size helpers ----------------------------------------------------- */
@@ -100,7 +101,8 @@ static inline u16 fetch16(m68k_cpu *cpu) {
      * 0x40800000-0x4083FFFF. */
     if (cpu->mem && cpu->mem->model == MAC_MODEL_SE30
         && cpu->pc >= 0x40000000u
-        && (cpu->pc < 0x40800000u || cpu->pc >= 0x40840000u)) {
+        && (cpu->pc < 0x40800000u || cpu->pc >= 0x40840000u)
+        && !getenv("SE30_NO_FETCH_BERR")) {
         cpu->bus_error_pending = cpu->pc | 0x80000000u;
     }
     u16 w = mac_read16(cpu->mem, cpu->pc);
