@@ -139,6 +139,26 @@ bool mac_load_rom(mac_mem *m, const u8 *rom, u32 len) {
      * untouched (real IWM/SWIM disk path is a later milestone). */
     if (m->model == MAC_MODEL_PLUS)
         sony_patch_rom(m);
+    /* M7.6bq — SE/30 (Mac IIx ROM) patches matching minivmac
+     * ROMEMDEV.c lines 290-291, 308-310. These skip the slow ROM
+     * checksum and RAM tests; without these, our boot diverges from
+     * vmac at PC=0x40802AB0 (JMP +0xC3A → checksum loop, 500K instr)
+     * which we run but vmac BRA's past. Patches:
+     *   ROM[0x2AB0] = 0x6008 (BRA.S +8) — skip checksum routine
+     *   ROM[0x00EE] = 0x6002 (BRA.S +2) — skip RAM test 1
+     *   ROM[0x01AA] = 0x6002 (BRA.S +2) — skip RAM test 2 */
+    if (m->model == MAC_MODEL_SE30 && len >= 0x2AB2) {
+        m->rom[0x2AB0] = 0x60;
+        m->rom[0x2AB1] = 0x08;
+        if (len >= 0xF0) {
+            m->rom[0x00EE] = 0x60;
+            m->rom[0x00EF] = 0x02;
+        }
+        if (len >= 0x1AC) {
+            m->rom[0x01AA] = 0x60;
+            m->rom[0x01AB] = 0x02;
+        }
+    }
     return true;
 }
 
