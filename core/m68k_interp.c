@@ -56,6 +56,17 @@ void m68k_reset(m68k_cpu *cpu, struct mac_mem *mem) {
         cpu->ssp = mac_read32(mem, 0);
         cpu->a[7] = cpu->ssp;
         cpu->pc = mac_read32(mem, 4);
+        /* USP is undefined at hardware reset on the 68030. On the Mac
+         * SE/30 the ROM does `MOVEC USP, D7` early in boot and inspects
+         * bit 16 to decide between normal boot and diagnostic mode.
+         * Real cold-boot USP can be any value; setting bit 16 here
+         * (only under SE/30) takes the normal-boot path. Mac Plus path
+         * leaves USP = 0 to keep lockstep snapshots bit-identical.
+         * TODO(se30-usp): determine if there's a real hardware power-on
+         * convention or if this is meant to be set by a sense-line. */
+        if (mem->model == MAC_MODEL_SE30) {
+            cpu->usp = 0x00010000u;
+        }
     }
     cpu->halted = M68K_RUN;
 }

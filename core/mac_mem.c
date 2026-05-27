@@ -62,6 +62,14 @@ void mac_mem_init_ex(mac_mem *m, mac_machine_t model, u32 ram_size) {
         m->via2.t2c = 0xFFFF;
         m->via2.ora = 0xFF;
         m->via2.orb = 0xFF;
+        /* Power-on: VIA1 IFR bit 5 (T2) is undefined on real hardware,
+         * but the Mac SE/30 ROM expects it to be SET early in boot —
+         * the routine at 0x40803474 only arms T2 (sets T2C-H) if it
+         * sees bit 5 already set, otherwise returns without arming.
+         * Pre-setting IFR bit 5 to 1 lets the bootstrap proceed past
+         * the "wait N timer cycles" routines.
+         * TODO(via-power-on): verify against vMac SE-30 variant. */
+        m->via.ifr |= VIA_IRQ_T2;
         /* ASC + ADB stubs come pre-zeroed from the memset above. */
     }
 
