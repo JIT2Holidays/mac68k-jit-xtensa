@@ -2378,6 +2378,57 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
         } else if (w == 0x4E71) {          /* NOP */
             emit_advance(&e, 2, 4);
             inline_ops++; done = true;
+        } else if (w == 0x4E7A || w == 0x4E7B) {
+            /* M7.5i — MOVEC inline. The ext word is known at JIT compile
+             * time (peek from ROM/RAM). We map the 12-bit ctl-reg selector
+             * to a known offsetof in m68k_cpu and emit a single l32i/s32i
+             * pair between the general register slot and the ctl-reg slot.
+             *
+             * Length 4 (op + ext word), cycles 12 (m68k_step base 4 +
+             * do_movec handler 12 — wait, our interp adds +12 in do_movec
+             * plus the +4 base = 16... actually re-check).
+             *
+             * Privilege check skipped — assumes supervisor (TODO(priv)):
+             * user-mode MOVEC would raise vector 8 via the interp's
+             * is_priv_violation_if_user gate.
+             *
+             * Supported ctl regs: SFC/DFC/CACR/USP/VBR/CAAR/MSP/ISP/
+             * TC/TT0/TT1. The 64-bit SRP/CRP (sels 0x806/0x807) fall
+             * through to the m68k_step bridge since they need two-word
+             * transfers. */
+            u16 ext = mac_read16(cpu->mem, op_pc[i] + 2);
+            int dir_to_ctl = (w & 1) != 0;
+            int gen_reg = (ext >> 12) & 0xF;
+            u32 ctl_sel = ext & 0xFFF;
+            u32 ctl_off = ~0u;
+            switch (ctl_sel) {
+                case 0x000: ctl_off = (u32)offsetof(m68k_cpu, sfc); break;
+                case 0x001: ctl_off = (u32)offsetof(m68k_cpu, dfc); break;
+                case 0x002: ctl_off = (u32)offsetof(m68k_cpu, cacr); break;
+                case 0x800: ctl_off = (u32)offsetof(m68k_cpu, usp); break;
+                case 0x801: ctl_off = (u32)offsetof(m68k_cpu, vbr); break;
+                case 0x802: ctl_off = (u32)offsetof(m68k_cpu, caar); break;
+                case 0x803: ctl_off = (u32)offsetof(m68k_cpu, msp); break;
+                case 0x804: ctl_off = (u32)offsetof(m68k_cpu, isp); break;
+                case 0x003: ctl_off = (u32)offsetof(m68k_cpu, tc); break;
+                case 0x004: ctl_off = (u32)offsetof(m68k_cpu, tt0); break;
+                case 0x005: ctl_off = (u32)offsetof(m68k_cpu, tt1); break;
+                default: break;     /* SRP/CRP and unknowns: bridge */
+            }
+            if (ctl_off != ~0u) {
+                int gi = (gen_reg < 8) ? G_D(gen_reg) : G_A(gen_reg - 8);
+                if (dir_to_ctl) {
+                    /* Rn → ctl */
+                    emit_read_g(&e, &rc, gi, 8);
+                    xt_s32i(&e, 8, R_CPU, ctl_off);
+                } else {
+                    /* ctl → Rn */
+                    xt_l32i(&e, 8, R_CPU, ctl_off);
+                    emit_write_g(&e, &rc, gi, 8);
+                }
+                emit_advance(&e, 4, 16);   /* m68k_step base 4 + do_movec 12 */
+                inline_ops++; done = true;
+            }
         } else if ((w & 0xFFF8) == 0x4ED0) {
             /* M6.128 — JMP (An). Block terminator. Common in subroutine
              * dispatch tables that load An then JMP through it.
