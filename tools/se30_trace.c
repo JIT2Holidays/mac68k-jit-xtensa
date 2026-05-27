@@ -355,6 +355,18 @@ int main(int argc, char **argv) {
                 ram_logged = 1;
             }
         }
+        /* SE30_LOG_MACSBUG=1 — log first time PC reaches Macsbug parser
+         * entry at 0x40802EDC, indicating boot entered debug recovery. */
+        {
+            static int mb_logged = 0;
+            if (!mb_logged && getenv("SE30_LOG_MACSBUG") &&
+                cpu.pc >= 0x40802ED0u && cpu.pc < 0x40802EE0u) {
+                fprintf(stderr, "[macsbug] first entry PC=%08X at cyc=%llu instrs=%llu\n",
+                        cpu.pc, (unsigned long long)cpu.cycles,
+                        (unsigned long long)cpu.instrs);
+                mb_logged = 1;
+            }
+        }
     }
     note_pc(cpu.pc, cpu.cycles);
 
