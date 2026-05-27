@@ -352,6 +352,62 @@ int main(void) {
         rc |= bad;
     }
 
+    /* M7.5e — MULU.L / DIVU.L lockstep. MOVE.L #20, D0 ; MULU.L #6, D0 ;
+     * DIVU.L #4, D0 ; STOP. With sizing fixed and these ops in
+     * can_inline_020, the block contains all of them through the
+     * m68k_step bridge. */
+    {
+        mac_mem mi, mj;
+        mac_mem_init_ex(&mi, MAC_MODEL_SE30, 64 * 1024);
+        mac_mem_init_ex(&mj, MAC_MODEL_SE30, 64 * 1024);
+        u8 prog[16];
+        memset(prog, 0, sizeof prog);
+        m68a aa;
+        m68a_init(&aa, prog, sizeof prog, 0);
+        m68a_w32(&aa, 0x00010000);
+        m68a_w32(&aa, 0x00000100);
+        m68a_finish(&aa);
+        mac_load_ram_image(&mi, 0, prog, 8);
+        mac_load_ram_image(&mj, 0, prog, 8);
+        u16 code[] = {
+            0x203C, 0x0000, 0x0014,            /* MOVE.L #20, D0 */
+            0x4C3C, 0x0800, 0x0000, 0x0006,    /* MULU.L #6, D0 */
+                                               /* ext bits 14-12=0(Dq), 11=1(sgnoff in our impl=signed bit, hmm) */
+            0x4C7C, 0x0800, 0x0000, 0x0004,    /* DIVU.L #4, D0 */
+            0x4E72, 0x2700,                    /* STOP */
+        };
+        /* MUL.L ext word: bits 14-12 = Dq, bit 11 = signed (1=signed, 0=unsigned),
+         * bit 10 = 64-bit result. For 32-bit unsigned product into D0 use
+         * Dq=0, unsigned (bit 11 = 0), 32-bit (bit 10 = 0): ext = 0x0000.
+         * Let's flip to actually unsigned. */
+        code[4] = 0x0000;          /* MULU.L: Dq=0, unsigned, 32-bit */
+        code[8] = 0x0000;          /* DIVU.L: Dq=0, unsigned, 32-bit */
+        for (size_t i = 0; i < sizeof code / sizeof code[0]; i++) {
+            mac_write16(&mi, 0x100u + (u32)(i * 2), code[i]);
+            mac_write16(&mj, 0x100u + (u32)(i * 2), code[i]);
+        }
+        m68k_cpu ci, cj;
+        m68k_reset(&ci, &mi);
+        m68k_reset(&cj, &mj);
+        m68k_run_until(&ci, 100000);
+        m68k_dispatcher d;
+        m68k_dispatcher_init(&d, &cj);
+        m68k_dispatcher_run_until(&d, 100000);
+        int bad = diff_state("se30-muldiv-l", &ci, &cj);
+        if (!bad) {
+            /* 20 * 6 = 120; 120 / 4 = 30. */
+            if (ci.d[0] != 30) {
+                printf("  se30-muldiv-l: D0=%u want 30\n", ci.d[0]); bad = 1;
+            } else {
+                printf("  se30-muldiv-l: match — D0=30 (20*6/4)\n");
+            }
+        }
+        m68k_dispatcher_shutdown(&d);
+        mac_mem_free(&mi);
+        mac_mem_free(&mj);
+        rc |= bad;
+    }
+
     /* M7.5d — bitfield in memory mode (BFEXTU (d16,An){off:wid},Dn) —
      * validates the decoder fix that adds the d16 displacement bytes
      * to d.length. Without it, the JIT walker reads the d16 word as

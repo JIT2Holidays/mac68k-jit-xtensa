@@ -1894,6 +1894,10 @@ bool m68k_jit_can_inline_020(u16 op) {
      * the mask 0xF8C0 == 0xE8C0. */
     if ((op & 0xF8C0) == 0xE8C0) return true;
 
+    /* M7.5e — 32-bit MUL/DIV via m68k_step bridge. */
+    if ((op & 0xFFC0) == 0x4C00) return true;   /* MULU.L / MULS.L */
+    if ((op & 0xFFC0) == 0x4C40) return true;   /* DIVU.L / DIVS.L */
+
     return false;
 }
 
@@ -2838,6 +2842,13 @@ m68k_decoded m68k_decode_at(m68k_cpu *cpu, u32 pc) {
              * (An) sizes LINK.L to just 2 bytes and the walker decodes
              * the d32 displacement as 2 phantom instructions. */
             if ((op & 0xFFF8) == 0x4808) { d.length += 4; break; }
+            /* M7.5e — MULU.L / MULS.L (0x4C00 + EA) and DIVU.L / DIVS.L
+             * (0x4C40 + EA): 4 bytes minimum (op + 2-byte ext word) plus
+             * EA bytes. The default fall-through misses the ext word. */
+            if ((op & 0xFFC0) == 0x4C00 || (op & 0xFFC0) == 0x4C40) {
+                d.length += 2 + ea_ext_bytes(cpu, pc + 2, mode, reg, 4);
+                break;
+            }
             /* 2-byte instructions with NO effective-address field — these
              * must not fall through to the generic EA-extension sizing,
              * which would mis-read their register bits as an EA mode. */
