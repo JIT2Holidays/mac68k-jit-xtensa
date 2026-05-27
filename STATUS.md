@@ -42,6 +42,7 @@ milestones build on.
 | **M7.5p** | JIT native inline arms: BFCHG / BFCLR / BFSET (modify variants) | 8/8 |
 | **M7.5q** | JIT native inline arm: BFINS (insert field) | 8/8 |
 | **M7.5r** | JIT native inline arms: PACK + UNPK (Dn-Dn form) | 8/8 |
+| **M7.6a** | PMMU translation framework (no-op pass-through; real PTW TODO) | 8/8 |
 
 **Current state:**
 * **Interpreter**: All 68020/030 integer ISA implemented (M7.0). Boots
@@ -72,11 +73,19 @@ milestones build on.
   icon. Blocked on hardware modeling: VIA timer + IRQ delivery, full
   ASC FIFO, ADB protocol. Requires multi-session work.
 * **M7.4** — System 7.0 from InfiniteHD. Blocked on M7.3.
-* **M7.5 (native inline arms continuation)** — Bitfield × 8, long
-  MUL/DIV × 4, MOVES, TRAPcc cc!=F, CHK2/CMP2, CAS, CAS2, PACK, UNPK,
-  PMMU. All currently bridged via m68k_step.
-* **M7.6** — Full PMMU page-table walking (for 32-bit Mode / VM under
-  System 7.5+). Register stubs in M7.0 sufficient for 24-bit boot.
+* **M7.6 (real PTW)** — Page-table walking via SRP/CRP. Framework in
+  M7.6a; only needed for 32-bit Mode / VM under System 7.5+.
+
+**Native inline arms remaining via m68k_step bridge (lower priority):**
+* BFFFO (needs Xtensa NSAU emitter — leading-zero count)
+* MULU.L / MULS.L / DIVU.L / DIVS.L (need full 64-bit math via Xtensa
+  MULUH/MULSH + DIVU/DIVS — not exposed by current emitter)
+* RTD (control-flow inline needs helper_step_size API not yet exposed)
+* MOVES (memory access with function code — complex EA decode)
+* TRAPcc cc != F (conditional trap with PC mutation)
+* CHK2 / CMP2 / CAS / CAS2 (rare — not bench-hot)
+* PMMU instructions (already keep-in-block via bridge; native inline
+  would be marginal)
 
 ---
 
