@@ -144,6 +144,16 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[se30_trace] patched 0x40802C6C BRA → NOP NOP\n");
     }
 
+    /* SE30_PATCH_32AC=1 — NOP the BEQ.S at 0x408032AC that takes the
+     * RX_AVAIL=0 path back into the hot loop. Forces the ROM into the
+     * RX-data-processing branch at 0x408032AE regardless of RX state.
+     * Aggressive — useful for exploring what happens past the
+     * post-PMMU stall when serial input isn't available. */
+    if (mem.rom && rom_len > 0x32AD && getenv("SE30_PATCH_32AC")) {
+        mem.rom[0x32AC] = 0x4E; mem.rom[0x32AD] = 0x71;  /* NOP */
+        fprintf(stderr, "[se30_trace] patched 0x408032AC BEQ → NOP\n");
+    }
+
     m68k_cpu cpu;
     m68k_reset(&cpu, &mem);
     g_cpu = &cpu;
