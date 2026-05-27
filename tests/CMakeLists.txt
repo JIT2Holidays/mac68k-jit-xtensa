@@ -142,4 +142,10 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/roms/disks/se30-reset.snap")
                      --max-cycles 200000
                      --machine se30
              WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+else()
+    # M7.6aq — surface the missing-snapshot case so fresh checkouts
+    # see why the test is silently skipped.
+    message(STATUS "diff_jit_se30_reset_lockstep skipped — run "
+                   "scripts/snap-se30-reset.sh to generate "
+                   "roms/disks/se30-reset.snap (needs roms/MacIIx.ROM)")
 endif()
