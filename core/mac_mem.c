@@ -66,7 +66,11 @@ void mac_mem_init_ex(mac_mem *m, mac_machine_t model, u32 ram_size) {
          * file behaves identically. Filled in by later milestones. */
         m->via2.t1c = 0xFFFF;
         m->via2.t2c = 0xFFFF;
-        m->via2.ora = 0xFF;
+        /* VIA2 ORA: bits 6-7 = MODEL ID pins. Mac IIx reads them at
+         * boot at 0x4080394C to index a max-RAM table at 0x4080366A.
+         * vmac's VIA2_ORA defaults to 0 (latched), so bits 6-7 = 00 →
+         * table idx 0 → A2 = 0x0100FFFF (16MB max). Init to 0 to match. */
+        m->via2.ora = 0x00;
         m->via2.orb = 0xFF;
         /* Power-on: VIA1 IFR bit 5 (T2) is undefined on real hardware,
          * but the Mac SE/30 ROM expects it to be SET early in boot —
@@ -568,17 +572,17 @@ u8 mac_read8(mac_mem *m, u32 addr) {
     u8 val = (m->model == MAC_MODEL_SE30) ? 0xFFu : 0u;
     int rgn = (m->model == MAC_MODEL_SE30) ? region_of_se30(addr)
                                            : region_of(addr);
-    /* SE/30 open-bus reads: return 0xFF for unmapped MMIO/slots
-     * (matches minivmac Glue-chip behavior — slot probes use magic-value
-     * CMP+BNE, not BERR). HOWEVER, reads above RAM end but below the
-     * MMIO range (0x40000000) are PHYSICAL OPEN BUS and SHOULD BERR —
-     * the ROM's RAM-size probe at 0x40803944 marches A0 through powers
-     * of 2 expecting BERR when off-RAM. Without BERR there, garbage
-     * reads cause the probe to fail with D6=0xB6DB6DB6, dumping us into
-     * the Macsbug error-handler/parser stall. */
-    if (m->model == MAC_MODEL_SE30 && rgn == RGN_NONE && m->cpu
-        && addr < 0x40000000u && addr >= m->ram_size) {
-        m->cpu->bus_error_pending = addr | 0x80000000u;
+    /* SE/30 open-bus reads at unmapped MMIO/slots: return 0xFF
+     * (matches minivmac Glue-chip — slot probes use magic-value
+     * CMP+BNE, not BERR). For reads above ram_size but below MMIO
+     * (< 0x40000000), wrap modulo ram_size — the ROM's RAM-size
+     * detection at 0x40803944 relies on this wrap to find actual RAM
+     * size (writes pattern at candidate size limit, reads back from
+     * addr 0, detects wrap). */
+    if (m->model == MAC_MODEL_SE30 && rgn == RGN_NONE
+        && addr < 0x40000000u && addr >= m->ram_size && m->ram_size) {
+        u32 wrapped = addr % m->ram_size;
+        return m->ram[wrapped];
     }
     switch (rgn) {
         case RGN_VIA:    val = via_read(m, addr);  break;
@@ -642,13 +646,16 @@ void mac_write8(mac_mem *m, u32 addr, u8 v) {
     }
     int rgn = (m->model == MAC_MODEL_SE30) ? region_of_se30(addr)
                                            : region_of(addr);
-    /* SE/30: unmapped MMIO/slot writes silently dropped. Out-of-RAM
-     * writes in the < 0x40000000 range BERR (mirrors the read path —
-     * ROM's RAM-size probe writes patterns then reads them back, and
-     * expects BERR for both halves when past RAM). */
-    if (m->model == MAC_MODEL_SE30 && rgn == RGN_NONE && m->cpu
-        && addr < 0x40000000u && addr >= m->ram_size) {
-        m->cpu->bus_error_pending = addr | 0x80000000u;
+    /* SE/30: unmapped MMIO/slot writes silently dropped (open-bus).
+     * For writes above ram_size but below MMIO (< 0x40000000), wrap
+     * modulo ram_size — mirrors the read path. This matches real
+     * hardware where the address decoder repeats the RAM image. */
+    if (m->model == MAC_MODEL_SE30 && rgn == RGN_NONE
+        && addr < 0x40000000u && addr >= m->ram_size && m->ram_size) {
+        u32 wrapped = addr % m->ram_size;
+        m->ram[wrapped] = v;
+        if (mac_write_watch) mac_write_watch(mac_write_watch_ctx, wrapped);
+        return;
     }
     switch (rgn) {
         case RGN_VIA:    via_write(m, addr, v);  return;
