@@ -796,9 +796,16 @@ void m68k_dispatcher_run_until(m68k_dispatcher *d, u64 until) {
          * here so the JIT engine behaves identically. Without this, the
          * SE/30 ROM hardware-probe loop diverges from interp (see
          * diff-jit-trace at PC=0x40802A34 — MOVE.L abs.L from unmapped
-         * memory: interp pushes a format-A frame, JIT skips it). */
-        if (cpu->bus_error_pending) {
-            cpu->fault_addr = cpu->bus_error_pending & 0x0FFFFFFFu;
+         * memory: interp pushes a format-A frame, JIT skips it).
+         *
+         * M7.6ar — cache_bus_error_pending into a local. The compiler
+         * already knows Plus never sets it (gated in mac_read/write by
+         * model == SE30) but the load + zero-compare per block adds up.
+         * Reading once into a u32 helps the branch predictor and avoids
+         * a re-load if the slow path fires. */
+        u32 berr = cpu->bus_error_pending;
+        if (berr) {
+            cpu->fault_addr = berr & 0x0FFFFFFFu;
             cpu->bus_error_pending = 0;
             m68k_exception(cpu, 2);
             prev = NULL;
