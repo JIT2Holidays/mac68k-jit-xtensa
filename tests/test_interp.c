@@ -448,6 +448,32 @@ static int test_pmmu_translate(void) {
         return 1;
     }
 
+    /* M7.6n — long-form supervisor-only (S, bit 14). User-mode access
+     * (fc=1 = user data) to a S=1 page → BERR with CAUSE_SUPER.
+     * Supervisor (fc=5) access to the same page should succeed. */
+    cpu.tc = 0;
+    mac_write32(&mem, long_table + 4 * 8 + 0, 0x00004001u);   /* DT=1, S=1 */
+    mac_write32(&mem, long_table + 4 * 8 + 4, 0x000E0000u);   /* page addr */
+    cpu.srp = ((u64)long_table << 32) | 3u;
+    cpu.crp = cpu.srp;                                          /* same root for user */
+    cpu.tc = 0x80000000u | (4u << 20) | (4u << 12);
+    cpu.bus_error_pending = 0;
+    /* Supervisor reads page 4: should succeed. */
+    u32 ph_sup = mac_pmmu_translate(&mem, 0x4000u, 5, false);
+    if (cpu.bus_error_pending != 0 || ph_sup != 0xE0000u) {
+        printf("pmmu: S=1 super read phys=%08X berr=%08X\n",
+               ph_sup, cpu.bus_error_pending); return 1;
+    }
+    /* User reads page 4: should BERR with CAUSE_SUPER. */
+    cpu.bus_error_pending = 0;
+    mac_pmmu_translate(&mem, 0x4000u, 1, false);
+    if (cpu.bus_error_pending == 0 ||
+        (cpu.bus_error_pending & BERR_CAUSE_MASK) != BERR_CAUSE_SUPER) {
+        printf("pmmu: S=1 user cause=%08X want %08X\n",
+               cpu.bus_error_pending & BERR_CAUSE_MASK, BERR_CAUSE_SUPER);
+        return 1;
+    }
+
     /* M7.6i — U (used) and M (modified) bit maintenance. Set up a fresh
      * short-form entry with U=0/M=0, translate it once for read, expect
      * U=1 M=0. Translate again for write, expect U=1 M=1. */
