@@ -708,6 +708,40 @@ static int test_030_exception_frame(void) {
     return 0;
 }
 
+/* M7.6y — SE/30 reset state: SRP/CRP initialized to canonical
+ * "MMU disabled" descriptor (0x7FFF0001 in high 32, zero in low 32).
+ * Matches minivmac MINEM68K.c DoCodeMMU reference. */
+static int test_se30_srp_canonical(void) {
+    mac_mem mem;
+    mac_mem_init_ex(&mem, MAC_MODEL_SE30, 1024 * 1024);
+    m68k_cpu cpu;
+    m68k_reset(&cpu, &mem);
+
+    if (cpu.srp != ((u64)0x7FFF0001u << 32)) {
+        printf("se30 srp: got %016llX want 7FFF000100000000\n",
+               (unsigned long long)cpu.srp);
+        mac_mem_free(&mem); return 1;
+    }
+    if (cpu.crp != ((u64)0x7FFF0001u << 32)) {
+        printf("se30 crp: got %016llX want 7FFF000100000000\n",
+               (unsigned long long)cpu.crp);
+        mac_mem_free(&mem); return 1;
+    }
+
+    /* Plus model must NOT have this value (default zero — historical). */
+    mac_mem plus;
+    mac_mem_init_ex(&plus, MAC_MODEL_PLUS, 64 * 1024);
+    m68k_cpu pcpu;
+    m68k_reset(&pcpu, &plus);
+    if (pcpu.srp != 0 || pcpu.crp != 0) {
+        printf("plus srp/crp not zero — regression\n");
+        mac_mem_free(&mem); mac_mem_free(&plus); return 1;
+    }
+    mac_mem_free(&mem); mac_mem_free(&plus);
+    printf("  SE/30 SRP/CRP canonical-disabled init OK\n");
+    return 0;
+}
+
 int main(void) {
     if (test_arith()) return fail("arith snippet");
     if (test_xform_flags()) return fail("X-form condition codes");
@@ -715,6 +749,7 @@ int main(void) {
     if (test_se30_init_stable()) return fail("SE/30 init");
     if (test_pmmu_translate()) return fail("PMMU framework");
     if (test_030_exception_frame()) return fail("030 exception frame");
+    if (test_se30_srp_canonical()) return fail("SE/30 SRP canonical init");
 
     mac_mem mem;
     mac_mem_init(&mem, 1024 * 1024);
