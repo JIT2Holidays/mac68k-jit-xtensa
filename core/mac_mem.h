@@ -263,6 +263,15 @@ extern void (*mac_mmio_log)(mac_mem *m, u32 addr, u32 val, int is_write, int siz
 extern void (*mac_write_watch)(void *ctx, u32 addr);
 extern void  *mac_write_watch_ctx;
 
+/* Overlay-change hook — the JIT dispatcher registers this to invalidate
+ * its block cache when the boot overlay flips. JIT codegen bakes the
+ * overlay state into compiled code (see codegen.c lines 1790, 3212,
+ * 3666, 3722, 3915, 4007, 4105) so cached blocks become stale when
+ * overlay changes. Without this hook, JIT vs interp diverge at the
+ * first overlay-sensitive memory access after the overlay flip. */
+extern void (*mac_overlay_change_watch)(void *ctx);
+extern void  *mac_overlay_change_watch_ctx;
+
 /* Initialize the memory map for the given machine and RAM size. The Plus
  * path is the historical default — callers using the one-argument
  * mac_mem_init wrapper below get MAC_MODEL_PLUS and the original behavior

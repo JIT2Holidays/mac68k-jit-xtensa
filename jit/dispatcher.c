@@ -213,6 +213,18 @@ static void free_all_blocks(m68k_dispatcher *d) {
 
 /* --- self-modifying-code tracking ------------------------------------- */
 
+/* M6.268 — invalidate the entire JIT block cache. Called when boot
+ * overlay flips because codegen bakes the overlay state into address-
+ * decoding optimizations (see codegen.c lines 3212/3666/3722/3915/
+ * 4007/4105 and 1790). After this call, the next dispatch will
+ * recompile all blocks with the new overlay state. */
+static void overlay_invalidate(void *ctx) {
+    m68k_dispatcher *d = (m68k_dispatcher *)ctx;
+    free_all_blocks(d);
+    codecache_init(&d->cc, (u8 *)d->arena, d->arena_cap, d->cc.mode);
+    d->cpu->chain_budget = 0;  /* break any active native chain */
+}
+
 /* A guest write that lands on a page holding compiled code queues that
  * page for invalidation. Registered as the mac_mem write-watch. */
 static void smc_watch(void *ctx, u32 addr) {
@@ -383,6 +395,11 @@ bool m68k_dispatcher_init_ex(m68k_dispatcher *d, m68k_cpu *cpu,
     d->arena_cap = arena_kb * 1024u;
     mac_write_watch = smc_watch;
     mac_write_watch_ctx = d;
+    /* M6.268 — register overlay-change callback. JIT codegen bakes
+     * overlay state into compiled blocks; invalidate everything when
+     * overlay flips so the next dispatch recompiles with new state. */
+    mac_overlay_change_watch = overlay_invalidate;
+    mac_overlay_change_watch_ctx = d;
 #if defined(ESP_PLATFORM)
     extern void *m68k_jit_arena_alloc(u32 bytes);
     d->arena = m68k_jit_arena_alloc(d->arena_cap);

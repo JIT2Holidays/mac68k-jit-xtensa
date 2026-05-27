@@ -19,6 +19,13 @@
 void (*mac_mmio_log)(mac_mem *m, u32 addr, u32 val, int is_write, int size);
 void (*mac_write_watch)(void *ctx, u32 addr);
 void  *mac_write_watch_ctx;
+void (*mac_overlay_change_watch)(void *ctx);
+void  *mac_overlay_change_watch_ctx;
+
+/* M6.268 — helper to notify JIT (or other observer) of overlay flip. */
+static inline void mac_overlay_notify(void) {
+    if (mac_overlay_change_watch) mac_overlay_change_watch(mac_overlay_change_watch_ctx);
+}
 
 /* The Mac Plus runs the 68000 at 7.8336 MHz; the screen refreshes at
  * ~60.15 Hz, so a vertical-blank edge lands every ~130k CPU cycles. */
@@ -288,7 +295,11 @@ static void via_write(mac_mem *m, u32 addr, u8 val) {
                 v->ifr &= (u8)~(VIA_IRQ_CA1 | VIA_IRQ_CA2);
                 mac_via_recalc_irq(m);
             }
-            m->overlay = (val & 0x10) != 0;
+            {
+                bool old_overlay = m->overlay;
+                m->overlay = (val & 0x10) != 0;
+                if (old_overlay != m->overlay) mac_overlay_notify();
+            }
             /* PA5 is the floppy drive SEL line, read by the IWM. */
             m->iwm.sel = (val & 0x20) ? 1u : 0u;
             /* PA6 selects the video page (main vs alternate buffer). */
@@ -683,6 +694,7 @@ void mac_write8(mac_mem *m, u32 addr, u8 v) {
     if (m->model == MAC_MODEL_SE30 && m->overlay
         && (addr & 0xFFFFFFFEu) == 0x5FFFFFFEu) {
         m->overlay = false;
+        mac_overlay_notify();
         return;
     }
     /* RAM is writable under the overlay too (the boot code clears it). */
