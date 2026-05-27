@@ -1028,6 +1028,12 @@ void mac_mem_tick(mac_mem *m, u64 cycles) {
      * ROM may have other gates that check T1, and on real hardware
      * T1 is the system 60Hz tick which auto-reloads in continuous
      * mode. Both timers running is the normal post-boot state. */
+    /* M7.6aw / M7.6ax — keep IFR T1/T2 forced. Without this, the
+     * self-test at PC=0x4080347E BTST #5 of IFR fails (T2 IRQ flag
+     * cleared by write-1-clear before BEQ reads it). Side effect:
+     * IRQ-wait loops at PC=0x4080059C / 0x408005D2 may fire IRQ
+     * earlier than vmac's actual T2 underflow — but the boot still
+     * progresses (just with shifted instruction counts vs vmac). */
     if (m->model == MAC_MODEL_SE30) {
         u8 old_ifr = v->ifr;
         v->ifr |= VIA_IRQ_T2 | VIA_IRQ_T1;
