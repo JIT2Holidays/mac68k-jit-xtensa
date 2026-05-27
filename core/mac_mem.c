@@ -312,6 +312,15 @@ static void via_write(mac_mem *m, u32 addr, u8 val) {
             v->t2c = (u16)((v->t2l_lo) | ((u16)val << 8));
             v->t2_irq_armed = true;
             v->ifr &= (u8)~VIA_IRQ_T2;
+            v->t2_force_done = true;
+            /* M6.264 — pre-set IFR T2 on arm. Real hardware fires T2 IRQ
+             * after T2C-H value cycles. Our forced model doesn't accumulate
+             * cycles like real CPU, so we let the IFR bit be set
+             * conceptually "immediately" — matches what the boot's
+             * IFR-T2 poll expects to see. After ack via T2C-L read, the
+             * one-shot semantics work as normal. */
+            if (m->model == MAC_MODEL_SE30)
+                v->ifr |= VIA_IRQ_T2;
             mac_via_recalc_irq(m);
             break;
         case 10: v->sr = val; mac_kbd_sr_written(m); break;
@@ -1036,13 +1045,15 @@ void mac_mem_tick(mac_mem *m, u64 cycles) {
      * progresses (just with shifted instruction counts vs vmac). */
     if (m->model == MAC_MODEL_SE30) {
         u8 old_ifr = v->ifr;
-        /* M6.263 — env gate: SE30_NO_FORCE_T2 leaves T2 IFR alone, only
-         * force T1 (60Hz heartbeat). Tests if removing T2 force fixes
-         * IRQ-wait timing without breaking the early self-test. */
-        if (getenv("SE30_NO_FORCE_T2"))
-            v->ifr |= VIA_IRQ_T1;
-        else
-            v->ifr |= VIA_IRQ_T2 | VIA_IRQ_T1;
+        /* T1 force always (60Hz heartbeat needed throughout boot). */
+        v->ifr |= VIA_IRQ_T1;
+        /* M6.264 — T2 force only until ROM properly arms T2 (write to
+         * T2C-H at PC=0x40800572 sets t2_force_done). After arm, T2
+         * fires naturally at proper cycle, matching vmac's IRQ-wait-
+         * loop exit timing. Env gate SE30_NO_FORCE_T2=1 to test
+         * without ANY T2 force. */
+        if (!v->t2_force_done && !getenv("SE30_NO_FORCE_T2"))
+            v->ifr |= VIA_IRQ_T2;
         if (v->ifr != old_ifr) irq_changed = true;
     }
 

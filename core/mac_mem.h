@@ -94,6 +94,9 @@ typedef struct via6522 {
     bool t1_irq_armed;     /* T1 will raise IRQ on next timeout */
     bool t2_irq_armed;     /* T2 is one-shot: armed by T2C-H write,
                             * cleared when the IRQ fires            */
+    bool t2_force_done;    /* M6.264 — set on first T2C-H write to disable
+                            * the IFR-T2 force; ROM has properly armed T2
+                            * and natural underflow will fire IRQ on time */
     u64 last_cycle;        /* cycle stamp of the last timer step */
     u32 via_tick_rem;      /* CPU-cycle remainder for the /10 divider */
     u64 next_vbl;          /* next CA1 / vertical-blank edge     */
