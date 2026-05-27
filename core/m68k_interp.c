@@ -1875,8 +1875,20 @@ bool is_68020_only(u16 op) {
 }
 
 bool m68k_jit_can_inline_020(u16 op) {
-    /* M7.5a — EXTB.L Dn: 0100 1001 1100 0nnn (0x49C0-0x49C7). */
+    /* M7.5a — EXTB.L Dn: 0100 1001 1100 0nnn (0x49C0-0x49C7).
+     * Native 2-op codegen in jit/codegen.c. */
     if ((op & 0xFFF8) == 0x49C0) return true;
+
+    /* M7.5c — keep these in the block via the default m68k_step bridge
+     * (no native inline arm yet — but the bridge correctly handles them
+     * thanks to the M7.5b decoder-sizing fixes). The win is avoiding
+     * a block-termination and the dispatcher round-trip on every 020+
+     * op the SE/30 boot path hits. */
+    if (op == 0x4E7A || op == 0x4E7B) return true;       /* MOVEC */
+    if ((op & 0xFFF8) == 0x4808) return true;            /* LINK.L An,#d32 */
+    if ((op & 0xFF20) == 0xF400) return true;            /* CINV  (line F cache) */
+    if ((op & 0xFF20) == 0xF420) return true;            /* CPUSH (line F cache) */
+
     return false;
 }
 

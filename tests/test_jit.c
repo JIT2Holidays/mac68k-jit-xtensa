@@ -206,6 +206,55 @@ int main(void) {
         rc |= bad;
     }
 
+    /* M7.5c — MOVEC lockstep. Block: MOVE.L #0x1000,D0 ; MOVEC D0,VBR ;
+     * MOVEC VBR,D1 ; STOP. With MOVEC in can_inline_020 the JIT keeps
+     * it in the block (via m68k_step bridge) instead of terminating.
+     * Validate cpu->vbr and D1 match interp. */
+    {
+        mac_mem mi, mj;
+        mac_mem_init_ex(&mi, MAC_MODEL_SE30, 64 * 1024);
+        mac_mem_init_ex(&mj, MAC_MODEL_SE30, 64 * 1024);
+        u8 prog[16];
+        memset(prog, 0, sizeof prog);
+        m68a aa;
+        m68a_init(&aa, prog, sizeof prog, 0);
+        m68a_w32(&aa, 0x00010000);
+        m68a_w32(&aa, 0x00000100);
+        m68a_finish(&aa);
+        mac_load_ram_image(&mi, 0, prog, 8);
+        mac_load_ram_image(&mj, 0, prog, 8);
+        u16 code[] = {
+            0x203C, 0x0000, 0x1000,            /* MOVE.L #0x1000,D0 */
+            0x4E7B, (u16)((0 << 12) | 0x801),  /* MOVEC D0,VBR */
+            0x4E7A, (u16)((1 << 12) | 0x801),  /* MOVEC VBR,D1 */
+            0x4E72, 0x2700,                    /* STOP */
+        };
+        for (size_t i = 0; i < sizeof code / sizeof code[0]; i++) {
+            mac_write16(&mi, 0x100u + (u32)(i * 2), code[i]);
+            mac_write16(&mj, 0x100u + (u32)(i * 2), code[i]);
+        }
+        m68k_cpu ci, cj;
+        m68k_reset(&ci, &mi);
+        m68k_reset(&cj, &mj);
+        m68k_run_until(&ci, 100000);
+        m68k_dispatcher d;
+        m68k_dispatcher_init(&d, &cj);
+        m68k_dispatcher_run_until(&d, 100000);
+        int bad = diff_state("se30-movec", &ci, &cj);
+        if (!bad) {
+            if (ci.vbr != 0x1000 || ci.d[1] != 0x1000 || cj.vbr != 0x1000 || cj.d[1] != 0x1000) {
+                printf("  se30-movec: VBR=%08X D1=%08X (jit VBR=%08X D1=%08X) want 1000/1000\n",
+                       ci.vbr, ci.d[1], cj.vbr, cj.d[1]); bad = 1;
+            } else {
+                printf("  se30-movec: match — VBR=0x1000, D1=0x1000\n");
+            }
+        }
+        m68k_dispatcher_shutdown(&d);
+        mac_mem_free(&mi);
+        mac_mem_free(&mj);
+        rc |= bad;
+    }
+
     /* M7.5b — LINK.L decode test. Validates m68k_decode_at sizes the
      * 6-byte LINK.L correctly so the block walker doesn't fall into the
      * d32 displacement bytes mis-decoded as instructions. */
