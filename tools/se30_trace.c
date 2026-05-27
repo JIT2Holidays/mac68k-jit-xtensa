@@ -128,28 +128,20 @@ int main(int argc, char **argv) {
     free(rom_data);
     fprintf(stderr, "[se30_trace] loaded MacIIx.ROM (%u bytes)\n", rom_len);
 
-    /* M7.6v — ROM patch at 0x40802C6C is now DEFAULT-ON for the trace
-     * tool. The unconditional BRA at that offset routes execution to a
-     * "diagnostic" path at 0x40802E96 that begins with MOVEQ #0,D7 —
-     * thus clearing D7 bit 16, which the post-ASC loop later tests and
-     * branches on. The normal-boot path at 0x40802C70 does BSET #16,D7
-     * + BSET #22,D7 + enables cache, but it is unreachable from this
-     * entry without the patch.
+    /* M7.6bd — Per vmac comparison (M7.6bc), SE30_PATCH_2C6C is the
+     * WRONG direction. vmac takes the diagnostic-mode path at
+     * 0x40802C6C (no patch) and SUCCEEDS, emerging with D7=0x4. The
+     * real fix is making our hardware respond correctly to the
+     * diagnostic tests so the path naturally exits.
      *
-     * Why this is a workaround, not the real fix: the real ROM presumably
-     * relies on diagnostic-path hardware tests succeeding and then BSET'ing
-     * bit 16 from within the diagnostic path. Our hardware model doesn't
-     * fully satisfy those tests (ASC/VIA2/ADB are partial stubs), so the
-     * ROM stays in diagnostic mode forever. Patching past the BRA lets
-     * the next stall surface so we can keep iterating.
-     *
-     * Set SE30_NO_PATCH=1 to disable the patch and reproduce the original
-     * stall at PC=0x40802EE0 (described in the M7.6t roadmap memory).
-     */
-    if (mem.rom && rom_len > 0x2C70 && !getenv("SE30_NO_PATCH")) {
+     * Default is now NO PATCH. Set SE30_PATCH_2C6C=1 to enable the
+     * old behavior (forces the BSET D7 bits 16/22 path; doesn't lead
+     * to floppy-? — kept only for the legacy exploration trail). */
+    if (mem.rom && rom_len > 0x2C70 && getenv("SE30_PATCH_2C6C")) {
         mem.rom[0x2C6C] = 0x4E; mem.rom[0x2C6D] = 0x71;  /* NOP */
         mem.rom[0x2C6E] = 0x4E; mem.rom[0x2C6F] = 0x71;  /* NOP */
-        fprintf(stderr, "[se30_trace] patched 0x40802C6C BRA → NOP NOP\n");
+        fprintf(stderr, "[se30_trace] patched 0x40802C6C BRA → NOP NOP "
+                "(legacy — vmac shows this is wrong direction)\n");
     }
 
     /* SE30_PATCH_32AC=1 — NOP the BEQ.S at 0x408032AC that takes the

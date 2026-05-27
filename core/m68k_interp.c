@@ -65,7 +65,14 @@ void m68k_reset(m68k_cpu *cpu, struct mac_mem *mem) {
          * TODO(se30-usp): determine if there's a real hardware power-on
          * convention or if this is meant to be set by a sense-line. */
         if (mem->model == MAC_MODEL_SE30) {
-            cpu->usp = 0x00010000u;
+            /* M7.6bd — Per vmac comparison (M7.6bc), USP=0x00010000
+             * (bit 16 set) was wrong: vmac's D7=0x00000004 after
+             * diagnostic-mode entry, meaning the ROM's
+             * MOVEC USP,D7 path does NOT have bit 16 set. Setting USP
+             * to 0 matches vmac's behavior — ROM takes the diagnostic
+             * path naturally and (with right hardware) proceeds to
+             * boot. */
+            cpu->usp = 0;
             /* M7.6x — canonical "MMU disabled" SRP/CRP per minivmac's
              * Mac IIx reference (third_party/minivmac MINEM68K.c
              * DoCodeMMU): PMOVE SRP/CRP, (A0) emits 0x7FFF0001 then
