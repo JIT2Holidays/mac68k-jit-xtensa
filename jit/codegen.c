@@ -11710,6 +11710,67 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                 inline_ops++; done = true;
             }
             /* else (dynamic offset or width): fall through to bridge. */
+        } else if ((w & 0xFFF8) == 0xEAC0 ||
+                   (w & 0xFFF8) == 0xECC0 ||
+                   (w & 0xFFF8) == 0xEEC0) {
+            /* M7.5p — BFCHG / BFCLR / BFSET Dn{off:wid} (68020+).
+             * In-place modify variants that write the field bits back
+             * to Dn:
+             *   BFCHG (sub-op 010, 0xEAC0): Dn = Dn ^ mask
+             *   BFCLR (sub-op 100, 0xECC0): Dn = Dn & ~mask
+             *   BFSET (sub-op 110, 0xEEC0): Dn = Dn | mask
+             * where mask covers the field bits.
+             *
+             * Static off/wid only; Dn-source only; off+wid <= 32 only.
+             * Other cases bridge.
+             *
+             * Flags computed from the ORIGINAL field value (pre-modify),
+             * per the 68020 PRM. N = MSB of original field; Z = (original
+             * field == 0); V = C = 0; X preserved. */
+            u16 ext = mac_read16(cpu->mem, op_pc[i] + 2);
+            bool dyn_off = (ext >> 11) & 1;
+            bool dyn_wid = (ext >> 5) & 1;
+            int off = (ext >> 6) & 0x1F;
+            int wid = ext & 0x1F;
+            if (wid == 0) wid = 32;
+            if (!dyn_off && !dyn_wid && off + wid <= 32) {
+                int reg = w & 7;
+                int sub_op = (w >> 8) & 0xF;  /* 0xA = BFCHG, 0xC = BFCLR, 0xE = BFSET */
+                u32 mask;
+                if (wid == 32) {
+                    mask = 0xFFFFFFFFu;
+                } else {
+                    mask = ((1u << wid) - 1u) << (32 - off - wid);
+                }
+
+                emit_read_g(&e, &rc, G_D(reg), 8);
+                /* Extract original field into a9 for flags (zero-extended). */
+                xt_mov(&e, 9, 8);
+                if (off > 0) xt_slli(&e, 9, 9, off);
+                if (wid < 32) xt_srli(&e, 9, 9, (u8)(32 - wid));
+
+                /* Apply the op. emit_load_imm puts mask in a10 using a11
+                 * as scratch. */
+                emit_load_imm(&e, 10, 11, mask);
+                if (sub_op == 0xA) {           /* BFCHG */
+                    xt_xor(&e, 8, 8, 10);
+                } else if (sub_op == 0xC) {    /* BFCLR */
+                    emit_load_imm(&e, 10, 11, ~mask);
+                    xt_and(&e, 8, 8, 10);
+                } else {                       /* BFSET (sub_op 0xE) */
+                    xt_or(&e, 8, 8, 10);
+                }
+                emit_write_g(&e, &rc, G_D(reg), 8);
+
+                if (!flags_dead[i]) {
+                    /* Shift original field to MSB so emit_logic_flags gives
+                     * the right N. Z is invariant under shift. */
+                    if (wid < 32) xt_slli(&e, 9, 9, (u8)(32 - wid));
+                    emit_logic_flags(&e, 9);
+                }
+                emit_advance(&e, 4, 10);  /* m68k_step base 4 + do_bitfield reg 6 = 10. */
+                inline_ops++; done = true;
+            }
         } else if ((w & 0xFFF8) == 0xEBC0) {
             /* M7.5o — BFEXTS Dn{off:wid}, Dm (68020+). Identical to
              * BFEXTU but sign-extends the field to 32 bits (arithmetic

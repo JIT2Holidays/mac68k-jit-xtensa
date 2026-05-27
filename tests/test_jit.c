@@ -352,6 +352,63 @@ int main(void) {
         rc |= bad;
     }
 
+    /* M7.5p — BFCLR / BFSET / BFCHG Dn{off:wid} native inline arms.
+     * Chain: clear bits 4-11 of D0, then set bits 16-23, then complement
+     * bits 24-31. */
+    {
+        mac_mem mi, mj;
+        mac_mem_init_ex(&mi, MAC_MODEL_SE30, 64 * 1024);
+        mac_mem_init_ex(&mj, MAC_MODEL_SE30, 64 * 1024);
+        u8 prog[16];
+        memset(prog, 0, sizeof prog);
+        m68a aa;
+        m68a_init(&aa, prog, sizeof prog, 0);
+        m68a_w32(&aa, 0x00010000);
+        m68a_w32(&aa, 0x00000100);
+        m68a_finish(&aa);
+        mac_load_ram_image(&mi, 0, prog, 8);
+        mac_load_ram_image(&mj, 0, prog, 8);
+        u16 code[] = {
+            0x203C, 0xFFFF, 0x00FF,          /* MOVE.L #0xFFFF00FF, D0 */
+            0xECC0, (u16)((4 << 6) | 8),     /* BFCLR D0{4:8} — clear bits 4..11 */
+            0xEEC0, (u16)((16 << 6) | 8),    /* BFSET D0{16:8} — set bits 16..23 */
+            0xEAC0, (u16)((0 << 6) | 8),     /* BFCHG D0{0:8} — toggle bits 0..7 */
+            0x4E72, 0x2700,                  /* STOP */
+        };
+        for (size_t i = 0; i < sizeof code / sizeof code[0]; i++) {
+            mac_write16(&mi, 0x100u + (u32)(i * 2), code[i]);
+            mac_write16(&mj, 0x100u + (u32)(i * 2), code[i]);
+        }
+        m68k_cpu ci, cj;
+        m68k_reset(&ci, &mi);
+        m68k_reset(&cj, &mj);
+        m68k_run_until(&ci, 100000);
+        m68k_dispatcher d;
+        m68k_dispatcher_init(&d, &cj);
+        m68k_dispatcher_run_until(&d, 100000);
+        int bad = diff_state("se30-bfclr-set-chg", &ci, &cj);
+        /* Initial D0 = 0xFFFF00FF.
+         * BFCLR D0{4:8} clears bits 4..11 of D0 (off=4 → bit 27..20 from
+         * MSB indexing = bits 27..20 of register). Wait — off is from MSB.
+         * off=4, wid=8 → bits (31-4)..(31-4-8+1) = 27..20 of register.
+         * So mask = 0x0FF00000. After BFCLR: D0 = 0xFFFF00FF & ~0x0FF00000 = 0xF00F00FF.
+         * BFSET D0{16:8}: off=16, wid=8 → bits 15..8. mask = 0x0000FF00.
+         * D0 = 0xF00F00FF | 0x0000FF00 = 0xF00FFFFF.
+         * BFCHG D0{0:8}: off=0, wid=8 → bits 31..24. mask = 0xFF000000.
+         * D0 = 0xF00FFFFF ^ 0xFF000000 = 0x0F0FFFFF. */
+        if (!bad) {
+            if (ci.d[0] != 0x0F0FFFFFu) {
+                printf("  se30-bfclr-set-chg: D0=%08X want 0F0FFFFF\n", ci.d[0]); bad = 1;
+            } else {
+                printf("  se30-bfclr-set-chg: match — D0=0x0F0FFFFF\n");
+            }
+        }
+        m68k_dispatcher_shutdown(&d);
+        mac_mem_free(&mi);
+        mac_mem_free(&mj);
+        rc |= bad;
+    }
+
     /* M7.5n — BFTST Dn{off:wid} native inline arm (flags-only). */
     {
         mac_mem mi, mj;
