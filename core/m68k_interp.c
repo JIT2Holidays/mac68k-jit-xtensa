@@ -1842,12 +1842,16 @@ static void do_pmmu(m68k_cpu *cpu, u16 op, u32 op_pc) {
         cpu->bus_error_pending = 0;
         u32 phys = mac_pmmu_translate(cpu->mem, la, fc, !rw);
         u16 msr = 0;
-        if (cpu->bus_error_pending != 0) msr |= (1u << 11);   /* I */
-        /* The walker doesn't distinguish WP vs S vs invalid in its
-         * BERR token, so we can't separate W/S bits without re-running.
-         * For now report Invalid for any BERR — refinement in a later
-         * milestone. Set Modified if the walk succeeded and the leaf
-         * had M=1 (already set by the walker on write). */
+        if (cpu->bus_error_pending != 0) {
+            u32 cause = cpu->bus_error_pending & BERR_CAUSE_MASK;
+            switch (cause) {
+                case BERR_CAUSE_WP:      msr |= (1u << 12); break;   /* W */
+                case BERR_CAUSE_SUPER:   msr |= (1u << 13); break;   /* S */
+                case BERR_CAUSE_OOR:                                  /* limit-equiv */
+                case BERR_CAUSE_INVALID:
+                default:                 msr |= (1u << 11); break;   /* I */
+            }
+        }
         (void)phys;
         cpu->mmusr = msr;
         cpu->bus_error_pending = saved_berr;   /* PTEST must not raise BERR */

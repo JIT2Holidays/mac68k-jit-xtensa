@@ -729,7 +729,7 @@ u32 mac_pmmu_translate(mac_mem *m, u32 logical_addr, u8 fc, bool is_write) {
     if (dt == 0) {
         /* Invalid root pointer — set bus_error_pending so the next
          * instruction completion raises vector 2. */
-        cpu->bus_error_pending = logical_addr | 0x80000000u;
+        cpu->bus_error_pending = (logical_addr & 0x0FFFFFFFu) | 0x80000000u | BERR_CAUSE_INVALID;
         return logical_addr;
     }
     u32 table_base = (u32)(rp >> 32) & 0xFFFFFFF0u;
@@ -754,7 +754,7 @@ u32 mac_pmmu_translate(mac_mem *m, u32 logical_addr, u8 fc, bool is_write) {
     if (is > 0) {
         u32 is_mask = ~((1u << (32 - is)) - 1u);
         if ((logical_addr & is_mask) != 0) {
-            cpu->bus_error_pending = logical_addr | 0x80000000u;
+            cpu->bus_error_pending = (logical_addr & 0x0FFFFFFFu) | 0x80000000u | BERR_CAUSE_OOR;
             return logical_addr;
         }
     }
@@ -799,7 +799,7 @@ u32 mac_pmmu_translate(mac_mem *m, u32 logical_addr, u8 fc, bool is_write) {
              * subsequent code doesn't trip on an undefined physical
              * address; the exception will redirect cpu->pc on the
              * next m68k_run_until tick. */
-            cpu->bus_error_pending = logical_addr | 0x80000000u;
+            cpu->bus_error_pending = (logical_addr & 0x0FFFFFFFu) | 0x80000000u | BERR_CAUSE_INVALID;
             m->pmmu_in_walk = 0;
             return logical_addr;
         }
@@ -827,13 +827,13 @@ u32 mac_pmmu_translate(mac_mem *m, u32 logical_addr, u8 fc, bool is_write) {
                 bool sup_only = (desc0 & (1u << 14)) != 0;
                 if (is_write && wp) {
                     /* Write to WP page → bus error. */
-                    cpu->bus_error_pending = logical_addr | 0x80000000u;
+                    cpu->bus_error_pending = (logical_addr & 0x0FFFFFFFu) | 0x80000000u | BERR_CAUSE_WP;
                     m->pmmu_in_walk = 0;
                     return logical_addr;
                 }
                 if (sup_only && !is_supervisor) {
                     /* User access to supervisor-only page → bus error. */
-                    cpu->bus_error_pending = logical_addr | 0x80000000u;
+                    cpu->bus_error_pending = (logical_addr & 0x0FFFFFFFu) | 0x80000000u | BERR_CAUSE_SUPER;
                     m->pmmu_in_walk = 0;
                     return logical_addr;
                 }

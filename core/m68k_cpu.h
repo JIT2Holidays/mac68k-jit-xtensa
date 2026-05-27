@@ -90,6 +90,18 @@ typedef struct m68k_cpu {
      * this the ROM cannot detect which chips are present and loops
      * forever waiting on signals from un-modeled hardware. */
     u32 bus_error_pending;
+/* M7.6l — bus_error_pending encoding. Bit 31 is the "pending" flag the
+ * run loop tests. Bits 30-28 are the cause; PTEST decodes these into
+ * MMUSR. Bits 27-0 hold the faulting logical address (low 28 bits, but
+ * in practice we never set BERR with LAs above 0x0FFFFFFF in current
+ * code paths). */
+#define BERR_CAUSE_SHIFT     28
+#define BERR_CAUSE_MASK      (7u << BERR_CAUSE_SHIFT)
+#define BERR_CAUSE_GENERIC   (0u << BERR_CAUSE_SHIFT)
+#define BERR_CAUSE_WP        (1u << BERR_CAUSE_SHIFT)
+#define BERR_CAUSE_SUPER     (2u << BERR_CAUSE_SHIFT)
+#define BERR_CAUSE_INVALID   (3u << BERR_CAUSE_SHIFT)
+#define BERR_CAUSE_OOR       (4u << BERR_CAUSE_SHIFT)
 
     /* Scratch slot used by a JIT block to stash its CALL0 return address
      * without modifying a1 (see jit/dispatcher.c — same trick as gbjit). */
