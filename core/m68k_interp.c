@@ -2023,7 +2023,12 @@ bool m68k_jit_can_inline_020(u16 op) {
      * reset: block at 0x4083F872 (F010 PMOVE + 4EF9 JMP) sends JIT to
      * PC=0 instead of the JMP target. Terminating the block at PMMU
      * costs one dispatcher round-trip but keeps the JIT correct.
-     * TODO: identify the exact bridge issue and re-enable. */
+     *
+     * M7.6am — re-enable attempted, immediately caught by the
+     * diff_jit_se30_reset_lockstep test: even with M7.6ae's BERR
+     * handling, the bug is independent and PMMU inline still
+     * corrupts. The bug remains. Do NOT uncomment without writing a
+     * specific fix that survives the ctest lockstep. */
     /* if ((op & 0xFE00) == 0xF000) return true; */
 
     return false;
