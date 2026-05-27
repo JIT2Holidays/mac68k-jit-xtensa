@@ -584,16 +584,6 @@ u8 mac_read8(mac_mem *m, u32 addr) {
         u32 wrapped = addr % m->ram_size;
         return m->ram[wrapped];
     }
-    /* Slot I/O region (0x50000000+, outside built-in 0x50F00000+):
-     * BERR on data reads too. The ROM probes slot card I/O with
-     * sequences like MOVE.L from slot addr — empty slots BERR. The
-     * handler at 0x40802A00 BSET #24, RTE-s, code continues. Without
-     * BERR, returning 0xFF causes the probe loop in RAM-loaded boot
-     * code to find phantom data. */
-    if (m->model == MAC_MODEL_SE30 && rgn == RGN_NONE
-        && addr >= 0x50000000u && addr < 0x50F00000u && m->cpu) {
-        m->cpu->bus_error_pending = addr | 0x80000000u;
-    }
     switch (rgn) {
         case RGN_VIA:    val = via_read(m, addr);  break;
         case RGN_VIA2:   val = via2_read(m, &m->via2, addr); break;
