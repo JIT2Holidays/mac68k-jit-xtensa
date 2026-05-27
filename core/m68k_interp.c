@@ -1889,6 +1889,11 @@ bool m68k_jit_can_inline_020(u16 op) {
     if ((op & 0xFF20) == 0xF400) return true;            /* CINV  (line F cache) */
     if ((op & 0xFF20) == 0xF420) return true;            /* CPUSH (line F cache) */
 
+    /* M7.5d — bitfield ops via m68k_step bridge. Decoder now correctly
+     * sizes them (M7.5d in m68k_decode_at). All eight variants share
+     * the mask 0xF8C0 == 0xE8C0. */
+    if ((op & 0xF8C0) == 0xE8C0) return true;
+
     return false;
 }
 
@@ -2931,6 +2936,18 @@ m68k_decoded m68k_decode_at(m68k_cpu *cpu, u32 pc) {
             break;
         }
         case 0xE: {
+            /* M7.5d — 68020+ bitfield ops (BFTST/BFEXTU/BFCHG/BFEXTS/BFCLR/
+             * BFFFO/BFSET/BFINS): mask 0xF8C0 == 0xE8C0. 4-byte minimum
+             * (op + 2-byte ext word); the EA contributes its usual bytes
+             * for memory modes. The default szf==3 below would size
+             * these wrong (no ext word counted). */
+            if ((op & 0xF8C0) == 0xE8C0) {
+                d.length += 2;                              /* bitfield ext word */
+                if (mode != 0) {
+                    d.length += ea_ext_bytes(cpu, pc + 2, mode, reg, 4);
+                }
+                break;
+            }
             if (szf == 3) d.length += ea_ext_bytes(cpu, pc, mode, reg, 2);
             break;
         }

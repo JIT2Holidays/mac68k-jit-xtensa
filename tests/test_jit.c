@@ -352,6 +352,65 @@ int main(void) {
         rc |= bad;
     }
 
+    /* M7.5d — bitfield in memory mode (BFEXTU (d16,An){off:wid},Dn) —
+     * validates the decoder fix that adds the d16 displacement bytes
+     * to d.length. Without it, the JIT walker reads the d16 word as
+     * a phantom opcode. */
+    {
+        mac_mem mi, mj;
+        mac_mem_init_ex(&mi, MAC_MODEL_SE30, 64 * 1024);
+        mac_mem_init_ex(&mj, MAC_MODEL_SE30, 64 * 1024);
+        u8 prog[64];
+        memset(prog, 0, sizeof prog);
+        m68a aa;
+        m68a_init(&aa, prog, sizeof prog, 0);
+        m68a_w32(&aa, 0x00010000);
+        m68a_w32(&aa, 0x00000100);
+        m68a_finish(&aa);
+        mac_load_ram_image(&mi, 0, prog, 8);
+        mac_load_ram_image(&mj, 0, prog, 8);
+        /* Put 0xABCD1234 at address 0x1000. Code:
+         *   MOVEA.L #0x1000, A0
+         *   BFEXTU (8,A0){0:8}, D1     ; D1 = byte at A0+8 -> garbage
+         *   STOP.
+         * Simpler: BFEXTU (A0){4:8}, D1 — mode 2 (no d16). Actually the
+         * "memory" test we want is mode 5 with d16, which forces the
+         * decoder to size as 6 bytes. */
+        mac_write32(&mi, 0x1008, 0xABCD1234u);
+        mac_write32(&mj, 0x1008, 0xABCD1234u);
+        u16 code[] = {
+            0x207C, 0x0000, 0x1000,                  /* MOVEA.L #0x1000, A0 */
+            0xE9E8,                                  /* BFEXTU (d16,A0){...},D1; ext at next word */
+            (u16)((1 << 12) | (4 << 6) | 8),         /* ext: dst=D1, off=4, wid=8 */
+            0x0008,                                  /* d16 = 8 */
+            0x4E72, 0x2700,                          /* STOP */
+        };
+        for (size_t i = 0; i < sizeof code / sizeof code[0]; i++) {
+            mac_write16(&mi, 0x100u + (u32)(i * 2), code[i]);
+            mac_write16(&mj, 0x100u + (u32)(i * 2), code[i]);
+        }
+        m68k_cpu ci, cj;
+        m68k_reset(&ci, &mi);
+        m68k_reset(&cj, &mj);
+        m68k_run_until(&ci, 100000);
+        m68k_dispatcher d;
+        m68k_dispatcher_init(&d, &cj);
+        m68k_dispatcher_run_until(&d, 100000);
+        int bad = diff_state("se30-bfextu-mem", &ci, &cj);
+        if (!bad) {
+            /* (0xABCD1234 starting at bit-offset 4 from MSB, width 8) = 0xBC. */
+            if (ci.d[1] != 0xBC) {
+                printf("  se30-bfextu-mem: D1=%08X want 000000BC\n", ci.d[1]); bad = 1;
+            } else {
+                printf("  se30-bfextu-mem: match — D1=0xBC (mem BFEXTU)\n");
+            }
+        }
+        m68k_dispatcher_shutdown(&d);
+        mac_mem_free(&mi);
+        mac_mem_free(&mj);
+        rc |= bad;
+    }
+
     /* SE/30 hybrid termination: a block that mixes 68000 ops with a
      * 68020 BFEXTU. The JIT block walker should stop just before BFEXTU
      * and the interpreter should pick up there. End state must match
