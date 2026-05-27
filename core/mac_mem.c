@@ -446,10 +446,18 @@ static void scsi_write(mac_mem *m, u32 addr, u8 v) {
  * Same register-select scheme as VIA1: address bits 9..12 pick the
  * register. */
 static u8 via2_read(mac_mem *m, via6522 *v, u32 addr) {
-    (void)m;
     u8 r = (u8)((addr >> 9) & 0x0Fu);
     switch (r) {
-        case 0:  return v->orb;
+        case 0:
+            /* M7.6bt — SE/30 VIA2 ORB read: input bits (DDRB=0) read
+             * the live wire OR'd with FloatVal=0xFF (per minivmac
+             * VIA2_ORB_CanIn=0x00, FloatVal=0xFF). Without this, the
+             * boot's BTST #3, (VIA2_ORB) at 0x4083F786 reads 0 instead
+             * of 1, diverging from vmac at n=8530. */
+            if (m && m->model == MAC_MODEL_SE30) {
+                return (u8)((v->orb & v->ddrb) | (0xFFu & ~v->ddrb));
+            }
+            return v->orb;
         case 1: case 15: return v->ora;
         case 2:  return v->ddrb;
         case 3:  return v->ddra;
