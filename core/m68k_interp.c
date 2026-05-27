@@ -66,6 +66,15 @@ void m68k_reset(m68k_cpu *cpu, struct mac_mem *mem) {
          * convention or if this is meant to be set by a sense-line. */
         if (mem->model == MAC_MODEL_SE30) {
             cpu->usp = 0x00010000u;
+            /* M7.6x — canonical "MMU disabled" SRP/CRP per minivmac's
+             * Mac IIx reference (third_party/minivmac MINEM68K.c
+             * DoCodeMMU): PMOVE SRP/CRP, (A0) emits 0x7FFF0001 then
+             * 0x00000000 — LIMIT=0x7FFF (max), DT=1 invalid table.
+             * The boot ROM stores SRP/CRP to memory during init and
+             * compares to this canonical pattern; returning zeros
+             * confused some of the hardware-detect paths. */
+            cpu->srp = ((u64)0x7FFF0001u << 32);
+            cpu->crp = cpu->srp;
         }
     }
     cpu->halted = M68K_RUN;
