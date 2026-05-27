@@ -112,10 +112,14 @@ int main(int argc, char **argv) {
     u64 max_cycles = (argc > 1) ? strtoull(argv[1], NULL, 0) : 200000000ull;
 
     mac_mem mem;
-    /* Default 128 MB so the ROM's RAM-probe loop terminates cleanly.
-     * SE30_RAM_MB env overrides — useful for generating smaller
-     * snapshots for ctest. */
-    u32 ram_mb = 128;
+    /* Default 8 MB to match minivmac IIx setup. The ROM's RAM-probe
+     * loop at 0x408035A4-DC writes MOVE.L D2, (A1) to high addresses
+     * and TST.L (A4) at A4=0 to check for alias. With 128MB RAM the
+     * write to A1=0x02000000 doesn't alias to RAM[0], causing the
+     * boot to take a different path than vmac (which has 8MB and
+     * does alias). 8MB makes our boot match vmac's lockstep through
+     * 2.67M instructions. SE30_RAM_MB env overrides. */
+    u32 ram_mb = 8;
     const char *rm = getenv("SE30_RAM_MB");
     if (rm) { unsigned long v = strtoul(rm, NULL, 0); if (v) ram_mb = (u32)v; }
     mac_mem_init_ex(&mem, MAC_MODEL_SE30, ram_mb * 1024u * 1024u);
@@ -271,6 +275,26 @@ int main(int argc, char **argv) {
                     cpu.a[0], cpu.a[1], cpu.a[2], cpu.a[3],
                     cpu.a[4], cpu.a[5], cpu.a[6], cpu.a[7], cpu.sr);
                 m68k_step(&cpu);
+                /* SE30_RAM0_AT=<idx>: when reaching this instr index in
+                 * dump mode, print RAM[0..0x20] and overlay state. */
+                {
+                    static u32 step_n = 0;
+                    static u32 dump_at_n = 0;
+                    static int dump_at_inited = 0;
+                    if (!dump_at_inited) {
+                        const char *r0 = getenv("SE30_RAM0_AT");
+                        if (r0) dump_at_n = (u32)strtoul(r0, NULL, 0);
+                        dump_at_inited = 1;
+                    }
+                    step_n++;
+                    if (dump_at_n && step_n == dump_at_n) {
+                        fprintf(stderr, "[ram0 @ step=%u] overlay=%d ram[0..0x10]:",
+                                step_n, mem.overlay);
+                        for (int k = 0; k < 0x10; k++)
+                            fprintf(stderr, " %02X", mem.ram[k]);
+                        fprintf(stderr, "\n");
+                    }
+                }
             }
             dump_n = 0;
             continue;
