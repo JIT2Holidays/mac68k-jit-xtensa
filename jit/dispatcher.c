@@ -497,14 +497,28 @@ static u8 *sim_translate(xt_sim *s, u32 addr) {
         return c->stack_buf + (addr - HOST_STACK_BASE);
     if (c->cpu && c->cpu->mem && c->cpu->mem->ram) {
         u32 guest = addr - HOST_RAM_BASE;
-        /* Mac Plus alias: RAM mirrors fill 0..0x3FFFFF when ram_size <
-         * 0x400000. Match mac_read16's `addr & (ram_size-1)` handling. */
-        if (guest < 0x400000u && (guest & (c->cpu->mem->ram_size - 1u)) < c->cpu->mem->ram_size)
-            return c->cpu->mem->ram + (guest & (c->cpu->mem->ram_size - 1u));
-        /* ROM at guest 0x400000-0x41FFFF (aliased to HOST_RAM_BASE+0x400000). */
-        if (c->cpu->mem->rom && guest >= 0x400000u &&
-            guest < 0x400000u + c->cpu->mem->rom_size)
-            return c->cpu->mem->rom + (guest - 0x400000u);
+        /* M6.270 — model-aware memory map. For SE/30, RAM extends to
+         * its ram_size (up to 128MB) at low addresses; ROM is at
+         * 0x40800000-0x4083FFFF (32-bit address). For Plus, RAM
+         * mirrors fill 0..0x3FFFFF when ram_size < 0x400000 and
+         * ROM aliases at 0x400000. */
+        if (c->cpu->mem->model == MAC_MODEL_SE30) {
+            if (guest < c->cpu->mem->ram_size)
+                return c->cpu->mem->ram + guest;
+            /* SE/30 ROM lives at 0x40800000-0x4083FFFF in guest space. */
+            if (c->cpu->mem->rom && guest >= 0x40800000u &&
+                guest < 0x40800000u + c->cpu->mem->rom_size)
+                return c->cpu->mem->rom + (guest - 0x40800000u);
+        } else {
+            /* Mac Plus alias: RAM mirrors fill 0..0x3FFFFF when ram_size <
+             * 0x400000. Match mac_read16's `addr & (ram_size-1)` handling. */
+            if (guest < 0x400000u && (guest & (c->cpu->mem->ram_size - 1u)) < c->cpu->mem->ram_size)
+                return c->cpu->mem->ram + (guest & (c->cpu->mem->ram_size - 1u));
+            /* ROM at guest 0x400000-0x41FFFF (aliased to HOST_RAM_BASE+0x400000). */
+            if (c->cpu->mem->rom && guest >= 0x400000u &&
+                guest < 0x400000u + c->cpu->mem->rom_size)
+                return c->cpu->mem->rom + (guest - 0x400000u);
+        }
     }
     if (addr < c->block->code_size)
         return c->block->code + addr;
