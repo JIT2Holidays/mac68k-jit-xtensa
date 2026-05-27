@@ -72,10 +72,11 @@ void mac_mem_init_ex(mac_mem *m, mac_machine_t model, u32 ram_size) {
          * vmac's VIA2_ORA defaults to 0 (latched), so bits 6-7 = 00 →
          * table idx 0 → A2 = 0x0100FFFF (16MB max). Init to 0 to match. */
         m->via2.ora = 0x00;
-        /* VIA2 ORB: vmac defaults all wires to 0. Bit 3 (PB3) is the
-         * Addr32 toggle — 0 = 24-bit mode (default), 1 = 32-bit mode.
-         * Bit 2 = power-off signal. Init to 0 to match vmac, so boot
-         * starts in 24-bit mode. */
+        /* VIA2 ORB: vmac's VIA2_Reset clears ORB to 0; the OUTPUT bits
+         * are 0. But the INPUT bits read from Wires (initialized to 1
+         * in AddrSpac_Init, GLOBGLUE.c:1668), and our via2_read
+         * compose-on-read uses FloatVal=0xFF for DDRB=0 bits so input
+         * bits read HIGH. So ORB=0x00 matches vmac. */
         m->via2.orb = 0x00;
         /* Power-on: VIA1 IFR bit 5 (T2) is undefined on real hardware,
          * but the Mac SE/30 ROM expects it to be SET early in boot —
@@ -459,7 +460,16 @@ static u8 via2_read(mac_mem *m, via6522 *v, u32 addr) {
                 return (u8)((v->orb & v->ddrb) | (0xFFu & ~v->ddrb));
             }
             return v->orb;
-        case 1: case 15: return v->ora;
+        case 1: case 15:
+            /* M7.6bx — VIA2 ORA read: per vmac VIA2_ORA_FloatVal=0xFF
+             * (and Wires init to 1), input bits read HIGH. Without
+             * this, our RAM-detect loop at 0x408035BE-CC stops after
+             * one iteration since byte read=0x00 doesn't progress
+             * through the size-code table at 0x4080366A. */
+            if (m && m->model == MAC_MODEL_SE30) {
+                return (u8)((v->ora & v->ddra) | (0xFFu & ~v->ddra));
+            }
+            return v->ora;
         case 2:  return v->ddrb;
         case 3:  return v->ddra;
         case 4:  return (u8)(v->t1c & 0xFF);
@@ -478,10 +488,19 @@ static u8 via2_read(mac_mem *m, via6522 *v, u32 addr) {
 }
 
 static void via2_write(mac_mem *m, via6522 *v, u32 addr, u8 val) {
-    (void)m;
     u8 r = (u8)((addr >> 9) & 0x0Fu);
     switch (r) {
-        case 0:  v->orb = val; break;
+        case 0:
+            if (getenv("SE30_ADDR32_DBG") && m && m->cpu &&
+                ((v->orb & 0x08u) != (val & 0x08u))) {
+                fprintf(stderr, "[Addr32] PB3 change %d->%d cyc=%llu pc=%08X\n",
+                        (v->orb & 0x08u) ? 1 : 0,
+                        (val & 0x08u) ? 1 : 0,
+                        (unsigned long long)m->cpu->cycles,
+                        m->cpu->pc);
+            }
+            v->orb = val;
+            break;
         case 1: case 15: v->ora = val; break;
         case 2:  v->ddrb = val; break;
         case 3:  v->ddra = val; break;
