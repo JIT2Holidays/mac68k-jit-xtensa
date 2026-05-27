@@ -81,6 +81,11 @@ m68k_decoded m68k_decode_at(m68k_cpu *cpu, u32 pc);
  * the 020+ op. */
 bool is_68020_only(u16 op);
 
+/* True for the subset of 020+ opcodes the JIT has inline arms for —
+ * block walker keeps these in the block instead of terminating. Grows
+ * over M7.5 milestones as inline arms are added. */
+bool m68k_jit_can_inline_020(u16 op);
+
 /* CPU exception ring log {vector, faulting pc, cycle} and a debug hook
  * invoked on every line-A (Toolbox) trap. */
 extern u32 m68k_exc_log[64][3];

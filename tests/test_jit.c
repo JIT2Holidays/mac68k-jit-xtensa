@@ -158,6 +158,54 @@ int main(void) {
     mac_mem_free(&tmp);
     rc |= run_both("demo", demo, dlen, 50000000ull);
 
+    /* M7.5a — EXTB.L JIT inline arm. Under SE/30 mode the block walker
+     * keeps EXTB.L in the block (m68k_jit_can_inline_020 returns true)
+     * and the JIT emits a 2-op slli/srai sequence. Validate against
+     * the interpreter on three sign cases. */
+    {
+        mac_mem mi, mj;
+        mac_mem_init_ex(&mi, MAC_MODEL_SE30, 64 * 1024);
+        mac_mem_init_ex(&mj, MAC_MODEL_SE30, 64 * 1024);
+        u8 prog[32];
+        memset(prog, 0, sizeof prog);
+        m68a a;
+        m68a_init(&a, prog, sizeof prog, 0);
+        m68a_w32(&a, 0x00010000);          /* SSP */
+        m68a_w32(&a, 0x00000100);          /* PC  */
+        m68a_finish(&a);
+        mac_load_ram_image(&mi, 0, prog, 8);
+        mac_load_ram_image(&mj, 0, prog, 8);
+        /* MOVE.L #0x12345680,D0 ; EXTB.L D0 ; STOP. */
+        u16 code[] = {
+            0x203C, 0x1234, 0x5680,          /* MOVE.L #...,D0 */
+            0x49C0,                          /* EXTB.L D0 */
+            0x4E72, 0x2700,                  /* STOP #$2700 */
+        };
+        for (size_t i = 0; i < sizeof code / sizeof code[0]; i++) {
+            mac_write16(&mi, 0x100u + (u32)(i * 2), code[i]);
+            mac_write16(&mj, 0x100u + (u32)(i * 2), code[i]);
+        }
+        m68k_cpu ci, cj;
+        m68k_reset(&ci, &mi);
+        m68k_reset(&cj, &mj);
+        m68k_run_until(&ci, 100000);
+        m68k_dispatcher d;
+        m68k_dispatcher_init(&d, &cj);
+        m68k_dispatcher_run_until(&d, 100000);
+        int bad = diff_state("se30-extbl", &ci, &cj);
+        if (!bad) {
+            if (ci.d[0] != 0xFFFFFF80) {
+                printf("  se30-extbl: D0=%08X want FFFFFF80\n", ci.d[0]); bad = 1;
+            } else {
+                printf("  se30-extbl: match — D0=0xFFFFFF80 (sign-extended)\n");
+            }
+        }
+        m68k_dispatcher_shutdown(&d);
+        mac_mem_free(&mi);
+        mac_mem_free(&mj);
+        rc |= bad;
+    }
+
     /* SE/30 hybrid termination: a block that mixes 68000 ops with a
      * 68020 BFEXTU. The JIT block walker should stop just before BFEXTU
      * and the interpreter should pick up there. End state must match

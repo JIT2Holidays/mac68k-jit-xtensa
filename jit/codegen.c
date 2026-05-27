@@ -1819,7 +1819,8 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
          * (Plus code never emits 020+) so existing JIT behavior is
          * bit-for-bit identical. */
         if (cpu->mem && cpu->mem->model == MAC_MODEL_SE30
-            && is_68020_only(d.opcode)) {
+            && is_68020_only(d.opcode)
+            && !m68k_jit_can_inline_020(d.opcode)) {
             break;
         }
         op_word[n_ops] = d.opcode;
@@ -9699,6 +9700,32 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             u8 dst_reg = (dn_xt >= 0) ? (u8)dn_xt : 8;
             xt_slli(&e, dst_reg, src_reg, 16);          /* .W at bit 31 */
             xt_srai(&e, dst_reg, dst_reg, 16);          /* arith shift back */
+            if (dn_xt >= 0) {
+                for (int s = 0; s < rc.active; s++)
+                    if (rc.guest[s] == (u8)G_D(dn)) { rc.dirty |= (u16)(1u << s); break; }
+            } else {
+                emit_write_g(&e, &rc, G_D(dn), 8);
+            }
+            if (!flags_dead[i]) emit_logic_flags(&e, dst_reg);
+            emit_advance(&e, 2, 4);
+            inline_ops++; done = true;
+        } else if ((w & 0xFFF8) == 0x49C0) {
+            /* M7.5a — EXTB.L Dn (68020+) — sign-extend Dn[7:0] to
+             * Dn[31:0]. Bit 7 of the low byte propagates into bits 8-31.
+             *
+             * Implementation mirrors EXT.L but with shift count 24
+             * instead of 16. Two ops total, replaces the full 32-bit
+             * Dn. Flags MOVE-family: N=bit31, Z=(result==0), V=C=0,
+             * X preserved. Length 2, 4 cycles. First 030-only inline
+             * arm — active only under MAC_MODEL_SE30 (block walker
+             * keeps it in the block via m68k_jit_can_inline_020). */
+            int dn = w & 7;
+            int dn_xt = cache_lookup(&rc, G_D(dn));
+            u8 src_reg = (dn_xt >= 0) ? (u8)dn_xt : 8;
+            if (dn_xt < 0) emit_read_g(&e, &rc, G_D(dn), 8);
+            u8 dst_reg = (dn_xt >= 0) ? (u8)dn_xt : 8;
+            xt_slli(&e, dst_reg, src_reg, 24);          /* .B at bit 31 */
+            xt_srai(&e, dst_reg, dst_reg, 24);          /* arith shift back */
             if (dn_xt >= 0) {
                 for (int s = 0; s < rc.active; s++)
                     if (rc.guest[s] == (u8)G_D(dn)) { rc.dirty |= (u16)(1u << s); break; }

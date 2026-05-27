@@ -1874,6 +1874,12 @@ bool is_68020_only(u16 op) {
     return false;
 }
 
+bool m68k_jit_can_inline_020(u16 op) {
+    /* M7.5a — EXTB.L Dn: 0100 1001 1100 0nnn (0x49C0-0x49C7). */
+    if ((op & 0xFFF8) == 0x49C0) return true;
+    return false;
+}
+
 void m68k_step(m68k_cpu *cpu) {
     /* Once the CPU has halted (e.g. the guest wrote the debug exit port),
      * further steps are no-ops. This keeps a JIT block — which may contain
