@@ -1912,6 +1912,11 @@ bool m68k_jit_can_inline_020(u16 op) {
     if ((op & 0xF1F0) == 0x8140) return true;   /* PACK */
     if ((op & 0xF1F0) == 0xC180) return true;   /* UNPK */
 
+    /* M7.5g — PMMU coprocessor (line F, cp-id 0): PMOVE/PFLUSH/PLOAD/
+     * PTEST. The interpreter does register-stub only (TODO(pmmu)) but
+     * keeping in block avoids dispatcher round-trips. */
+    if ((op & 0xFE00) == 0xF000) return true;
+
     return false;
 }
 
@@ -3020,9 +3025,28 @@ m68k_decoded m68k_decode_at(m68k_cpu *cpu, u32 pc) {
             if (szf == 3) d.length += ea_ext_bytes(cpu, pc, mode, reg, 2);
             break;
         }
-        /* line-A (Toolbox trap) and line-F take an exception — control
-         * leaves the block, so they terminate it. */
-        case 0xA: case 0xF:
+        /* line-A (Toolbox trap) — exception, ends block. */
+        case 0xA:
+            d.ends_block = true;
+            break;
+        /* line-F — usually trap (ends block), but 68020+ PMMU (cp-id 0)
+         * and CINV/CPUSH cache control are NOT traps and shouldn't end
+         * the block. M7.5g — let the JIT keep them in-block under SE/30
+         * mode. */
+        case 0xF:
+            if ((op & 0xFF20) == 0xF400 || (op & 0xFF20) == 0xF420) {
+                /* CINV / CPUSH — 2 bytes, no operand. */
+                break;
+            }
+            if ((op & 0xFE00) == 0xF000) {
+                /* PMMU (cp-id 0): 4 bytes (op + ext) plus EA bytes for
+                 * memory-mode PMOVE. */
+                d.length += 2;
+                if (mode != 0 && mode != 1) {
+                    d.length += ea_ext_bytes(cpu, pc + 2, mode, reg, 4);
+                }
+                break;
+            }
             d.ends_block = true;
             break;
         default: break;
