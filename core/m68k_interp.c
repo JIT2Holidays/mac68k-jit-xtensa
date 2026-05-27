@@ -2015,8 +2015,16 @@ bool m68k_jit_can_inline_020(u16 op) {
 
     /* M7.5g — PMMU coprocessor (line F, cp-id 0): PMOVE/PFLUSH/PLOAD/
      * PTEST. The interpreter does register-stub only (TODO(pmmu)) but
-     * keeping in block avoids dispatcher round-trips. */
-    if ((op & 0xFE00) == 0xF000) return true;
+     * keeping in block avoids dispatcher round-trips.
+     *
+     * M7.6ad — DISABLED. The helper-step bridge for PMMU corrupts the
+     * register file in a way that causes the next op in the block to
+     * read garbage targets — observed via diff-jit-trace on SE/30
+     * reset: block at 0x4083F872 (F010 PMOVE + 4EF9 JMP) sends JIT to
+     * PC=0 instead of the JMP target. Terminating the block at PMMU
+     * costs one dispatcher round-trip but keeps the JIT correct.
+     * TODO: identify the exact bridge issue and re-enable. */
+    /* if ((op & 0xFE00) == 0xF000) return true; */
 
     return false;
 }
