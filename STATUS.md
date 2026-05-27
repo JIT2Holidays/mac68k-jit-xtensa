@@ -5,6 +5,71 @@
 > across the 68000 ISA, plus the trajectory-safety-aware shopping list
 > for further inline arms.
 
+## M7 arc — 68030 / Macintosh SE/30 milestone log
+
+The M7 arc adds 68030 + Macintosh SE/30 emulation alongside the existing
+Plus path. Boot-to-Finder is the ultimate target, but it's a long
+multi-session effort — many milestones land foundations that subsequent
+milestones build on.
+
+| Milestone | Summary | Plus reg. |
+|-----------|---------|-----------|
+| **M7.0**  | 030/SE-30 foundation: ISA, machine model, 32-bit bus, JIT hybrid | 8/8 |
+| **M7.1**  | SE/30 ROM acquisition (Mac IIx ROM 256 KB); RESET no-op; boot through POST | 8/8 |
+| **M7.3a** | tools/se30_trace.c — boot tracer w/ PC histogram, MMIO log, exception ring | 8/8 |
+| **M7.3b** | MMIO access log extension (16384 buckets, top-60 display) | 8/8 |
+| **M7.3c** | Unmapped reads return 0xFF (open-bus) under SE/30 | 8/8 |
+| **M7.3d** | SCC base address fix (0x50F04000, was wrong Mac-IIx 0x50F0C000) | 8/8 |
+| **M7.3e** | Bus error generation (vector 2) for SE/30 unmapped accesses | 8/8 |
+| **M7.3f** | se30_trace: SCC byte injection + ROM patch experiments | 8/8 |
+| **M7.3g** | SCC RR1 returns "All Sent" bit for SE/30 idle | 8/8 |
+| **M7.3h** | SE/30 power-on USP bit 16 + VIA1 T2 IFR pre-set (speculative) | 8/8 |
+| **M7.5a** | JIT native inline arm: EXTB.L | 8/8 |
+| **M7.5b** | m68k_decode_at fixes: RTD ends_block, LINK.L 6 bytes, EXTB.L explicit 2 | 8/8 |
+| **M7.5c** | JIT block-keepables: MOVEC, LINK.L, CINV/CPUSH via m68k_step bridge | 8/8 |
+| **M7.5d** | Decoder fix for bitfield ops (4 + EA bytes); all 8 variants in block | 8/8 |
+| **M7.5e** | Decoder fix for MULU.L/DIVU.L (4 + EA bytes); in block | 8/8 |
+| **M7.5f** | Decoder fix for line-0 020+ ops + TRAPcc + PACK/UNPK; UNPK mask bug fix | 8/8 |
+| **M7.5g** | Decoder fix for PMMU + CINV/CPUSH not ending block; in block | 8/8 |
+| **M7.5h** | JIT native inline arm: CINV/CPUSH | 8/8 |
+| **M7.5i** | JIT native inline arm: MOVEC ctl<->Rn (11 control regs) | 8/8 |
+| **M7.5j** | JIT native inline arm: LINK.L An,#d32 | 8/8 |
+| **M7.5k** | RTD #d16 in JIT block via bridge (as last op) | 8/8 |
+| **M7.5l** | JIT native inline arm: TRAPF (cc=F variants) | 8/8 |
+
+**Current state:**
+* **Interpreter**: All 68020/030 integer ISA implemented (M7.0). Boots
+  SE/30 ROM through 200M+ instructions but stalls in a diagnostic-mode
+  SCC poll loop at PC=0x40802EE4. Diagnostic findings indicate the ROM
+  expects either serial input or a multi-iteration T2-timer wait loop
+  with bit 16 of D7 staying set across iterations — neither is provided
+  by our minimal stubs.
+* **JIT**: Hybrid termination (M7.0) lets the JIT compile 68000 code
+  unchanged under SE/30. Every 020+ op now has correct m68k_decode_at
+  sizing AND is in m68k_jit_can_inline_020, so blocks no longer
+  terminate at 020+ boundaries. 5 native inline arms implemented
+  (EXTB.L, CINV/CPUSH, MOVEC, LINK.L, TRAPF); 9+ ops go through the
+  default m68k_step bridge.
+* **Tests**: 8/8 ctest cases green throughout (zero Plus regression
+  across all 22 commits in the M7 arc). JIT differential test now has
+  13 lockstep cases (4 Plus + 9 SE/30: extbl, movec, linkl, rtd,
+  cinv-cpush, pack-trapf, muldiv-l, bfextu-mem, hybrid).
+
+**Out of scope — still pending:**
+* **M7.2** — vMac SE/30 lock-step harness (needs minivmac SE-30 variant
+  build). Deferred.
+* **M7.3 (boot completion)** — Reach the floppy-question-mark / boot
+  icon. Blocked on hardware modeling: VIA timer + IRQ delivery, full
+  ASC FIFO, ADB protocol. Requires multi-session work.
+* **M7.4** — System 7.0 from InfiniteHD. Blocked on M7.3.
+* **M7.5 (native inline arms continuation)** — Bitfield × 8, long
+  MUL/DIV × 4, MOVES, TRAPcc cc!=F, CHK2/CMP2, CAS, CAS2, PACK, UNPK,
+  PMMU. All currently bridged via m68k_step.
+* **M7.6** — Full PMMU page-table walking (for 32-bit Mode / VM under
+  System 7.5+). Register stubs in M7.0 sufficient for 24-bit boot.
+
+---
+
 ## M7.0 — 68030 / Macintosh SE/30 foundation 🎯
 
 Ground-floor milestone toward booting a Mac SE/30 with System 7.0. No
