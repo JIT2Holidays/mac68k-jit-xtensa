@@ -224,7 +224,10 @@ static u8 via_read_pb(mac_mem *m) {
 
 static u8 via_read_pa(mac_mem *m) {
     via6522 *v = &m->via;
-    u8 in = 0x80;                              /* PA7 SCC WReq idle high */
+    /* PA7 = SCC WReq idle high. SE/30 boot at 0x40802A8E tests bit 1
+     * of VIA1 ORA — vmac trace shows BNE taken (bit 1 = 1), making
+     * boot skip a BSET-rewrite loop. Add PA1 high to match. */
+    u8 in = (m->model == MAC_MODEL_SE30) ? 0x82u : 0x80u;
     return (u8)((v->ora & v->ddra) | (in & ~v->ddra));
 }
 
