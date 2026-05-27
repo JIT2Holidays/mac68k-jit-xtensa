@@ -568,12 +568,10 @@ u8 mac_read8(mac_mem *m, u32 addr) {
     u8 val = (m->model == MAC_MODEL_SE30) ? 0xFFu : 0u;
     int rgn = (m->model == MAC_MODEL_SE30) ? region_of_se30(addr)
                                            : region_of(addr);
-    /* SE/30 BERR: unmapped reads (no region) raise a bus error after
-     * the current instruction. The ROM uses BERR as a hardware-probe
-     * recovery mechanism — see m68k_cpu.bus_error_pending. */
-    if (m->model == MAC_MODEL_SE30 && rgn == RGN_NONE && m->cpu) {
-        m->cpu->bus_error_pending = addr | 0x80000000u;
-    }
+    /* SE/30 open-bus reads: return 0xFF (matches minivmac Glue-chip
+     * behavior). The ROM's slot/peripheral probes use magic-value
+     * compares (e.g., CMP.L #$AAAA5555) and BNE branches to detect
+     * "no card" — they do NOT rely on BERR for the empty-slot case. */
     switch (rgn) {
         case RGN_VIA:    val = via_read(m, addr);  break;
         case RGN_VIA2:   val = via2_read(m, &m->via2, addr); break;
