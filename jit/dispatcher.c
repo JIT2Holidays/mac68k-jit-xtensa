@@ -743,16 +743,15 @@ void m68k_dispatcher_run_until(m68k_dispatcher *d, u64 until) {
          * (slot card area). JIT compiles such blocks via mac_read16
          * which returns 0xFF (no BERR), then runs them as line F
          * traps — diverging from interp. Match interp's semantics by
-         * raising BERR before dispatch when PC is in that range. */
+         * setting bus_error_pending here so the post-block check at
+         * line ~860 fires BERR. JIT will compile/execute the block
+         * (treating 0xFFFF as line F), and the line F exception
+         * pushes its own Format-0 frame before BERR — matching the
+         * sequence interp's m68k_step + run-loop pending-check does. */
         if (cpu->mem && cpu->mem->model == MAC_MODEL_SE30
             && pc >= 0x40000000u
             && (pc < 0x40800000u || pc >= 0x40840000u)) {
             cpu->bus_error_pending = pc | 0x80000000u;
-            cpu->fault_addr = cpu->bus_error_pending & 0x0FFFFFFFu;
-            cpu->bus_error_pending = 0;
-            m68k_exception(cpu, 2);
-            prev = NULL;
-            continue;
         }
         m68k_block *b;
         bool chain_hit = false;
