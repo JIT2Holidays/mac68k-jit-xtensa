@@ -1036,7 +1036,13 @@ void mac_mem_tick(mac_mem *m, u64 cycles) {
      * progresses (just with shifted instruction counts vs vmac). */
     if (m->model == MAC_MODEL_SE30) {
         u8 old_ifr = v->ifr;
-        v->ifr |= VIA_IRQ_T2 | VIA_IRQ_T1;
+        /* M6.263 — env gate: SE30_NO_FORCE_T2 leaves T2 IFR alone, only
+         * force T1 (60Hz heartbeat). Tests if removing T2 force fixes
+         * IRQ-wait timing without breaking the early self-test. */
+        if (getenv("SE30_NO_FORCE_T2"))
+            v->ifr |= VIA_IRQ_T1;
+        else
+            v->ifr |= VIA_IRQ_T2 | VIA_IRQ_T1;
         if (v->ifr != old_ifr) irq_changed = true;
     }
 

@@ -285,18 +285,32 @@ int main(int argc, char **argv) {
                 {
                     static u32 tick_step_n = 0;
                     static u32 tick_every = 0;
-                    static u32 tick_at = 0;
+                    static u32 tick_ats[8] = {0};
+                    static u32 n_tick_ats = 0;
                     static int tick_inited = 0;
                     if (!tick_inited) {
                         const char *te = getenv("SE30_DUMP_TICK_EVERY");
                         const char *ta = getenv("SE30_DUMP_TICK_AT");
                         if (te) tick_every = (u32)strtoul(te, NULL, 0);
-                        if (ta) tick_at = (u32)strtoul(ta, NULL, 0);
+                        if (ta) {
+                            char buf[256]; strncpy(buf, ta, sizeof(buf)-1);
+                            buf[sizeof(buf)-1] = 0;
+                            char *p = buf, *tok;
+                            while ((tok = strsep(&p, ",")) && n_tick_ats < 8) {
+                                u32 v = (u32)strtoul(tok, NULL, 0);
+                                if (v) tick_ats[n_tick_ats++] = v;
+                            }
+                        }
                         tick_inited = 1;
                     }
                     tick_step_n++;
-                    if ((tick_every && (tick_step_n % tick_every) == 0) ||
-                        (tick_at && tick_step_n == tick_at)) {
+                    bool fire = (tick_every && (tick_step_n % tick_every) == 0);
+                    if (!fire) {
+                        for (u32 i = 0; i < n_tick_ats; i++) {
+                            if (tick_step_n == tick_ats[i]) { fire = true; break; }
+                        }
+                    }
+                    if (fire) {
                         mac_mem_tick(&mem, cpu.cycles);
                         m68k_poll_interrupts(&cpu);
                     }
