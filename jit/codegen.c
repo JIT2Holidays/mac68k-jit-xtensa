@@ -11626,6 +11626,39 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + joo_pos + 2] = (u8)(jw_oo >> 16);
 
             inline_ops++; done = true;
+        } else if ((w & 0xFFF8) == 0xE8C0) {
+            /* M7.5n — BFTST Dn{off:wid} (68020+). Flags-only bitfield op
+             * — no result write. Same shape as BFEXTU but with op_sel=000.
+             * Static offset/width with Dn source only; others bridge. */
+            u16 ext = mac_read16(cpu->mem, op_pc[i] + 2);
+            bool dyn_off = (ext >> 11) & 1;
+            bool dyn_wid = (ext >> 5) & 1;
+            if (!dyn_off && !dyn_wid) {
+                int src_dn = w & 7;
+                int off = (ext >> 6) & 0x1F;
+                int wid = ext & 0x1F;
+                if (wid == 0) wid = 32;
+
+                if (!flags_dead[i]) {
+                    emit_read_g(&e, &rc, G_D(src_dn), 8);
+                    /* Shift the field to MSB position so emit_logic_flags'
+                     * bit-31 test = N (bit wid-1 of field) and Z = (field==0). */
+                    if (off > 0)            xt_slli(&e, 8, 8, off);
+                    /* Mask off any bits below the field: shift right then
+                     * left would zero them; but for BFTST we only need
+                     * the N (top bit) and Z (any bit set in field). The
+                     * left-shift already puts field at MSB. If off > 0
+                     * the bits BELOW the field are also in there. We need
+                     * to clear them so Z is correct. */
+                    if (wid < 32) {
+                        xt_srli(&e, 8, 8, (u8)(32 - wid));
+                        xt_slli(&e, 8, 8, (u8)(32 - wid));
+                    }
+                    emit_logic_flags(&e, 8);
+                }
+                emit_advance(&e, 4, 10);
+                inline_ops++; done = true;
+            }
         } else if ((w & 0xFFF8) == 0xE9C0) {
             /* M7.5m — BFEXTU Dn{off:wid}, Dm (68020+).
              * Mask 0xFFF8 == 0xE9C0 isolates: bits 15-8 = 11101001
@@ -11677,6 +11710,36 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                 inline_ops++; done = true;
             }
             /* else (dynamic offset or width): fall through to bridge. */
+        } else if ((w & 0xFFF8) == 0xEBC0) {
+            /* M7.5o — BFEXTS Dn{off:wid}, Dm (68020+). Identical to
+             * BFEXTU but sign-extends the field to 32 bits (arithmetic
+             * shift right instead of logical). */
+            u16 ext = mac_read16(cpu->mem, op_pc[i] + 2);
+            bool dyn_off = (ext >> 11) & 1;
+            bool dyn_wid = (ext >> 5) & 1;
+            if (!dyn_off && !dyn_wid) {
+                int src_dn = w & 7;
+                int dst_dn = (ext >> 12) & 7;
+                int off = (ext >> 6) & 0x1F;
+                int wid = ext & 0x1F;
+                if (wid == 0) wid = 32;
+
+                emit_read_g(&e, &rc, G_D(src_dn), 8);
+                if (!(wid == 32 && off == 0)) {
+                    if (off > 0) xt_slli(&e, 8, 8, off);
+                    if (wid < 32) xt_srai(&e, 8, 8, (u8)(32 - wid));
+                }
+                emit_write_g(&e, &rc, G_D(dst_dn), 8);
+
+                if (!flags_dead[i]) {
+                    /* Field is already sign-extended in a8. MSB is at
+                     * bit 31 → emit_logic_flags computes N correctly.
+                     * Z is (sign_extended_field == 0). */
+                    emit_logic_flags(&e, 8);
+                }
+                emit_advance(&e, 4, 10);
+                inline_ops++; done = true;
+            }
         } else if (top == 0xE && !((w >> 8) & 1)
                    && ((w >> 6) & 3) == 2
                    && !((w >> 5) & 1)
