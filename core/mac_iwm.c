@@ -14,7 +14,16 @@
 
 /* --- Apple RTC --------------------------------------------------------- */
 
-bool rtc_data_out(mac_rtc *r) { return r->data_out; }
+bool rtc_data_out(mac_rtc *r) {
+    /* PB0 tristates whenever the RTC isn't actively driving it: either CE
+     * deasserted, or we're between command/data phases. The real Mac bus
+     * pulls high. We model this by returning HIGH unless the chip is in
+     * state 2 (shifting OUT a read response, the only time it actively
+     * drives the line). The SE/30 boot ROM polls PB0 during idle for some
+     * status check and expects HIGH — without this it loops forever. */
+    if (r->state != 2) return true;
+    return r->data_out;
+}
 
 /* Drive the RTC from a VIA port-B write: PB0=data, PB1=clock, PB2=/enable. */
 void rtc_via_write(mac_rtc *r, u8 pb) {
@@ -22,6 +31,7 @@ void rtc_via_write(mac_rtc *r, u8 pb) {
     bool clk = (pb & 0x02) != 0;
     bool data = (pb & 0x01) != 0;
 
+    r->ce_high = !enb;
     if (!enb) {                        /* deselected — reset the transfer */
         r->state = 0;
         r->bit_count = 0;

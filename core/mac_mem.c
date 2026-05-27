@@ -160,12 +160,29 @@ void mac_via_recalc_irq(mac_mem *m) {
 static u8 via_reg(u32 addr) { return (u8)((addr >> 9) & 0x0Fu); }
 
 /* Compose the value seen when reading VIA port B. Output bits return the
- * ORB latch; input bits return the live pin. */
+ * ORB latch; input bits return the live pin.
+ *
+ * PB layout differs by machine:
+ *   Plus:  PB0=RTC data, PB1=RTC clock, PB2=RTC /EN, PB3=mouse switch,
+ *          PB4-5=SCC handshake, PB6=/HBlank, PB7=sound enable
+ *   SE/30: PB0=RTC data, PB1=RTC clock, PB2=RTC /EN, PB3=ADB /INT
+ *          (active low — low when ADB device has an unsolicited event),
+ *          PB4-5=ADB state, PB6=/HBlank, PB7=sound disable
+ */
 static u8 via_read_pb(mac_mem *m) {
     via6522 *v = &m->via;
     u8 in = 0;
     if (rtc_data_out(&m->rtc)) in |= 0x01;     /* PB0 RTC data        */
-    if (m->mouse_btn)          in |= 0x08;     /* PB3 mouse switch up */
+    if (m->model == MAC_MODEL_PLUS) {
+        if (m->mouse_btn)          in |= 0x08; /* PB3 mouse switch up */
+    } else {
+        /* M7.6t — SE/30 ADB /INT line. Idle HIGH (no event). Real hardware
+         * pulses it LOW when an ADB device has unsolicited data — we leave
+         * it high until ADB is properly modelled. The boot ROM polls this
+         * bit; returning consistent HIGH is the correct "no device active"
+         * answer and keeps the ROM out of the ADB-read path. */
+        in |= 0x08;
+    }
     /* PB6 /HBlank toggles fast; approximate with the cycle counter. */
     if (m->cpu && (m->cpu->cycles & 0x80)) in |= 0x40;
     return (u8)((v->orb & v->ddrb) | (in & ~v->ddrb));

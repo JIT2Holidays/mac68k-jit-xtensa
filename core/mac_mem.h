@@ -118,6 +118,7 @@ typedef struct mac_rtc {
     u8  cmd;               /* latched command byte              */
     bool data_out;         /* current value driven onto PB0     */
     bool last_clk;         /* PB1 edge detection                */
+    bool ce_high;          /* /rtcEnb deasserted — data_out tristates HIGH */
     u32 seconds;           /* clock — seconds since 1904        */
     u8  pram[256];         /* parameter RAM                     */
     bool write_pending;
