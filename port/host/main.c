@@ -931,13 +931,43 @@ int main(int argc, char **argv) {
         if (!m68k_dispatcher_init(&dd, &cj)) {
             fprintf(stderr, "trace: jit init failed\n"); return 4;
         }
+        if (getenv("DIFF_JIT_NO_CACHE")) dd.no_cache = true;
         m68k_dispatcher_set_prefetch(&dd, prefetch_mode, prefetch_depth);
         u64 step = 0;
         m68k_cpu pre_cj;
+        u64 dump_step = 0;
+        const char *ds = getenv("DIFF_JIT_DUMP_STEP");
+        if (ds) dump_step = strtoull(ds, NULL, 0);
         while (cj.cycles < max_cycles && !cj.halted) {
             u32 pc_before = cj.pc;
             u64 cyc_before = cj.cycles;
             pre_cj = cj;
+            if (dump_step && step + 1 == dump_step) {
+                fprintf(stderr, "[trace dump pre step=%llu] pc=%08X cyc=%llu\n",
+                        (unsigned long long)step, pc_before, (unsigned long long)cyc_before);
+                fprintf(stderr, "  interp D0-D7: %08X %08X %08X %08X %08X %08X %08X %08X\n",
+                        cpu.d[0], cpu.d[1], cpu.d[2], cpu.d[3],
+                        cpu.d[4], cpu.d[5], cpu.d[6], cpu.d[7]);
+                fprintf(stderr, "  interp A0-A7: %08X %08X %08X %08X %08X %08X %08X %08X SR=%04X\n",
+                        cpu.a[0], cpu.a[1], cpu.a[2], cpu.a[3],
+                        cpu.a[4], cpu.a[5], cpu.a[6], cpu.a[7], cpu.sr);
+                fprintf(stderr, "  jit    D0-D7: %08X %08X %08X %08X %08X %08X %08X %08X\n",
+                        cj.d[0], cj.d[1], cj.d[2], cj.d[3],
+                        cj.d[4], cj.d[5], cj.d[6], cj.d[7]);
+                fprintf(stderr, "  jit    A0-A7: %08X %08X %08X %08X %08X %08X %08X %08X SR=%04X\n",
+                        cj.a[0], cj.a[1], cj.a[2], cj.a[3],
+                        cj.a[4], cj.a[5], cj.a[6], cj.a[7], cj.sr);
+                fprintf(stderr, "  RAM[%08X]: interp=%02X%02X%02X%02X jit=%02X%02X%02X%02X\n",
+                        cj.a[1],
+                        mem.ram[cj.a[1] & (mem.ram_size-1)],
+                        mem.ram[(cj.a[1]+1) & (mem.ram_size-1)],
+                        mem.ram[(cj.a[1]+2) & (mem.ram_size-1)],
+                        mem.ram[(cj.a[1]+3) & (mem.ram_size-1)],
+                        mj.ram[cj.a[1] & (mj.ram_size-1)],
+                        mj.ram[(cj.a[1]+1) & (mj.ram_size-1)],
+                        mj.ram[(cj.a[1]+2) & (mj.ram_size-1)],
+                        mj.ram[(cj.a[1]+3) & (mj.ram_size-1)]);
+            }
             /* sony.c uses a single global S.vm pointer for its
              * mac_mem accesses; in lockstep we must re-point it
              * to whichever engine's memory is about to run, or
