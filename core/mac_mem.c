@@ -339,7 +339,14 @@ static u8 scc_read(mac_mem *m, u32 addr) {
     int ptr = m->scc.wr_ptr & 0xF;
     m->scc.wr_ptr = 0;          /* next access starts at WR0 again */
     if (ptr == 0) {
-        u8 rr0 = SCC_RR0_TX_EMPTY | SCC_RR0_DCD;
+        /* M7.6y — RR0 defaults: TX_EMPTY always set (no Tx in flight).
+         * DCD on Plus: set (Plus's local-talk path doesn't check DCD but
+         * doesn't dislike it asserted either, and existing snapshots
+         * latched that value). DCD on SE/30: cleared, matching what
+         * minivmac's SCCEMDEV.c returns ("DCD always false" — there is
+         * no modem connected). */
+        u8 rr0 = SCC_RR0_TX_EMPTY;
+        if (m->model == MAC_MODEL_PLUS) rr0 |= SCC_RR0_DCD;
         if (c->rx_avail) rr0 |= SCC_RR0_RX_AVAIL | SCC_RR0_CTS;
         return rr0;
     }
