@@ -11771,6 +11771,70 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                 emit_advance(&e, 4, 10);  /* m68k_step base 4 + do_bitfield reg 6 = 10. */
                 inline_ops++; done = true;
             }
+        } else if ((w & 0xFFF8) == 0xEFC0) {
+            /* M7.5q — BFINS Dm, Dn{off:wid} (68020+). Insert the low
+             * `wid` bits of Dm into Dn's field at offset `off`. Sub-op
+             * 111, mask 0xFFF8 == 0xEFC0.
+             *
+             * Static off/wid only, Dn dest only (mode 0), off+wid <= 32.
+             * Other cases bridge.
+             *
+             * Note: for BFINS, the ext word bits 14-12 name the SOURCE
+             * register (Dm), and the opcode's mode/reg name the DEST
+             * (Dn). Reverse of BFEXTU which has dest in ext word.
+             *
+             * Flags computed from the source bits (low `wid` bits of Dm,
+             * NOT from Dn before insert): N = bit (wid-1) of source field,
+             * Z = (source field == 0), V = C = 0, X preserved. */
+            u16 ext = mac_read16(cpu->mem, op_pc[i] + 2);
+            bool dyn_off = (ext >> 11) & 1;
+            bool dyn_wid = (ext >> 5) & 1;
+            int off = (ext >> 6) & 0x1F;
+            int wid = ext & 0x1F;
+            if (wid == 0) wid = 32;
+            if (!dyn_off && !dyn_wid && off + wid <= 32) {
+                int dst_dn = w & 7;
+                int src_dn = (ext >> 12) & 7;
+                u32 mask;
+                if (wid == 32) {
+                    mask = 0xFFFFFFFFu;
+                } else {
+                    mask = ((1u << wid) - 1u) << (32 - off - wid);
+                }
+
+                /* a8 = source low `wid` bits, zero-extended. */
+                emit_read_g(&e, &rc, G_D(src_dn), 8);
+                if (wid < 32) {
+                    /* a8 = a8 & ((1<<wid) - 1) — keep low wid bits */
+                    xt_slli(&e, 8, 8, (u8)(32 - wid));
+                    xt_srli(&e, 8, 8, (u8)(32 - wid));
+                }
+
+                /* For flags: shift source to MSB so emit_logic_flags
+                 * gets the right N. We do this BEFORE the shift-to-field
+                 * position. */
+                if (!flags_dead[i]) {
+                    if (wid < 32) xt_slli(&e, 9, 8, (u8)(32 - wid));
+                    else          xt_mov (&e, 9, 8);
+                }
+
+                /* Position source bits at the field's location in Dn. */
+                int shift_amt = 32 - off - wid;
+                if (shift_amt > 0) xt_slli(&e, 8, 8, (u8)shift_amt);
+
+                /* Read dest, clear field, OR in source. */
+                emit_read_g(&e, &rc, G_D(dst_dn), 11);
+                emit_load_imm(&e, 10, 12, ~mask);
+                xt_and(&e, 11, 11, 10);
+                xt_or (&e, 8, 11, 8);
+                emit_write_g(&e, &rc, G_D(dst_dn), 8);
+
+                if (!flags_dead[i]) {
+                    emit_logic_flags(&e, 9);
+                }
+                emit_advance(&e, 4, 10);
+                inline_ops++; done = true;
+            }
         } else if ((w & 0xFFF8) == 0xEBC0) {
             /* M7.5o — BFEXTS Dn{off:wid}, Dm (68020+). Identical to
              * BFEXTU but sign-extends the field to 32 bits (arithmetic

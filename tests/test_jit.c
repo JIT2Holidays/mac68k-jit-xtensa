@@ -352,6 +352,57 @@ int main(void) {
         rc |= bad;
     }
 
+    /* M7.5q — BFINS Dm, Dn{off:wid} native inline arm. Insert low
+     * `wid` bits of source register into Dn's field at `off`. */
+    {
+        mac_mem mi, mj;
+        mac_mem_init_ex(&mi, MAC_MODEL_SE30, 64 * 1024);
+        mac_mem_init_ex(&mj, MAC_MODEL_SE30, 64 * 1024);
+        u8 prog[16];
+        memset(prog, 0, sizeof prog);
+        m68a aa;
+        m68a_init(&aa, prog, sizeof prog, 0);
+        m68a_w32(&aa, 0x00010000);
+        m68a_w32(&aa, 0x00000100);
+        m68a_finish(&aa);
+        mac_load_ram_image(&mi, 0, prog, 8);
+        mac_load_ram_image(&mj, 0, prog, 8);
+        /* Setup: D0 = 0xFFFF0000 (dest), D1 = 0x000000AB (source low 8).
+         * BFINS D1, D0{8:8} — insert low 8 bits of D1 into D0 bits 16..23.
+         * mask = 0x00FF0000 → result = (0xFFFF0000 & ~0x00FF0000) | (0xAB<<16)
+         *                            = 0xFF000000 | 0x00AB0000
+         *                            = 0xFFAB0000. */
+        u16 code[] = {
+            0x203C, 0xFFFF, 0x0000,           /* MOVE.L #0xFFFF0000, D0 */
+            0x223C, 0x0000, 0x00AB,           /* MOVE.L #0x000000AB, D1 */
+            0xEFC0, (u16)((1 << 12) | (8 << 6) | 8), /* BFINS D1, D0{8:8} */
+            0x4E72, 0x2700,                   /* STOP */
+        };
+        for (size_t i = 0; i < sizeof code / sizeof code[0]; i++) {
+            mac_write16(&mi, 0x100u + (u32)(i * 2), code[i]);
+            mac_write16(&mj, 0x100u + (u32)(i * 2), code[i]);
+        }
+        m68k_cpu ci, cj;
+        m68k_reset(&ci, &mi);
+        m68k_reset(&cj, &mj);
+        m68k_run_until(&ci, 100000);
+        m68k_dispatcher d;
+        m68k_dispatcher_init(&d, &cj);
+        m68k_dispatcher_run_until(&d, 100000);
+        int bad = diff_state("se30-bfins-dn", &ci, &cj);
+        if (!bad) {
+            if (ci.d[0] != 0xFFAB0000u) {
+                printf("  se30-bfins-dn: D0=%08X want FFAB0000\n", ci.d[0]); bad = 1;
+            } else {
+                printf("  se30-bfins-dn: match — D0=0xFFAB0000\n");
+            }
+        }
+        m68k_dispatcher_shutdown(&d);
+        mac_mem_free(&mi);
+        mac_mem_free(&mj);
+        rc |= bad;
+    }
+
     /* M7.5p — BFCLR / BFSET / BFCHG Dn{off:wid} native inline arms.
      * Chain: clear bits 4-11 of D0, then set bits 16-23, then complement
      * bits 24-31. */
