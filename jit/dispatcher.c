@@ -789,6 +789,21 @@ void m68k_dispatcher_run_until(m68k_dispatcher *d, u64 until) {
         enter_block(d, b, start_off);
         d->blocks_executed++;
 
+        /* M7.6ae — SE/30 deferred bus error. mac_read / mac_write set
+         * bus_error_pending when the ROM probes an unmapped address; the
+         * ROM's BERR-recovery handler at vector 2 picks up the fault and
+         * resumes. The interp run loop already handles this — match it
+         * here so the JIT engine behaves identically. Without this, the
+         * SE/30 ROM hardware-probe loop diverges from interp (see
+         * diff-jit-trace at PC=0x40802A34 — MOVE.L abs.L from unmapped
+         * memory: interp pushes a format-A frame, JIT skips it). */
+        if (cpu->bus_error_pending) {
+            cpu->fault_addr = cpu->bus_error_pending & 0x0FFFFFFFu;
+            cpu->bus_error_pending = 0;
+            m68k_exception(cpu, 2);
+            prev = NULL;
+        }
+
         if (d->no_cache) { m68k_block_free(b); prev = NULL; }
         else             { prev = b; }
 
