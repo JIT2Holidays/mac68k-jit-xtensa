@@ -275,6 +275,28 @@ int main(int argc, char **argv) {
                     cpu.a[0], cpu.a[1], cpu.a[2], cpu.a[3],
                     cpu.a[4], cpu.a[5], cpu.a[6], cpu.a[7], cpu.sr);
                 m68k_step(&cpu);
+                /* SE30_DUMP_TICK_EVERY=<N>: call mac_mem_tick +
+                 * m68k_poll_interrupts every N instructions during
+                 * dump-mode tracing. Matches vmac's m68k_go_nCycles
+                 * batching so IRQ-driven loop exits fire at the same
+                 * cadence. Without this, dump mode never delivers
+                 * timer IRQs and gets stuck in IRQ-wait loops like
+                 * the DBF at PC=0x4080059C. */
+                {
+                    static u32 tick_step_n = 0;
+                    static u32 tick_every = 0;
+                    static int tick_inited = 0;
+                    if (!tick_inited) {
+                        const char *te = getenv("SE30_DUMP_TICK_EVERY");
+                        if (te) tick_every = (u32)strtoul(te, NULL, 0);
+                        tick_inited = 1;
+                    }
+                    tick_step_n++;
+                    if (tick_every && (tick_step_n % tick_every) == 0) {
+                        mac_mem_tick(&mem, cpu.cycles);
+                        m68k_poll_interrupts(&cpu);
+                    }
+                }
                 /* SE30_RAM0_AT=<idx>: when reaching this instr index in
                  * dump mode, print RAM[0..0x20] and overlay state. */
                 {
@@ -311,6 +333,34 @@ int main(int argc, char **argv) {
             (unsigned long long)cpu.cycles,
             (unsigned long long)cpu.instrs,
             cpu.fault_addr, cpu.bus_error_pending, cpu.d[7], cpu.a[6]);
+    /* Dump code at final PC (16 words) for stall-loop analysis. */
+    {
+        u32 wpc = cpu.pc & (mem.ram_size - 1u);
+        if (wpc + 0x20 <= mem.ram_size) {
+            fprintf(stderr, "[se30_trace] code @ pc=0x%08X (RAM offset 0x%X):",
+                    cpu.pc, wpc);
+            for (int i = 0; i < 16; i++) {
+                u16 w = (mem.ram[wpc + i*2] << 8) | mem.ram[wpc + i*2 + 1];
+                fprintf(stderr, " %04X", w);
+            }
+            fprintf(stderr, "\n");
+        }
+    }
+    /* Dump vector table (first 0x40 bytes = 16 vectors). */
+    fprintf(stderr, "[se30_trace] vectors RAM[0..0x40]:");
+    for (int i = 0; i < 0x40; i += 4) {
+        u32 v = (mem.ram[i]<<24)|(mem.ram[i+1]<<16)|(mem.ram[i+2]<<8)|mem.ram[i+3];
+        fprintf(stderr, " [%X]=%08X", i, v);
+        if (i % 16 == 12) fprintf(stderr, "\n            ");
+    }
+    fprintf(stderr, "\n");
+    /* Dump registers — all 16. */
+    fprintf(stderr, "[se30_trace] regs: d0=%08X d1=%08X d2=%08X d3=%08X d4=%08X d5=%08X d6=%08X d7=%08X\n"
+            "             a0=%08X a1=%08X a2=%08X a3=%08X a4=%08X a5=%08X a6=%08X a7=%08X sr=%04X\n",
+            cpu.d[0], cpu.d[1], cpu.d[2], cpu.d[3],
+            cpu.d[4], cpu.d[5], cpu.d[6], cpu.d[7],
+            cpu.a[0], cpu.a[1], cpu.a[2], cpu.a[3],
+            cpu.a[4], cpu.a[5], cpu.a[6], cpu.a[7], cpu.sr);
 
     /* First-visit timeline: print each newly-visited ROM region. */
     fprintf(stderr, "\n[se30_trace] first-visit timeline (ROM regions):\n");
