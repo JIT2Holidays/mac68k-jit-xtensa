@@ -35,9 +35,16 @@ void mac_mem_init_ex(mac_mem *m, mac_machine_t model, u32 ram_size) {
         ram_size = MAC_SE30_MAX_RAM;
     m->ram_size = ram_size;
     m->ram = (u8 *)calloc(1, ram_size);
-    /* The Plus uses a VIA-driven ROM overlay at boot. The SE/30 has no
-     * overlay — ROM is mapped at a fixed high address from reset. */
-    m->overlay = (model == MAC_MODEL_PLUS);
+    /* Boot overlay at reset:
+     *  - Plus: ROM at 0x000000 (and mirror 0x400000), RAM at 0x600000.
+     *    PA4 of VIA1 controls the flip (cleared by the ROM early in boot).
+     *  - SE/30: ROM mirrored at 0x00000000-0x3FFFFFFF (low address space)
+     *    AND at its proper location 0x40800000. The Glue chip's overlay
+     *    register (a write to 0x5FFFFFFE on the Mac II family) flips the
+     *    overlay off; RAM then appears at 0x00000000 and ROM stays at
+     *    0x40800000 only. We trigger the flip on first write to that
+     *    address (see overlay-flip in mac_write8 below). */
+    m->overlay = true;
     m->fb_base = ram_size - MAC_FB_OFFSET;
 
     m->via.t1c = 0xFFFF;
@@ -427,11 +434,19 @@ static void asc_write(mac_mem *m, u32 addr, u8 v) {
 /* Return a RAM/ROM pointer for plain-memory addresses, or NULL for MMIO. */
 static u8 *mem_ptr(mac_mem *m, u32 addr) {
     if (m->model == MAC_MODEL_SE30) {
-        /* SE/30: no boot overlay. RAM at 0x00000000+, ROM at 0x40800000+. */
-        if (m->ram_size && addr < m->ram_size) return m->ram + addr;
+        /* ROM is always mapped at 0x40800000. While the boot overlay is
+         * on, the ROM is ALSO mirrored at low addresses (0x00000000+)
+         * so the CPU's reset vector fetch at 0x00000000 hits ROM. After
+         * the first write to the Glue overlay register (handled in
+         * mac_write8), RAM takes over the low address window. */
         if (m->rom && addr >= MAC_SE30_ROM_BASE
                    && addr < MAC_SE30_ROM_BASE + m->rom_size)
             return m->rom + (addr - MAC_SE30_ROM_BASE);
+        if (m->overlay) {
+            if (m->rom && addr < m->rom_size) return m->rom + addr;
+        } else {
+            if (m->ram_size && addr < m->ram_size) return m->ram + addr;
+        }
         return NULL;
     }
     if (m->overlay) {
@@ -518,8 +533,19 @@ void mac_write8(mac_mem *m, u32 addr, u8 v) {
     if (m->model == MAC_MODEL_PLUS) addr &= 0xFFFFFFu;
     m->writes++;
     if (mac_mmio_log && !mem_ptr(m, addr)) mac_mmio_log(m, addr, v, 1, 1);
+    /* SE/30: Glue chip overlay register at 0x5FFFFFFE/F. Any write to
+     * this address flips the boot overlay off — ROM disappears from
+     * low addresses, RAM takes over. */
+    if (m->model == MAC_MODEL_SE30 && m->overlay
+        && (addr & 0xFFFFFFFEu) == 0x5FFFFFFEu) {
+        m->overlay = false;
+        return;
+    }
     /* RAM is writable under the overlay too (the boot code clears it). */
     if (m->model == MAC_MODEL_SE30) {
+        /* SE/30: RAM at low addresses is always writable. Reads during
+         * overlay come from ROM (see mem_ptr), but writes always go to
+         * RAM — that's how the ROM probes RAM size during overlay. */
         if (m->ram_size && addr < m->ram_size) {
             m->ram[addr] = v;
             if (mac_write_watch) mac_write_watch(mac_write_watch_ctx, addr);

@@ -2053,7 +2053,18 @@ void m68k_step(m68k_cpu *cpu) {
         }
         /* Fixed-encoding instructions first. */
         if (op == 0x4E71) { return; }                       /* NOP */
-        if (op == 0x4E70) { cpu->halted = M68K_HALT_RESET; cpu->chain_budget = 0; return; } /* RESET -> stop */
+        if (op == 0x4E70) {
+            /* RESET instruction: on real hardware this asserts the /RESET
+             * pin for ~10 clocks (resetting all peripherals) and then
+             * execution continues. We don't model the peripheral reset
+             * yet — just advance and continue, which matches the SE/30
+             * ROM's expectation (it RESETs early during POST and then
+             * proceeds). Plus ROM never emits RESET so this is a no-op
+             * change for the Plus lockstep tests.
+             * TODO(reset): mac_peripherals_reset(cpu->mem). */
+            cpu->cycles += 132;
+            return;
+        }
         if (op == 0x4E73) {                                  /* RTE */
             bool was = m68k_is_super(cpu);
             u16 sr = mac_read16(cpu->mem, cpu->a[7]); cpu->a[7] += 2;

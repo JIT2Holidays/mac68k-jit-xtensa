@@ -812,8 +812,10 @@ int main(int argc, char **argv) {
                 free(rom);
                 return 3;
             }
-            fprintf(stderr, "[host] loaded Mac ROM %s (%u bytes) at 0x%06X, "
-                            "overlaid at 0x0\n", rom_path, rlen, MAC_ROM_BASE);
+            u32 rom_base = (machine == MAC_MODEL_SE30) ? MAC_SE30_ROM_BASE
+                                                       : MAC_ROM_BASE;
+            fprintf(stderr, "[host] loaded Mac ROM %s (%u bytes) at 0x%08X, "
+                            "overlaid at 0x0\n", rom_path, rlen, rom_base);
         } else {
             mac_load_ram_image(&mem, 0, rom, rlen);
             fprintf(stderr, "[host] loaded %s (%u bytes) at 0x0\n",

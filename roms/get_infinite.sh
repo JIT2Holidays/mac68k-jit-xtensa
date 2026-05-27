@@ -27,6 +27,7 @@ cd "$(dirname "$0")/.."                       # repo root
 mkdir -p roms/disks
 
 ROM="roms/MacPlus.ROM"
+IIX="roms/MacIIx.ROM"           # SE/30-compatible 256 KB system ROM
 SYS="roms/disks/System6.0.5.dsk"
 HD="roms/disks/InfiniteHD6.dsk"
 RAW="https://raw.githubusercontent.com/mihaip/infinite-mac/main"
@@ -41,6 +42,17 @@ else
     echo "* Downloading Macintosh Plus ROM ..."
     curl -fL --progress-bar -o "$ROM.tmp" "$RAW/src/Data/Mac-Plus.rom"
     mv "$ROM.tmp" "$ROM"
+fi
+
+# --- 1b. Macintosh IIx ROM (256 KB, --machine se30) ----------------------
+# The Mac IIx and Macintosh SE/30 share the same 256 KB ROM; this is the
+# ROM the SE/30 boots from. Used by `mac68k_host --machine se30`.
+if [ -f "$IIX" ]; then
+    echo "* $IIX already present — skipping"
+else
+    echo "* Downloading Macintosh IIx ROM (used for SE/30) ..."
+    curl -fL --progress-bar -o "$IIX.tmp" "$RAW/src/Data/Mac-IIx.rom"
+    mv "$IIX.tmp" "$IIX"
 fi
 
 # --- 2. System 6.0.5 boot disk (10 MB, a bootable HFS hard-disk image) ---

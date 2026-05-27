@@ -231,8 +231,16 @@ static int test_se30_init_stable(void) {
     if (mem.model != MAC_MODEL_SE30) {
         printf("se30: model = %d want 1\n", mem.model); return 1;
     }
+    /* SE/30 reset state has the boot overlay on (ROM mirrored at low
+     * addresses). It's flipped off by the ROM writing to the Glue
+     * register at 0x5FFFFFFE during init. */
+    if (!mem.overlay) {
+        printf("se30: overlay clear at init, expected on\n"); return 1;
+    }
+    /* Trigger overlay-off by writing the Glue register, then verify. */
+    mac_write8(&mem, 0x5FFFFFFEu, 0);
     if (mem.overlay) {
-        printf("se30: overlay set, expected off\n"); return 1;
+        printf("se30: overlay still on after Glue write\n"); return 1;
     }
     /* Stub ASC/ADB present in the struct (no crash on access). */
     mac_write8(&mem, MAC_SE30_ASC_BASE + 0x10, 0x55);
