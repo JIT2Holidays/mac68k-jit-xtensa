@@ -530,9 +530,43 @@ static int test_pmmu_translate(void) {
         return 1;
     }
 
+    /* M7.6o — PTEST end-to-end through the interpreter. Encode PTEST with
+     * <ea> = (A1), set A1 to an LA that hits an invalid descriptor, step
+     * once, and verify MMUSR has bit 11 (I) set with no actual BERR. */
+    {
+        /* SE/30 init has overlay=true (ROM mirrored at low LAs). Turn it
+         * off so RAM is visible at 0x200 for our instruction stream. */
+        mem.overlay = false;
+        /* With TC.E=1 the instruction-fetch goes through PMMU translation
+         * too — make page 0 identity-mapped so PC=0x200 lands at phys 0x200. */
+        cpu.tc = 0;
+        mac_write32(&mem, table_base + 0 * 4, 0x00000001u);   /* page 0 → phys 0, DT=1 */
+        mac_write32(&mem, table_base + 2 * 4, 0x00000000u);   /* page 2 → invalid */
+        cpu.srp = ((u64)table_base << 32) | 2u;
+        cpu.tc = 0x80000000u | (4u << 20) | (4u << 12);
+        cpu.bus_error_pending = 0;
+        cpu.mmusr = 0;
+        /* PTEST opcode 0xF011 (mode=2 An-indir, reg=1 A1). */
+        mac_write16(&mem, 0x200, 0xF011);
+        /* Ext word: bits 15-13 = 100 (PTEST), bit 9 = RW=1 (read),
+         * bits 12-10 = FC=5 (super data) → 0x8000 | 0x0200 | 0x1400 = 0x9600 */
+        mac_write16(&mem, 0x202, 0x9600);
+        cpu.pc = 0x200;
+        cpu.sr |= SR_S;                       /* supervisor for PMMU op */
+        cpu.a[1] = 0x2000;                    /* page 2 → invalid */
+        m68k_step(&cpu);
+        if (cpu.bus_error_pending != 0) {
+            printf("pmmu: PTEST should NOT set bus_error_pending\n"); return 1;
+        }
+        if ((cpu.mmusr & (1u << 11)) == 0) {
+            printf("pmmu: PTEST invalid-desc MMUSR=%04X, expected I bit\n",
+                   cpu.mmusr); return 1;
+        }
+    }
+
     mac_mem_free(&mem);
     (void)cpu; (void)pcpu;
-    printf("  PMMU translate framework OK (short + long + BERR + WP + U/M + IS)\n");
+    printf("  PMMU translate framework OK (short + long + BERR + WP + U/M + IS + PTEST)\n");
     return 0;
 }
 
