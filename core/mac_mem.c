@@ -751,12 +751,20 @@ u32 mac_pmmu_translate(mac_mem *m, u32 logical_addr, u8 fc) {
     shift = page_size_bits + (u32)total_idx_bits;
 
     u32 cur_table = table_base;
+    /* Current descriptor format (4 or 8 bytes per entry). Determined by
+     * the PARENT descriptor's DT: DT=2 → short (4 bytes), DT=3 → long
+     * (8 bytes). Root pointer's DT acts as the parent for level 0. */
+    u32 entry_sz = (dt == 3) ? 8u : 4u;
     for (int level = 0; level < n_levels; level++) {
         shift -= (u32)level_bits[level];
         u32 idx = (logical_addr >> shift) & ((1u << level_bits[level]) - 1u);
-        u32 desc_addr = (cur_table + idx * 4u) & 0xFFFFFFFCu;
-        u32 desc = mac_read32(m, desc_addr);
-        u8 desc_dt = (u8)(desc & 3);
+        u32 desc_addr = (cur_table + idx * entry_sz) & 0xFFFFFFFCu;
+        u32 desc0 = mac_read32(m, desc_addr);
+        u32 desc1 = 0;
+        if (entry_sz == 8u) {
+            desc1 = mac_read32(m, desc_addr + 4u);
+        }
+        u8 desc_dt = (u8)(desc0 & 3);
         if (desc_dt == 0) {
             /* Invalid descriptor — raise bus error (vector 2). The
              * deferred-BERR mechanism (M7.3e) fires after the current
@@ -769,13 +777,30 @@ u32 mac_pmmu_translate(mac_mem *m, u32 logical_addr, u8 fc) {
         }
         if (level == n_levels - 1) {
             /* Leaf: this is a page descriptor. Combine page-aligned
-             * address with the in-page offset. */
-            u32 page_phys = desc & ~((1u << page_size_bits) - 1u);
+             * address with the in-page offset.
+             *   short-form: address bits are bits 8-31 of desc0
+             *               (mask off the DT/U/M low bits with the
+             *               page-size mask).
+             *   long-form: full address in desc1 (page-aligned).
+             */
+            u32 page_phys;
+            if (entry_sz == 8u) {
+                page_phys = desc1 & ~((1u << page_size_bits) - 1u);
+            } else {
+                page_phys = desc0 & ~((1u << page_size_bits) - 1u);
+            }
             u32 page_offset = logical_addr & ((1u << page_size_bits) - 1u);
             return page_phys | page_offset;
         }
-        /* Non-leaf: pointer to next-level table. Mask off DT/U/M bits. */
-        cur_table = desc & 0xFFFFFFF0u;
+        /* Non-leaf: pointer to next-level table. */
+        if (entry_sz == 8u) {
+            cur_table = desc1 & 0xFFFFFFF0u;
+        } else {
+            cur_table = desc0 & 0xFFFFFFF0u;
+        }
+        /* The current descriptor's DT tells us the NEXT level's entry
+         * format (2 = short, 3 = long). */
+        entry_sz = (desc_dt == 3) ? 8u : 4u;
     }
     /* Should not reach here. */
     return logical_addr;

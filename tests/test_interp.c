@@ -364,6 +364,35 @@ static int test_pmmu_translate(void) {
         return 1;
     }
 
+    /* M7.6f — long-form (8-byte) descriptor test. Same idea as the
+     * short-form 1-level test, but entries are 8 bytes each: word 0 has
+     * the DT/flags, word 1 has the full 32-bit address. */
+    u32 long_table = 0x5000u;
+    /* Entry 0 (8 bytes): word0=0x00000001 (DT=1 page), word1=0x00040000 (page addr). */
+    mac_write32(&mem, long_table + 0 * 8 + 0, 0x00000001u);
+    mac_write32(&mem, long_table + 0 * 8 + 4, 0x00040000u);
+    /* Entry 1: word0=DT=1, word1=0x00080000. */
+    mac_write32(&mem, long_table + 1 * 8 + 0, 0x00000001u);
+    mac_write32(&mem, long_table + 1 * 8 + 4, 0x00080000u);
+    /* Root pointer: long format (DT=3). */
+    cpu.srp = ((u64)long_table << 32) | 3u;
+    /* Single-level walk, TIA=4, PS=4 (4KB pages). */
+    cpu.tc = 0x80000000u | (4u << 20) | (4u << 12);
+    cpu.bus_error_pending = 0;
+    /* LA 0x00000080 → page 0 (TIA idx 0, PS=4 → bits 11-0 are offset).
+     * Expect phys = 0x00040000 | 0x80 = 0x00040080. */
+    u32 phl = mac_pmmu_translate(&mem, 0x00000080u, 5);
+    if (phl != 0x00040080u) {
+        printf("pmmu: long-form 1-level LA=0x80 → phys=%08X want 40080\n", phl);
+        return 1;
+    }
+    /* LA 0x00001234 → page 1, offset 0x234. Expected 0x00080234. */
+    phl = mac_pmmu_translate(&mem, 0x00001234u, 5);
+    if (phl != 0x00080234u) {
+        printf("pmmu: long-form 1-level LA=0x1234 → phys=%08X want 80234\n", phl);
+        return 1;
+    }
+
     /* M7.6e — invalid descriptor → bus error. Set up a 1-level table
      * where the LA we translate lands on an invalid (DT=0) leaf. */
     mac_write32(&mem, table_base + 2 * 4, 0x00000000u);   /* DT=0 invalid */
@@ -380,7 +409,7 @@ static int test_pmmu_translate(void) {
 
     mac_mem_free(&mem);
     (void)cpu; (void)pcpu;
-    printf("  PMMU translate framework OK (1-level + 2-level PTW + BERR)\n");
+    printf("  PMMU translate framework OK (short + long form + BERR)\n");
     return 0;
 }
 
