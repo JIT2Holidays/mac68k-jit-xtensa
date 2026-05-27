@@ -104,7 +104,9 @@ int main(int argc, char **argv) {
     u64 max_cycles = (argc > 1) ? strtoull(argv[1], NULL, 0) : 200000000ull;
 
     mac_mem mem;
-    mac_mem_init_ex(&mem, MAC_MODEL_SE30, 8u * 1024u * 1024u);
+    /* Full 128 MB so the ROM's RAM-probe loop terminates cleanly — the
+     * probe sweeps to ~127 MB looking for installed banks. */
+    mac_mem_init_ex(&mem, MAC_MODEL_SE30, 128u * 1024u * 1024u);
 
     u8 *rom_data = NULL;
     u32 rom_len = read_file("roms/MacIIx.ROM", &rom_data);
@@ -171,10 +173,12 @@ int main(int argc, char **argv) {
     }
     note_pc(cpu.pc, cpu.cycles);
 
-    fprintf(stderr, "[se30_trace] halt=%d pc=0x%08X cycles=%llu instrs=%llu\n",
+    fprintf(stderr, "[se30_trace] halt=%d pc=0x%08X cycles=%llu instrs=%llu "
+            "last_fault_addr=0x%08X bus_err_pending=0x%08X d7=0x%08X a6=0x%08X\n",
             cpu.halted, cpu.pc,
             (unsigned long long)cpu.cycles,
-            (unsigned long long)cpu.instrs);
+            (unsigned long long)cpu.instrs,
+            cpu.fault_addr, cpu.bus_error_pending, cpu.d[7], cpu.a[6]);
 
     /* First-visit timeline: print each newly-visited ROM region. */
     fprintf(stderr, "\n[se30_trace] first-visit timeline (ROM regions):\n");
