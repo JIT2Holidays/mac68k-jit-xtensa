@@ -301,10 +301,48 @@ static int test_pmmu_translate(void) {
     if (mac_pmmu_translate(&mem, 0x12345678u, 5) != 0x12345678u) {
         printf("pmmu: TT0 match not pass-through\n"); return 1;
     }
+    cpu.tt0 = 0;
+
+    /* M7.6c — single-level short-form PTW test. Set up a page table at
+     * RAM 0x4000 with 16 entries (each 4 bytes), 4KB pages (PS=4).
+     *
+     * Boot overlay must be off so RAM writes are visible to RAM reads
+     * (otherwise mac_read32 in PMMU reads from the ROM mirror). The
+     * SE/30 ROM normally clears overlay via the Glue write at 0x5FFFFFFE;
+     * we do the same here. */
+    mem.overlay = false;
+    u32 table_base = 0x4000u;
+    /* Map LA 0x00000000 (page 0) → phys 0x10000 (1:0x10 page swap). */
+    mac_write32(&mem, table_base + 0 * 4, 0x00010002u);   /* phys 0x10000, dt=2 (short page) */
+    /* Map LA 0x00001000 (page 1) → phys 0x20000. */
+    mac_write32(&mem, table_base + 1 * 4, 0x00020002u);
+    /* Set SRP: high 32 = table_base, low 32 = descriptor type 2 (short). */
+    cpu.srp = ((u64)table_base << 32) | 2u;
+    /* TC.E=1, TIA=4, PS=4 (4KB pages), other fields 0. */
+    cpu.tc  = 0x80000000u | (4u << 20) | (4u << 12);
+
+    /* Translate LA 0x00000100 (page 0, offset 0x100). Expect phys
+     * 0x10000 + 0x100 = 0x10100. */
+    u32 phys = mac_pmmu_translate(&mem, 0x00000100u, 5);   /* fc=5 = supervisor data */
+    if (phys != 0x10100u) {
+        printf("pmmu: 1-level PTW LA=0x100 → phys=%08X want 10100\n", phys);
+        return 1;
+    }
+    /* LA 0x00001ABC → page 1 + offset 0xABC → phys 0x20ABC. */
+    phys = mac_pmmu_translate(&mem, 0x00001ABCu, 5);
+    if (phys != 0x20ABCu) {
+        printf("pmmu: 1-level PTW LA=0x1ABC → phys=%08X want 20ABC\n", phys);
+        return 1;
+    }
+    /* Multi-level (TIB != 0) → pass-through (TODO). */
+    cpu.tc |= (4u << 8);  /* set TIB = 4 */
+    if (mac_pmmu_translate(&mem, 0x100u, 5) != 0x100u) {
+        printf("pmmu: multi-level should pass-through (TODO)\n"); return 1;
+    }
 
     mac_mem_free(&mem);
     (void)cpu; (void)pcpu;
-    printf("  PMMU translate framework OK (pass-through paths)\n");
+    printf("  PMMU translate framework OK (incl 1-level PTW)\n");
     return 0;
 }
 
