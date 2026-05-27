@@ -2027,9 +2027,14 @@ bool m68k_jit_can_inline_020(u16 op) {
      * M7.6am — re-enable attempted, immediately caught by the
      * diff_jit_se30_reset_lockstep test: even with M7.6ae's BERR
      * handling, the bug is independent and PMMU inline still
-     * corrupts. The bug remains. Do NOT uncomment without writing a
-     * specific fix that survives the ctest lockstep. */
-    /* if ((op & 0xFE00) == 0xF000) return true; */
+     * corrupts.
+     *
+     * M7.6an — ROOT CAUSE FOUND + FIXED: the JIT's F-line trap arm in
+     * jit/codegen.c was catching PMMU ops and raising vec 11. Added a
+     * guard BEFORE the F-line trap arm that lets PMMU fall through to
+     * the helper_step bridge. Re-enabled here. Verified by the
+     * lockstep test now passing with PMMU inline. */
+    if ((op & 0xFE00) == 0xF000) return true;
 
     return false;
 }

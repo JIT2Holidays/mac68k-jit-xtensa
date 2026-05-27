@@ -2335,6 +2335,19 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
              * assuming supervisor, which is correct for OS code). */
             emit_advance(&e, 2, 12);
             inline_ops++; done = true;
+        } else if (top == 0xF && (w & 0xFE00) == 0xF000) {
+            /* M7.6an — PMMU coprocessor (cp-id=0): fall through to the
+             * default helper_step bridge below (calls m68k_step → do_pmmu).
+             * MUST be matched BEFORE the F-line trap arm below — without
+             * this, PMOVE/PFLUSH/PLOAD/PTEST get fline_trap'd to vector
+             * 11 with PC=ROM[0x2C], breaking SE/30 boot. (Original bug
+             * surfaced via diff_jit_se30_reset_lockstep: block at
+             * 0x4083F872 F010+4EF9 sent JIT to PC=0 / A7=SSP-8 because
+             * vec 11 fired during what should have been the helper bridge.)
+             *
+             * Length already accounted for by m68k_decode_at in
+             * m68k_interp.c (case 0xF: d.length += 2 + EA-ext).
+             * No native arm — fall through. */
         } else if (top == 0xF) {
             /* M6.137 — F-line trap. Bench-hot 0xFFFF at 21 808 hits /
              * 100 M cyc (the bench's M6.66-equivalent divergence zone
