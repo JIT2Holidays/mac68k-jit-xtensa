@@ -1666,11 +1666,29 @@ static void do_movec(m68k_cpu *cpu, u16 op, u32 op_pc) {
      * Ext word bit 15 = A/D flag for the general register. */
     int dir_to_ctl = (op & 1) != 0;
     int gen_reg = (ext >> 12) & 0xF; /* bit 15 = A/D, bits 14-12 = idx */
-    u32 *p = movec_ctlreg(cpu, ext & 0xFFF);
+    u16 ctrl = ext & 0xFFF;
+    u32 *p = movec_ctlreg(cpu, ctrl);
     if (!p) { illegal(cpu, op); return; }
     u32 *gr = (gen_reg < 8) ? &cpu->d[gen_reg] : &cpu->a[gen_reg - 8];
-    if (dir_to_ctl) *p = *gr;
-    else            *gr = *p;
+    if (dir_to_ctl) {
+        u32 v = *gr;
+        /* M7.6bs — match minivmac masks for control regs that have
+         * reserved/ignored bits. The SE/30 ROM at 0x4083F85C writes
+         * 0x2000 to CACR then reads it back; if read returns 0x2000,
+         * BEQ at 0x4083F86C is NOT taken and PMOVE runs. vmac masks
+         * with 0x3 (only EI/FI bits), so read returns 0, BEQ taken,
+         * PMOVE skipped. We match to align boot flow. */
+        switch (ctrl) {
+            case 0x000: v &= 0x7;       break; /* SFC: low 3 bits */
+            case 0x001: v &= 0x7;       break; /* DFC: low 3 bits */
+            case 0x002: v &= 0x3;       break; /* CACR: only EI/FI */
+            case 0x802: v &= 0xFC;      break; /* CAAR */
+            default: break;
+        }
+        *p = v;
+    } else {
+        *gr = *p;
+    }
     cpu->cycles += 12;
 }
 

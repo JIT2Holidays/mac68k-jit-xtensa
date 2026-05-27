@@ -2414,13 +2414,17 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             int gen_reg = (ext >> 12) & 0xF;
             u32 ctl_sel = ext & 0xFFF;
             u32 ctl_off = ~0u;
+            /* M7.6bs — disable inline for ctl regs whose writes need
+             * masking (SFC/DFC/CACR/CAAR) to match the interp's
+             * vmac-aligned mask behavior. Falls through to m68k_step
+             * bridge which applies the masks correctly. */
             switch (ctl_sel) {
-                case 0x000: ctl_off = (u32)offsetof(m68k_cpu, sfc); break;
-                case 0x001: ctl_off = (u32)offsetof(m68k_cpu, dfc); break;
-                case 0x002: ctl_off = (u32)offsetof(m68k_cpu, cacr); break;
+                /* case 0x000: SFC — bridge */
+                /* case 0x001: DFC — bridge */
+                /* case 0x002: CACR — bridge */
                 case 0x800: ctl_off = (u32)offsetof(m68k_cpu, usp); break;
                 case 0x801: ctl_off = (u32)offsetof(m68k_cpu, vbr); break;
-                case 0x802: ctl_off = (u32)offsetof(m68k_cpu, caar); break;
+                /* case 0x802: CAAR — bridge */
                 case 0x803: ctl_off = (u32)offsetof(m68k_cpu, msp); break;
                 case 0x804: ctl_off = (u32)offsetof(m68k_cpu, isp); break;
                 case 0x003: ctl_off = (u32)offsetof(m68k_cpu, tc); break;
