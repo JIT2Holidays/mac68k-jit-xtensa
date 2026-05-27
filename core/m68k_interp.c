@@ -1888,6 +1888,7 @@ bool m68k_jit_can_inline_020(u16 op) {
      * op the SE/30 boot path hits. */
     if (op == 0x4E7A || op == 0x4E7B) return true;       /* MOVEC */
     if ((op & 0xFFF8) == 0x4808) return true;            /* LINK.L An,#d32 */
+    if (op == 0x4E74) return true;                       /* RTD #d16 (block terminator) */
     if ((op & 0xFF20) == 0xF400) return true;            /* CINV  (line F cache) */
     if ((op & 0xFF20) == 0xF420) return true;            /* CPUSH (line F cache) */
 
