@@ -114,12 +114,40 @@ int main(int argc, char **argv) {
     free(rom_data);
     fprintf(stderr, "[se30_trace] loaded MacIIx.ROM (%u bytes)\n", rom_len);
 
+    /* Optional: ROM patch experiment. SE30_PATCH_2C6C=1 NOPs out the
+     * unconditional BRA at 0x40802C6C (ROM offset 0x2C6C) so execution
+     * falls through to 0x40802C70 (BSET #16,D7 + BSET #22,D7 + enable
+     * cache + jump to normal init). This tests whether the post-ASC
+     * outer-loop stall is fixed when D7 bit 16 is set normally. */
+    if (getenv("SE30_PATCH_2C6C")) {
+        if (mem.rom && rom_len > 0x2C70) {
+            mem.rom[0x2C6C] = 0x4E; mem.rom[0x2C6D] = 0x71;  /* NOP */
+            mem.rom[0x2C6E] = 0x4E; mem.rom[0x2C6F] = 0x71;  /* NOP */
+            fprintf(stderr, "[se30_trace] patched 0x40802C6C BRA → NOP NOP\n");
+        }
+    }
+
     m68k_cpu cpu;
     m68k_reset(&cpu, &mem);
     g_cpu = &cpu;
     mac_mmio_log = mmio_log_cb;
     fprintf(stderr, "[se30_trace] reset PC=0x%08X SSP=0x%08X SR=0x%04X\n",
             cpu.pc, cpu.a[7], cpu.sr);
+
+    /* Optional: inject a byte into SCC channel A at a fixed cycle to
+     * test whether the post-ASC outer loop is purely SCC-poll-waiting.
+     * SE30_INJECT_BYTE=<hex> SE30_INJECT_AT=<cyc> env vars. */
+    u8 inject_byte = 0;
+    u64 inject_at = ~0ull;
+    const char *ib = getenv("SE30_INJECT_BYTE");
+    const char *ia = getenv("SE30_INJECT_AT");
+    if (ib && ia) {
+        inject_byte = (u8)strtoul(ib, NULL, 0);
+        inject_at = strtoull(ia, NULL, 0);
+        fprintf(stderr, "[se30_trace] will inject SCC byte 0x%02X at cyc=%llu\n",
+                inject_byte, (unsigned long long)inject_at);
+    }
+    bool injected = (inject_at == ~0ull);
 
     u64 sample_every = 32;
     u64 next_sample = 0;
@@ -130,6 +158,12 @@ int main(int argc, char **argv) {
         if (cpu.cycles >= next_sample) {
             note_pc(cpu.pc, cpu.cycles);
             next_sample = cpu.cycles + sample_every;
+        }
+        if (!injected && cpu.cycles >= inject_at) {
+            mac_scc_rx(&mem, 1, inject_byte);
+            fprintf(stderr, "[se30_trace] injected SCC byte 0x%02X at cyc=%llu\n",
+                    inject_byte, (unsigned long long)cpu.cycles);
+            injected = true;
         }
         u64 chunk_end = cpu.cycles + 1024;
         if (chunk_end > max_cycles) chunk_end = max_cycles;
