@@ -36,6 +36,12 @@ milestones build on.
 | **M7.5j** | JIT native inline arm: LINK.L An,#d32 | 8/8 |
 | **M7.5k** | RTD #d16 in JIT block via bridge (as last op) | 8/8 |
 | **M7.5l** | JIT native inline arm: TRAPF (cc=F variants) | 8/8 |
+| **M7.5m** | JIT native inline arm: BFEXTU Dn-source (static off/wid) | 8/8 |
+| **M7.5n** | JIT native inline arm: BFTST (flags-only) | 8/8 |
+| **M7.5o** | JIT native inline arm: BFEXTS (signed extract) | 8/8 |
+| **M7.5p** | JIT native inline arms: BFCHG / BFCLR / BFSET (modify variants) | 8/8 |
+| **M7.5q** | JIT native inline arm: BFINS (insert field) | 8/8 |
+| **M7.5r** | JIT native inline arms: PACK + UNPK (Dn-Dn form) | 8/8 |
 
 **Current state:**
 * **Interpreter**: All 68020/030 integer ISA implemented (M7.0). Boots
@@ -47,13 +53,17 @@ milestones build on.
 * **JIT**: Hybrid termination (M7.0) lets the JIT compile 68000 code
   unchanged under SE/30. Every 020+ op now has correct m68k_decode_at
   sizing AND is in m68k_jit_can_inline_020, so blocks no longer
-  terminate at 020+ boundaries. 5 native inline arms implemented
-  (EXTB.L, CINV/CPUSH, MOVEC, LINK.L, TRAPF); 9+ ops go through the
-  default m68k_step bridge.
+  terminate at 020+ boundaries. **14 native inline arms implemented**:
+  EXTB.L, CINV/CPUSH, MOVEC, LINK.L, TRAPF, BFEXTU, BFTST, BFEXTS,
+  BFCHG, BFCLR, BFSET, BFINS, PACK, UNPK. Remaining 020+ ops on
+  m68k_step bridge: BFFFO (needs Xtensa NSAU emitter), MULU.L/MULS.L/
+  DIVU.L/DIVS.L (64-bit math), RTD, MOVES, TRAPcc cc!=F, CHK2/CMP2,
+  CAS/CAS2, PMMU.
 * **Tests**: 8/8 ctest cases green throughout (zero Plus regression
-  across all 22 commits in the M7 arc). JIT differential test now has
-  13 lockstep cases (4 Plus + 9 SE/30: extbl, movec, linkl, rtd,
-  cinv-cpush, pack-trapf, muldiv-l, bfextu-mem, hybrid).
+  across all M7 commits). JIT differential test has 18 lockstep cases:
+  4 Plus + 14 SE/30 — extbl, movec, linkl, rtd, cinv-cpush, pack-trapf,
+  muldiv-l, bfextu-mem, bfextu-dn, bftst-dn, bfexts-dn, bfclr-set-chg,
+  bfins-dn, hybrid.
 
 **Out of scope — still pending:**
 * **M7.2** — vMac SE/30 lock-step harness (needs minivmac SE-30 variant
