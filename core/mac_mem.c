@@ -52,7 +52,13 @@ void mac_mem_init_ex(mac_mem *m, mac_machine_t model, u32 ram_size) {
     m->via.next_vbl = MAC_VBL_CYCLES;
     /* PA4 = 1 (overlay on) is the power-on default; the ROM clears it. */
     m->via.ora = 0x7F;
-    m->via.orb = 0x87;
+    /* VIA1 ORB initial value differs by machine — PB7 has different
+     * semantics:
+     *   Plus:  PB7 = vSndEnb (active high; 1 = sound enabled) → set
+     *   SE/30: PB7 = vSndOff (active low;  0 = sound off)     → clear
+     * RTC pins (PB0-2) are identical: PB0/1 are bidir data/clock,
+     * PB2 is /EN active-low so idle HIGH = chip deselected. */
+    m->via.orb = (model == MAC_MODEL_SE30) ? 0x07u : 0x87u;
 
     if (model == MAC_MODEL_SE30) {
         /* VIA2 mirrors VIA1's reset shape; its port wiring is different
