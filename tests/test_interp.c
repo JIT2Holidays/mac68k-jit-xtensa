@@ -364,9 +364,23 @@ static int test_pmmu_translate(void) {
         return 1;
     }
 
+    /* M7.6e — invalid descriptor → bus error. Set up a 1-level table
+     * where the LA we translate lands on an invalid (DT=0) leaf. */
+    mac_write32(&mem, table_base + 2 * 4, 0x00000000u);   /* DT=0 invalid */
+    cpu.tc = 0x80000000u | (4u << 20) | (4u << 12);       /* back to 1-level */
+    cpu.srp = ((u64)table_base << 32) | 2u;
+    cpu.bus_error_pending = 0;
+    /* LA 0x00002000 → page 2 → invalid descriptor. */
+    u32 ph = mac_pmmu_translate(&mem, 0x00002000u, 5);
+    (void)ph;
+    if (cpu.bus_error_pending == 0) {
+        printf("pmmu: invalid descriptor did NOT set bus_error_pending\n");
+        return 1;
+    }
+
     mac_mem_free(&mem);
     (void)cpu; (void)pcpu;
-    printf("  PMMU translate framework OK (1-level + 2-level PTW)\n");
+    printf("  PMMU translate framework OK (1-level + 2-level PTW + BERR)\n");
     return 0;
 }
 

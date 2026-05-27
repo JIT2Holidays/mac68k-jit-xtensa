@@ -715,7 +715,12 @@ u32 mac_pmmu_translate(mac_mem *m, u32 logical_addr, u8 fc) {
     u64 rp = is_supervisor ? cpu->srp : cpu->crp;
     /* SRP/CRP low 32 = descriptor; high 32 = table pointer. */
     u8 dt = (u8)(rp & 3);
-    if (dt == 0) return logical_addr;       /* invalid → no translation */
+    if (dt == 0) {
+        /* Invalid root pointer — set bus_error_pending so the next
+         * instruction completion raises vector 2. */
+        cpu->bus_error_pending = logical_addr | 0x80000000u;
+        return logical_addr;
+    }
     u32 table_base = (u32)(rp >> 32) & 0xFFFFFFF0u;
 
     int level_bits[4] = {
@@ -753,8 +758,13 @@ u32 mac_pmmu_translate(mac_mem *m, u32 logical_addr, u8 fc) {
         u32 desc = mac_read32(m, desc_addr);
         u8 desc_dt = (u8)(desc & 3);
         if (desc_dt == 0) {
-            /* Invalid descriptor → would normally bus-error.
-             * TODO(pmmu-fault). Pass through for now. */
+            /* Invalid descriptor — raise bus error (vector 2). The
+             * deferred-BERR mechanism (M7.3e) fires after the current
+             * instruction completes. Pass through the LA for now so
+             * subsequent code doesn't trip on an undefined physical
+             * address; the exception will redirect cpu->pc on the
+             * next m68k_run_until tick. */
+            cpu->bus_error_pending = logical_addr | 0x80000000u;
             return logical_addr;
         }
         if (level == n_levels - 1) {
