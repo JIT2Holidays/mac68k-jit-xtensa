@@ -318,6 +318,15 @@ static u8 scc_read(mac_mem *m, u32 addr) {
         if (c->rx_avail) rr0 |= SCC_RR0_RX_AVAIL | SCC_RR0_CTS;
         return rr0;
     }
+    /* RR1 returns special status: bit 0 = "All Sent" (TX shift register
+     * empty). For an idle SCC with no Tx in flight, this bit is always
+     * set — without it, the SE/30 ROM's "wait for Tx complete" polling
+     * loop at 0x408033E2 spins forever. Plus mode ROMs don't depend on
+     * this default and pre-write WR1 (and thus latch their own RR1
+     * state). */
+    if (ptr == 1 && m->model == MAC_MODEL_SE30) {
+        return c->rr[1] | 0x01u;
+    }
     return c->rr[ptr];
 }
 
