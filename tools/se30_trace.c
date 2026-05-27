@@ -275,24 +275,28 @@ int main(int argc, char **argv) {
                     cpu.a[0], cpu.a[1], cpu.a[2], cpu.a[3],
                     cpu.a[4], cpu.a[5], cpu.a[6], cpu.a[7], cpu.sr);
                 m68k_step(&cpu);
-                /* SE30_DUMP_TICK_EVERY=<N>: call mac_mem_tick +
-                 * m68k_poll_interrupts every N instructions during
-                 * dump-mode tracing. Matches vmac's m68k_go_nCycles
-                 * batching so IRQ-driven loop exits fire at the same
-                 * cadence. Without this, dump mode never delivers
-                 * timer IRQs and gets stuck in IRQ-wait loops like
-                 * the DBF at PC=0x4080059C. */
+                /* SE30_DUMP_TICK_AT=<instr>: at this instruction index,
+                 * call mac_mem_tick + poll once. Used to surgically
+                 * inject an IRQ at a known wait-loop entry to bridge
+                 * the DBF wait without disturbing earlier matches.
+                 *
+                 * SE30_DUMP_TICK_EVERY=<N>: alternatively, tick every
+                 * N instructions throughout. */
                 {
                     static u32 tick_step_n = 0;
                     static u32 tick_every = 0;
+                    static u32 tick_at = 0;
                     static int tick_inited = 0;
                     if (!tick_inited) {
                         const char *te = getenv("SE30_DUMP_TICK_EVERY");
+                        const char *ta = getenv("SE30_DUMP_TICK_AT");
                         if (te) tick_every = (u32)strtoul(te, NULL, 0);
+                        if (ta) tick_at = (u32)strtoul(ta, NULL, 0);
                         tick_inited = 1;
                     }
                     tick_step_n++;
-                    if (tick_every && (tick_step_n % tick_every) == 0) {
+                    if ((tick_every && (tick_step_n % tick_every) == 0) ||
+                        (tick_at && tick_step_n == tick_at)) {
                         mac_mem_tick(&mem, cpu.cycles);
                         m68k_poll_interrupts(&cpu);
                     }
