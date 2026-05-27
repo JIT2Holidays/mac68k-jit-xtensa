@@ -311,7 +311,9 @@ void mac_mem_tick(mac_mem *m, u64 cycles);
  *   - User Data = 1, User Code = 2
  *   - Supervisor Data = 5, Supervisor Code = 6
  *   - CPU Space (interrupt ack) = 7 */
-u32 mac_pmmu_translate(mac_mem *m, u32 logical_addr, u8 fc);
+/* `is_write` lets the walker enforce write-protect (long-form leaf
+ * descriptors' WP bit). For reads pass false. */
+u32 mac_pmmu_translate(mac_mem *m, u32 logical_addr, u8 fc, bool is_write);
 
 /* Recompute the VIA IRQ summary and cpu->pending_irq. Public so the
  * keyboard code (core/mac_input.c) can raise the shift-register IRQ. */

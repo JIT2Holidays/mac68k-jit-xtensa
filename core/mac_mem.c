@@ -524,7 +524,7 @@ u8 mac_read8(mac_mem *m, u32 addr) {
      * so the per-access cost is minimal. */
     else if (m->cpu && (m->cpu->tc & 0x80000000u) && !m->pmmu_in_walk) {
         u8 fc = m68k_is_super(m->cpu) ? 5u : 1u;   /* sup/user data */
-        addr = mac_pmmu_translate(m, addr, fc);
+        addr = mac_pmmu_translate(m, addr, fc, /*is_write=*/false);
     }
     m->reads++;
     u8 *p = mem_ptr(m, addr);
@@ -569,7 +569,7 @@ void mac_write8(mac_mem *m, u32 addr, u8 v) {
     if (m->model == MAC_MODEL_PLUS) addr &= 0xFFFFFFu;
     else if (m->cpu && (m->cpu->tc & 0x80000000u) && !m->pmmu_in_walk) {
         u8 fc = m68k_is_super(m->cpu) ? 5u : 1u;
-        addr = mac_pmmu_translate(m, addr, fc);
+        addr = mac_pmmu_translate(m, addr, fc, /*is_write=*/true);
     }
     m->writes++;
     if (mac_mmio_log && !mem_ptr(m, addr)) mac_mmio_log(m, addr, v, 1, 1);
@@ -674,8 +674,7 @@ void mac_write32(mac_mem *m, u32 addr, u32 v) {
 /* M7.6a — PMMU translation framework. See mac_mem.h for the full
  * design notes. Currently returns the logical address unchanged in all
  * cases; real PTW is TODO(pmmu-ptw). */
-u32 mac_pmmu_translate(mac_mem *m, u32 logical_addr, u8 fc) {
-    (void)fc;
+u32 mac_pmmu_translate(mac_mem *m, u32 logical_addr, u8 fc, bool is_write) {
     if (m->model != MAC_MODEL_SE30 || !m->cpu) return logical_addr;
     if (m->pmmu_in_walk) return logical_addr;   /* recursion guard */
 
@@ -797,8 +796,27 @@ u32 mac_pmmu_translate(mac_mem *m, u32 logical_addr, u8 fc) {
              *   short-form: address bits are bits 8-31 of desc0
              *               (mask off the DT/U/M low bits with the
              *               page-size mask).
-             *   long-form: full address in desc1 (page-aligned).
+             *   long-form: full address in desc1 (page-aligned). Plus
+             *              status checks against desc0:
+             *                bit 11 = WP (write protect)
+             *                bit 14 = S  (supervisor-only)
              */
+            if (entry_sz == 8u) {
+                bool wp = (desc0 & (1u << 11)) != 0;
+                bool sup_only = (desc0 & (1u << 14)) != 0;
+                if (is_write && wp) {
+                    /* Write to WP page → bus error. */
+                    cpu->bus_error_pending = logical_addr | 0x80000000u;
+                    m->pmmu_in_walk = 0;
+                    return logical_addr;
+                }
+                if (sup_only && !is_supervisor) {
+                    /* User access to supervisor-only page → bus error. */
+                    cpu->bus_error_pending = logical_addr | 0x80000000u;
+                    m->pmmu_in_walk = 0;
+                    return logical_addr;
+                }
+            }
             u32 page_phys;
             if (entry_sz == 8u) {
                 page_phys = desc1 & ~((1u << page_size_bits) - 1u);

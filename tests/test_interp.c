@@ -276,14 +276,14 @@ static int test_pmmu_translate(void) {
     mac_mem_init_ex(&plus, MAC_MODEL_PLUS, 64 * 1024);
     m68k_cpu pcpu;
     m68k_reset(&pcpu, &plus);
-    if (mac_pmmu_translate(&plus, 0x12345678u, 5) != 0x12345678u) {
+    if (mac_pmmu_translate(&plus, 0x12345678u, 5, false) != 0x12345678u) {
         printf("pmmu: Plus translate not pass-through\n"); return 1;
     }
     mac_mem_free(&plus);
 
     /* SE/30 with TC.E = 0 → pass-through. */
     cpu.tc = 0;
-    if (mac_pmmu_translate(&mem, 0x12345678u, 5) != 0x12345678u) {
+    if (mac_pmmu_translate(&mem, 0x12345678u, 5, false) != 0x12345678u) {
         printf("pmmu: TC.E=0 not pass-through\n"); return 1;
     }
 
@@ -291,14 +291,14 @@ static int test_pmmu_translate(void) {
     cpu.tc = 0x80000000u;
     cpu.tt0 = 0;
     cpu.tt1 = 0;
-    if (mac_pmmu_translate(&mem, 0x12345678u, 5) != 0x12345678u) {
+    if (mac_pmmu_translate(&mem, 0x12345678u, 5, false) != 0x12345678u) {
         printf("pmmu: TC.E=1 no-TT path not pass-through\n"); return 1;
     }
 
     /* TT0 enabled covering all FCs (mask=0xF) and LA base 0x12 with mask
      * 0xFF → matches any address starting with 0x12. */
     cpu.tt0 = 0x12FF8000u | 0xFu;  /* LA base 0x12, LA mask 0xFF, E=1, FC mask 0xF */
-    if (mac_pmmu_translate(&mem, 0x12345678u, 5) != 0x12345678u) {
+    if (mac_pmmu_translate(&mem, 0x12345678u, 5, false) != 0x12345678u) {
         printf("pmmu: TT0 match not pass-through\n"); return 1;
     }
     cpu.tt0 = 0;
@@ -323,13 +323,13 @@ static int test_pmmu_translate(void) {
 
     /* Translate LA 0x00000100 (page 0, offset 0x100). Expect phys
      * 0x10000 + 0x100 = 0x10100. */
-    u32 phys = mac_pmmu_translate(&mem, 0x00000100u, 5);   /* fc=5 = supervisor data */
+    u32 phys = mac_pmmu_translate(&mem, 0x00000100u, 5, false);   /* fc=5 = supervisor data */
     if (phys != 0x10100u) {
         printf("pmmu: 1-level PTW LA=0x100 → phys=%08X want 10100\n", phys);
         return 1;
     }
     /* LA 0x00001ABC → page 1 + offset 0xABC → phys 0x20ABC. */
-    phys = mac_pmmu_translate(&mem, 0x00001ABCu, 5);
+    phys = mac_pmmu_translate(&mem, 0x00001ABCu, 5, false);
     if (phys != 0x20ABCu) {
         printf("pmmu: 1-level PTW LA=0x1ABC → phys=%08X want 20ABC\n", phys);
         return 1;
@@ -359,7 +359,7 @@ static int test_pmmu_translate(void) {
     /* LA bits 17-16 = 00 (top idx 0); bits 15-12 = 0101 (mid idx 5);
      * bits 11-0 = 0xABC. So LA = 0x5ABC. Expected phys = 0x50000 | 0xABC
      * = 0x50ABC. */
-    u32 phys2 = mac_pmmu_translate(&mem, 0x5ABCu, 5);
+    u32 phys2 = mac_pmmu_translate(&mem, 0x5ABCu, 5, false);
     if (phys2 != 0x50ABCu) {
         printf("pmmu: 2-level PTW LA=0x5ABC → phys=%08X want 50ABC\n", phys2);
         return 1;
@@ -388,13 +388,13 @@ static int test_pmmu_translate(void) {
     cpu.bus_error_pending = 0;
     /* LA 0x00000080 → page 0 (TIA idx 0, PS=4 → bits 11-0 are offset).
      * Expect phys = 0x00040000 | 0x80 = 0x00040080. */
-    u32 phl = mac_pmmu_translate(&mem, 0x00000080u, 5);
+    u32 phl = mac_pmmu_translate(&mem, 0x00000080u, 5, false);
     if (phl != 0x00040080u) {
         printf("pmmu: long-form 1-level LA=0x80 → phys=%08X want 40080\n", phl);
         return 1;
     }
     /* LA 0x00001234 → page 1, offset 0x234. Expected 0x00080234. */
-    phl = mac_pmmu_translate(&mem, 0x00001234u, 5);
+    phl = mac_pmmu_translate(&mem, 0x00001234u, 5, false);
     if (phl != 0x00080234u) {
         printf("pmmu: long-form 1-level LA=0x1234 → phys=%08X want 80234\n", phl);
         return 1;
@@ -408,16 +408,38 @@ static int test_pmmu_translate(void) {
     cpu.srp = ((u64)table_base << 32) | 2u;
     cpu.bus_error_pending = 0;
     /* LA 0x00002000 → page 2 → invalid descriptor. */
-    u32 ph = mac_pmmu_translate(&mem, 0x00002000u, 5);
+    u32 ph = mac_pmmu_translate(&mem, 0x00002000u, 5, false);
     (void)ph;
     if (cpu.bus_error_pending == 0) {
         printf("pmmu: invalid descriptor did NOT set bus_error_pending\n");
         return 1;
     }
 
+    /* M7.6h — long-form WP (write-protect) check. Mark long-table entry
+     * 2 as WP (word0 bit 11 = 0x800) plus DT=1. Write to that page
+     * should set bus_error_pending; read should NOT. */
+    cpu.tc = 0;
+    mac_write32(&mem, long_table + 2 * 8 + 0, 0x00000801u);   /* DT=1, WP=1 */
+    mac_write32(&mem, long_table + 2 * 8 + 4, 0x000C0000u);   /* page addr */
+    cpu.srp = ((u64)long_table << 32) | 3u;                    /* point back at long-form root */
+    cpu.tc = 0x80000000u | (4u << 20) | (4u << 12);
+    cpu.bus_error_pending = 0;
+    /* Read LA 0x2000 (page 2): should succeed. */
+    u32 ph_r = mac_pmmu_translate(&mem, 0x2000u, 5, false);
+    if (cpu.bus_error_pending != 0 || ph_r != 0xC0000u) {
+        printf("pmmu: WP read should pass — phys=%08X berr=%08X\n",
+               ph_r, cpu.bus_error_pending); return 1;
+    }
+    /* Write to same LA: should set bus_error_pending. */
+    cpu.bus_error_pending = 0;
+    mac_pmmu_translate(&mem, 0x2000u, 5, true);
+    if (cpu.bus_error_pending == 0) {
+        printf("pmmu: WP write should set bus_error_pending\n"); return 1;
+    }
+
     mac_mem_free(&mem);
     (void)cpu; (void)pcpu;
-    printf("  PMMU translate framework OK (short + long form + BERR)\n");
+    printf("  PMMU translate framework OK (short + long form + BERR + WP)\n");
     return 0;
 }
 
