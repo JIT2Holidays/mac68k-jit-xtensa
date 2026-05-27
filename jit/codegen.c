@@ -9180,6 +9180,17 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
 
             sext_memo_invalidate();
             inline_ops++; done = true;
+        } else if (w == 0x51FA || w == 0x51FB || w == 0x51FC) {
+            /* M7.5l — TRAPF (TRAPcc with cc=F). All three opmode variants
+             * never trap; just advance PC + cycles.
+             *   0x51FA: TRAPF.W — length 4 (op + 16-bit operand, ignored)
+             *   0x51FB: TRAPF.L — length 6 (op + 32-bit operand, ignored)
+             *   0x51FC: TRAPF   — length 2 (no operand)
+             * m68k_step base = 4; do_trapcc adds nothing on no-trap path.
+             * Real 030 takes 4-8 cycles for not-taken TRAPcc — we use 4. */
+            int len = (w == 0x51FA) ? 4 : (w == 0x51FB) ? 6 : 2;
+            emit_advance(&e, len, 4);
+            inline_ops++; done = true;
         } else if (top == 0x5 && szf == 3 && mode == 1
                    && (((w >> 8) & 0xF) == 1 || ((w >> 8) & 0xF) == 6
                        || ((w >> 8) & 0xF) == 7)) {
