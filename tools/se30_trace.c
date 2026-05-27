@@ -44,7 +44,7 @@ static struct { u32 pc; u64 n; } hot[HOT_BUCKETS];
 static u32 hot_n;
 
 /* MMIO trace — bucketed by addr. Records read/write counts and last value. */
-#define MMIO_BUCKETS 1024u
+#define MMIO_BUCKETS 16384u
 static struct {
     u32 addr;
     u64 reads, writes;
@@ -167,9 +167,20 @@ int main(int argc, char **argv) {
         hot[best].n = 0;
     }
 
-    /* MMIO access summary — top 30 most-accessed addresses. */
-    fprintf(stderr, "\n[se30_trace] hot MMIO addresses (top 30 by access count):\n");
-    for (int t = 0; t < 30; t++) {
+    /* Total MMIO ops. */
+    {
+        u64 tot_r = 0, tot_w = 0; u32 nbuckets = 0;
+        for (u32 i = 0; i < MMIO_BUCKETS; i++) {
+            tot_r += mmio[i].reads; tot_w += mmio[i].writes;
+            if (mmio[i].reads + mmio[i].writes) nbuckets++;
+        }
+        fprintf(stderr, "\n[se30_trace] MMIO totals: %u unique addrs, %llu reads, %llu writes\n",
+                nbuckets, (unsigned long long)tot_r, (unsigned long long)tot_w);
+    }
+
+    /* MMIO access summary — top 60 most-accessed addresses. */
+    fprintf(stderr, "\n[se30_trace] hot MMIO addresses (top 60 by access count):\n");
+    for (int t = 0; t < 60; t++) {
         u32 best = 0;
         u64 best_n = 0;
         for (u32 i = 0; i < MMIO_BUCKETS; i++) {

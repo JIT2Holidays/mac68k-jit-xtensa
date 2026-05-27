@@ -505,7 +505,13 @@ u8 mac_read8(mac_mem *m, u32 addr) {
     m->reads++;
     u8 *p = mem_ptr(m, addr);
     if (p) return *p;
-    u8 val = 0;
+    /* Default for unmapped reads:
+     *  - Plus: 0 (matches the historical behavior; Plus ROM tolerates it).
+     *  - SE/30: 0xFF (open-bus / pull-up high — what real Mac II hardware
+     *    returns for unmapped addresses, so the SE/30 ROM's hardware-
+     *    detection probes see "no device" instead of a fake all-zero
+     *    response that the probe interprets as a malformed device). */
+    u8 val = (m->model == MAC_MODEL_SE30) ? 0xFFu : 0u;
     int rgn = (m->model == MAC_MODEL_SE30) ? region_of_se30(addr)
                                            : region_of(addr);
     switch (rgn) {
