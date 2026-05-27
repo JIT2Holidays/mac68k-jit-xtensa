@@ -568,10 +568,18 @@ u8 mac_read8(mac_mem *m, u32 addr) {
     u8 val = (m->model == MAC_MODEL_SE30) ? 0xFFu : 0u;
     int rgn = (m->model == MAC_MODEL_SE30) ? region_of_se30(addr)
                                            : region_of(addr);
-    /* SE/30 open-bus reads: return 0xFF (matches minivmac Glue-chip
-     * behavior). The ROM's slot/peripheral probes use magic-value
-     * compares (e.g., CMP.L #$AAAA5555) and BNE branches to detect
-     * "no card" — they do NOT rely on BERR for the empty-slot case. */
+    /* SE/30 open-bus reads: return 0xFF for unmapped MMIO/slots
+     * (matches minivmac Glue-chip behavior — slot probes use magic-value
+     * CMP+BNE, not BERR). HOWEVER, reads above RAM end but below the
+     * MMIO range (0x40000000) are PHYSICAL OPEN BUS and SHOULD BERR —
+     * the ROM's RAM-size probe at 0x40803944 marches A0 through powers
+     * of 2 expecting BERR when off-RAM. Without BERR there, garbage
+     * reads cause the probe to fail with D6=0xB6DB6DB6, dumping us into
+     * the Macsbug error-handler/parser stall. */
+    if (m->model == MAC_MODEL_SE30 && rgn == RGN_NONE && m->cpu
+        && addr < 0x40000000u && addr >= m->ram_size) {
+        m->cpu->bus_error_pending = addr | 0x80000000u;
+    }
     switch (rgn) {
         case RGN_VIA:    val = via_read(m, addr);  break;
         case RGN_VIA2:   val = via2_read(m, &m->via2, addr); break;
@@ -634,9 +642,14 @@ void mac_write8(mac_mem *m, u32 addr, u8 v) {
     }
     int rgn = (m->model == MAC_MODEL_SE30) ? region_of_se30(addr)
                                            : region_of(addr);
-    /* SE/30: unmapped writes are silently dropped (open-bus). Matches
-     * minivmac Glue chip — does NOT raise BERR for empty NuBus slots or
-     * other unmapped regions. The ROM doesn't rely on BERR-on-write. */
+    /* SE/30: unmapped MMIO/slot writes silently dropped. Out-of-RAM
+     * writes in the < 0x40000000 range BERR (mirrors the read path —
+     * ROM's RAM-size probe writes patterns then reads them back, and
+     * expects BERR for both halves when past RAM). */
+    if (m->model == MAC_MODEL_SE30 && rgn == RGN_NONE && m->cpu
+        && addr < 0x40000000u && addr >= m->ram_size) {
+        m->cpu->bus_error_pending = addr | 0x80000000u;
+    }
     switch (rgn) {
         case RGN_VIA:    via_write(m, addr, v);  return;
         case RGN_VIA2:   via2_write(m, &m->via2, addr, v); return;
