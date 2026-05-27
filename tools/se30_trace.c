@@ -363,6 +363,12 @@ int main(int argc, char **argv) {
             fprintf(stderr, "\n");
         }
     }
+    /* Dump RAM at specific low-memory globals used by boot. */
+    fprintf(stderr, "[se30_trace] RAM[0x120]=%02X RAM[0x1C00..0x1C04]=%02X%02X%02X%02X "
+            "RAM[0xCC0..0xCC4]=%02X%02X%02X%02X\n",
+            mem.ram[0x120],
+            mem.ram[0x1C00], mem.ram[0x1C01], mem.ram[0x1C02], mem.ram[0x1C03],
+            mem.ram[0xCC0], mem.ram[0xCC1], mem.ram[0xCC2], mem.ram[0xCC3]);
     /* Dump vector table (first 0x40 bytes = 16 vectors). */
     fprintf(stderr, "[se30_trace] vectors RAM[0..0x40]:");
     for (int i = 0; i < 0x40; i += 4) {
