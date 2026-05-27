@@ -46,6 +46,11 @@ add_executable(mac68k_host port/host/main.c)
 target_include_directories(mac68k_host PRIVATE gui)
 target_link_libraries(mac68k_host PRIVATE mac68k_jit)
 
+# SE/30 boot tracer (interp-only, no JIT). Single-file driver. Linking
+# mac68k_core directly avoids picking up the JIT bridge.
+add_executable(se30_trace tools/se30_trace.c)
+target_link_libraries(se30_trace PRIVATE mac68k_core)
+
 enable_testing()
 add_subdirectory(tests)
 
