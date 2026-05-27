@@ -78,6 +78,14 @@ static void note_mmio(u32 addr, u32 val, int is_write, int size, u64 cyc) {
 
 /* Global pointer to active mac_mem so the mmio_log callback can read cycles. */
 static struct m68k_cpu *g_cpu;
+
+/* Optional SCC TX logging — enabled by SE30_LOG_TX=1 env var. */
+static void scc_tx_log_cb(void *c, int ch, u8 b) {
+    (void)c;
+    char ascii = (b >= 0x20 && b < 0x7F) ? (char)b : '.';
+    fprintf(stderr, "[scc-tx ch%d cyc=%llu] 0x%02X '%c'\n",
+            ch, (unsigned long long)(g_cpu ? g_cpu->cycles : 0), b, ascii);
+}
 static void mmio_log_cb(mac_mem *m, u32 addr, u32 val, int is_write, int size) {
     (void)m;
     note_mmio(addr, val, is_write, size, g_cpu ? g_cpu->cycles : 0);
@@ -158,6 +166,14 @@ int main(int argc, char **argv) {
     m68k_reset(&cpu, &mem);
     g_cpu = &cpu;
     mac_mmio_log = mmio_log_cb;
+
+    /* SE30_LOG_TX=1 — log every SCC TX byte. Helps identify what the ROM
+     * is trying to say over the serial port (e.g., Macsbug-probe init
+     * sequences). */
+    if (getenv("SE30_LOG_TX")) {
+        mem.scc.tx_ctx = NULL;
+        mem.scc.tx_sink = scc_tx_log_cb;
+    }
     fprintf(stderr, "[se30_trace] reset PC=0x%08X SSP=0x%08X SR=0x%04X\n",
             cpu.pc, cpu.a[7], cpu.sr);
 
