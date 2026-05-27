@@ -352,6 +352,53 @@ int main(void) {
         rc |= bad;
     }
 
+    /* M7.5m — BFEXTU Dn{off:wid},Dm native inline arm lockstep.
+     * Specifically exercises the new register-source/static-off/wid
+     * codegen path: MOVE.L #0xABCD1234, D0 ; BFEXTU D0{4:8}, D1 ; STOP.
+     * Expected: D1 = 0xBC, N=1, Z=0. */
+    {
+        mac_mem mi, mj;
+        mac_mem_init_ex(&mi, MAC_MODEL_SE30, 64 * 1024);
+        mac_mem_init_ex(&mj, MAC_MODEL_SE30, 64 * 1024);
+        u8 prog[16];
+        memset(prog, 0, sizeof prog);
+        m68a aa;
+        m68a_init(&aa, prog, sizeof prog, 0);
+        m68a_w32(&aa, 0x00010000);
+        m68a_w32(&aa, 0x00000100);
+        m68a_finish(&aa);
+        mac_load_ram_image(&mi, 0, prog, 8);
+        mac_load_ram_image(&mj, 0, prog, 8);
+        u16 code[] = {
+            0x203C, 0xABCD, 0x1234,           /* MOVE.L #0xABCD1234, D0 */
+            0xE9C0, (u16)((1 << 12) | (4 << 6) | 8), /* BFEXTU D0{4:8}, D1 */
+            0x4E72, 0x2700,                   /* STOP */
+        };
+        for (size_t i = 0; i < sizeof code / sizeof code[0]; i++) {
+            mac_write16(&mi, 0x100u + (u32)(i * 2), code[i]);
+            mac_write16(&mj, 0x100u + (u32)(i * 2), code[i]);
+        }
+        m68k_cpu ci, cj;
+        m68k_reset(&ci, &mi);
+        m68k_reset(&cj, &mj);
+        m68k_run_until(&ci, 100000);
+        m68k_dispatcher d;
+        m68k_dispatcher_init(&d, &cj);
+        m68k_dispatcher_run_until(&d, 100000);
+        int bad = diff_state("se30-bfextu-dn", &ci, &cj);
+        if (!bad) {
+            if (ci.d[1] != 0xBC) {
+                printf("  se30-bfextu-dn: D1=%08X want BC\n", ci.d[1]); bad = 1;
+            } else {
+                printf("  se30-bfextu-dn: match — D1=0xBC (Dn-source BFEXTU)\n");
+            }
+        }
+        m68k_dispatcher_shutdown(&d);
+        mac_mem_free(&mi);
+        mac_mem_free(&mj);
+        rc |= bad;
+    }
+
     /* M7.5h — CINV/CPUSH native inline arm lockstep. CINV BC,(A0) +
      * CPUSH BC,(A1) — both no-ops in our model. */
     {

@@ -11626,6 +11626,57 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + joo_pos + 2] = (u8)(jw_oo >> 16);
 
             inline_ops++; done = true;
+        } else if ((w & 0xFFF8) == 0xE9C0) {
+            /* M7.5m — BFEXTU Dn{off:wid}, Dm (68020+).
+             * Mask 0xFFF8 == 0xE9C0 isolates: bits 15-8 = 11101001
+             * (BFEXTU sub-op 001 in bits 10-8) + bits 7-3 = 11000
+             * (bits 7-6 = 11 always for bitfield, mode = 000 = Dn).
+             * The reg field (bits 2-0) is Dn source.
+             *
+             * Only handles static offset (ext bit 11 = 0) and static
+             * width (ext bit 5 = 0). Dynamic offset/width fall through
+             * to the m68k_step bridge.
+             *
+             * Semantics: extract `wid` bits starting at bit-offset `off`
+             * from the MSB of Dn (zero-extended). Width 0 means 32.
+             * For Xtensa codegen we use shift-left-then-shift-right:
+             *   a8 = (src << off) >>logical (32 - wid)
+             *
+             * Flags: N = bit (wid-1) of field, Z = (field == 0), V=C=0,
+             * X preserved. We compute N/Z by shifting the field to MSB
+             * (so emit_logic_flags' bit-31 test gives the right N).
+             *
+             * Length 4 (op + ext), cycles 10 (m68k_step base 4 +
+             * do_bitfield register-source 6). */
+            u16 ext = mac_read16(cpu->mem, op_pc[i] + 2);
+            bool dyn_off = (ext >> 11) & 1;
+            bool dyn_wid = (ext >> 5) & 1;
+            if (!dyn_off && !dyn_wid) {
+                int src_dn = w & 7;
+                int dst_dn = (ext >> 12) & 7;
+                int off = (ext >> 6) & 0x1F;
+                int wid = ext & 0x1F;
+                if (wid == 0) wid = 32;
+
+                emit_read_g(&e, &rc, G_D(src_dn), 8);
+                if (!(wid == 32 && off == 0)) {
+                    if (off > 0) xt_slli(&e, 8, 8, off);
+                    if (wid < 32) xt_srli(&e, 8, 8, (u8)(32 - wid));
+                }
+                emit_write_g(&e, &rc, G_D(dst_dn), 8);
+
+                if (!flags_dead[i]) {
+                    if (wid < 32) {
+                        xt_slli(&e, 9, 8, (u8)(32 - wid));
+                        emit_logic_flags(&e, 9);
+                    } else {
+                        emit_logic_flags(&e, 8);
+                    }
+                }
+                emit_advance(&e, 4, 10);
+                inline_ops++; done = true;
+            }
+            /* else (dynamic offset or width): fall through to bridge. */
         } else if (top == 0xE && !((w >> 8) & 1)
                    && ((w >> 6) & 3) == 2
                    && !((w >> 5) & 1)
