@@ -468,9 +468,29 @@ static int test_pmmu_translate(void) {
         return 1;
     }
 
+    /* M7.6j — TC.IS (initial shift). Re-use short-form entry 3 from the
+     * U/M test (table_base+12 → 0x000D0000 + DT=1). Set IS=8: 24-bit
+     * mode. LA 0x00003010 walks fine. LA 0x01003010 has top byte set
+     * → LA out-of-range → bus error. */
+    cpu.tc = 0;
+    cpu.srp = ((u64)table_base << 32) | 2u;
+    cpu.tc = 0x80000000u | (4u << 20) | (8u << 16) | (4u << 12);
+    cpu.bus_error_pending = 0;
+    u32 ph_is_ok = mac_pmmu_translate(&mem, 0x00003010u, 5, false);
+    if (cpu.bus_error_pending != 0 ||
+        (ph_is_ok & ~0xFFu) != 0x000D0000u) {
+        printf("pmmu: IS=8 in-range phys=%08X berr=%08X\n",
+               ph_is_ok, cpu.bus_error_pending); return 1;
+    }
+    cpu.bus_error_pending = 0;
+    mac_pmmu_translate(&mem, 0x01003010u, 5, false);
+    if (cpu.bus_error_pending == 0) {
+        printf("pmmu: IS=8 out-of-range did not BERR\n"); return 1;
+    }
+
     mac_mem_free(&mem);
     (void)cpu; (void)pcpu;
-    printf("  PMMU translate framework OK (short + long + BERR + WP + U/M)\n");
+    printf("  PMMU translate framework OK (short + long + BERR + WP + U/M + IS)\n");
     return 0;
 }
 

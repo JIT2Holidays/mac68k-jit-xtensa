@@ -741,10 +741,23 @@ u32 mac_pmmu_translate(mac_mem *m, u32 logical_addr, u8 fc, bool is_write) {
         (int)((cpu->tc >> 0)  & 0xF),   /* TID */
     };
     int ps = (cpu->tc >> 20) & 0xF;     /* page size = 2^(8+ps) */
+    int is = (cpu->tc >> 16) & 0xF;     /* initial shift: top IS bits of LA ignored */
 
     if (level_bits[0] == 0) return logical_addr; /* no levels configured */
 
     u32 page_size_bits = (u32)(8 + ps);
+
+    /* M7.6j — TC.IS enforcement. If IS > 0, the top IS bits of LA must
+     * be zero (the walker effectively addresses only 32-IS bits of the
+     * logical space). A nonzero top-IS field is an LA-out-of-range
+     * bus error. */
+    if (is > 0) {
+        u32 is_mask = ~((1u << (32 - is)) - 1u);
+        if ((logical_addr & is_mask) != 0) {
+            cpu->bus_error_pending = logical_addr | 0x80000000u;
+            return logical_addr;
+        }
+    }
     /* Build the bit position from which each level's index is extracted.
      * Start at the bit just above the page-offset field, and consume
      * level_bits[i] bits per level moving DOWN. */
