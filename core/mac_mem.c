@@ -71,7 +71,11 @@ void mac_mem_init_ex(mac_mem *m, mac_machine_t model, u32 ram_size) {
          * vmac's VIA2_ORA defaults to 0 (latched), so bits 6-7 = 00 →
          * table idx 0 → A2 = 0x0100FFFF (16MB max). Init to 0 to match. */
         m->via2.ora = 0x00;
-        m->via2.orb = 0xFF;
+        /* VIA2 ORB: vmac defaults all wires to 0. Bit 3 (PB3) is the
+         * Addr32 toggle — 0 = 24-bit mode (default), 1 = 32-bit mode.
+         * Bit 2 = power-off signal. Init to 0 to match vmac, so boot
+         * starts in 24-bit mode. */
+        m->via2.orb = 0x00;
         /* Power-on: VIA1 IFR bit 5 (T2) is undefined on real hardware,
          * but the Mac SE/30 ROM expects it to be SET early in boot —
          * the routine at 0x40803474 only arms T2 (sets T2C-H) if it
