@@ -1826,12 +1826,36 @@ static void do_pmmu(m68k_cpu *cpu, u16 op, u32 op_pc) {
         cpu->cycles += 8;
         return;
     }
-    /* PFLUSH / PLOAD / PTEST — accept and advance. ext bits identify the
-     * exact form but for stubs we just need to NOT raise an exception. */
-    if ((ext & 0xE000) == 0x2000 || (ext & 0xE000) == 0x0000
-        || (ext & 0xE000) == 0x8000) {
-        /* Some forms have an <ea>; decode if mode != reg-direct to consume
-         * any extension words. */
+    /* PTEST (ext bits 15-13 = 100): walk the page table for the LA in
+     * <ea> and populate MMUSR. Ext bit 9 = R/W (1 = read, 0 = write).
+     * Ext bits 12-10 = function code (we extract supervisor from FC&4).
+     * The walk should NOT actually raise a bus error — save/restore
+     * cpu->bus_error_pending around the call and reflect status in
+     * MMUSR bit 11 (I = invalid) on BERR, bit 12 (W = write-protected
+     * — set on the WP path), bit 13 (S = supervisor violation). */
+    if ((ext & 0xE000) == 0x8000) {
+        ea_t e = ea_decode(cpu, mode, reg, 4);
+        u32 la = (e.kind == EA_MEM) ? e.addr : 0;
+        bool rw = (ext & (1u << 9)) != 0;     /* 1 = read */
+        u8 fc = (u8)((ext >> 10) & 7);
+        u32 saved_berr = cpu->bus_error_pending;
+        cpu->bus_error_pending = 0;
+        u32 phys = mac_pmmu_translate(cpu->mem, la, fc, !rw);
+        u16 msr = 0;
+        if (cpu->bus_error_pending != 0) msr |= (1u << 11);   /* I */
+        /* The walker doesn't distinguish WP vs S vs invalid in its
+         * BERR token, so we can't separate W/S bits without re-running.
+         * For now report Invalid for any BERR — refinement in a later
+         * milestone. Set Modified if the walk succeeded and the leaf
+         * had M=1 (already set by the walker on write). */
+        (void)phys;
+        cpu->mmusr = msr;
+        cpu->bus_error_pending = saved_berr;   /* PTEST must not raise BERR */
+        cpu->cycles += 8;
+        return;
+    }
+    /* PFLUSH / PLOAD — accept and advance. */
+    if ((ext & 0xE000) == 0x2000 || (ext & 0xE000) == 0x0000) {
         if (mode > 1) ea_decode(cpu, mode, reg, 4);
         cpu->cycles += 8;
         return;
