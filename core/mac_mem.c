@@ -13,6 +13,7 @@
 #include "sony.h"
 #include "mac_input.h"
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 
 void (*mac_mmio_log)(mac_mem *m, u32 addr, u32 val, int is_write, int size);
@@ -1009,7 +1010,9 @@ void mac_mem_tick(mac_mem *m, u64 cycles) {
      * T1 is the system 60Hz tick which auto-reloads in continuous
      * mode. Both timers running is the normal post-boot state. */
     if (m->model == MAC_MODEL_SE30) {
+        u8 old_ifr = v->ifr;
         v->ifr |= VIA_IRQ_T2 | VIA_IRQ_T1;
+        if (v->ifr != old_ifr) irq_changed = true;
     }
 
     /* Vertical-blank edge -> VIA CA1, ~60 Hz. Also paces the .Sony
