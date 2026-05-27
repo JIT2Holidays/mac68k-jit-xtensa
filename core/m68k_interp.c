@@ -2074,6 +2074,12 @@ bool m68k_jit_can_inline_020(u16 op) {
     return false;
 }
 
+/* Debug hook: pc of the currently-executing instruction. Used by debug
+ * instrumentation in mac_write8 to report the actual writer's pc
+ * rather than the in-flight cpu->pc (which has been advanced by
+ * fetch16 calls for operand words). */
+u32 m68k_dbg_op_pc = 0;
+
 void m68k_step(m68k_cpu *cpu) {
     /* Once the CPU has halted (e.g. the guest wrote the debug exit port),
      * further steps are no-ops. This keeps a JIT block — which may contain
@@ -2082,6 +2088,7 @@ void m68k_step(m68k_cpu *cpu) {
     if (cpu->halted) return;
     cpu->instrs++;
     u32 op_pc = cpu->pc;
+    m68k_dbg_op_pc = op_pc;
     u16 op = fetch16(cpu);
 #ifdef JIT_HELPER_HISTO
     if (m68k_helper_histo[op] == 0) m68k_helper_first_pc[op] = op_pc;
