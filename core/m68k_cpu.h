@@ -70,11 +70,14 @@ typedef struct m68k_cpu {
      * cleanly. */
     u32 msp, isp;
 
-    /* TODO(pmmu): register stub only — the SE/30's 68030 has an on-chip
-     * PMMU. We accept PMOVE writes (so the SE/30 ROM doesn't fault) but
-     * do NOT actually translate addresses. PFLUSH / PLOAD / PTEST are
-     * no-ops. System 7 boots in 24-bit mode where the MMU is transparent;
-     * 32-bit mode / Virtual Memory will need full PTW. */
+    /* SE/30 68030 PMMU registers. M7.6 implementation status:
+     *   PMOVE TC/SRP/CRP/TT0/TT1/MMUSR: implemented (interp do_pmmu).
+     *   PTEST: walks the page table and demuxes cause into MMUSR
+     *     W/S/I bits per the M7.6l BERR_CAUSE_* encoding.
+     *   PFLUSH/PLOAD: accept-and-advance stubs (no TLB to flush).
+     *   Address translation: full multi-level walk with WP/S/IS/U/M
+     *     enforcement (M7.6g-p). Format-A BERR frame with fault
+     *     address at SP+0x0E (M7.6r). */
     u64 srp, crp;          /* supervisor / CPU root pointers */
     u32 tc;                /* translation control register   */
     u32 tt0, tt1;          /* transparent translation 0 / 1  */

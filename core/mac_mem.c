@@ -701,9 +701,11 @@ void mac_write32(mac_mem *m, u32 addr, u32 v) {
 
 /* --- periodic peripheral tick ----------------------------------------- */
 
-/* M7.6a — PMMU translation framework. See mac_mem.h for the full
- * design notes. Currently returns the logical address unchanged in all
- * cases; real PTW is TODO(pmmu-ptw). */
+/* M7.6a + M7.6g-p — PMMU translation. Full multi-level walk with TT0/TT1
+ * transparent translation, short + long form descriptors, WP / S
+ * (supervisor-only) / IS (initial-shift) / U (used) / M (modified) bit
+ * enforcement, and BERR cause encoding for PTEST → MMUSR demux. See
+ * mac_mem.h for the full design notes. */
 u32 mac_pmmu_translate(mac_mem *m, u32 logical_addr, u8 fc, bool is_write) {
     if (m->model != MAC_MODEL_SE30 || !m->cpu) return logical_addr;
     if (m->pmmu_in_walk) return logical_addr;   /* recursion guard */

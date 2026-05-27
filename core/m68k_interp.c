@@ -1314,15 +1314,11 @@ void m68k_jit_move_l_postinc_to_dn_mmio(m68k_cpu *cpu) {
  *   bounds        CHK2 / CMP2
  *   compare-swap  CAS / CAS2 (non-atomic — the guest is single-core)
  *   bcd packing   PACK / UNPK
- *   PMMU stubs    PMOVE TC/SRP/CRP/TT0/TT1/MMUSR (register-only; no translation)
- *                 PFLUSH / PLOAD / PTEST — no-op advance
- *   cache         CINV / CPUSH — no-op advance
- *
- * TODO(pmmu): full page-table walk + address translation. This milestone
- * accepts PMOVE writes so the SE/30 ROM doesn't fault during init, but
- * mac_read/write still go through the flat physical address. System 7
- * boots in 24-bit mode where the MMU is transparent; 32-bit Mode / Virtual
- * Memory will need full PTW. */
+ *   PMMU          PMOVE TC/SRP/CRP/TT0/TT1/MMUSR + PTEST → MMUSR demux
+ *                 PFLUSH / PLOAD — accept-and-advance (no TLB)
+ *                 Full multi-level walk: short + long form, TT0/TT1,
+ *                 WP/S/IS/U/M enforcement (M7.6g-p)
+ *   cache         CINV / CPUSH — no-op advance */
 
 static bool is_priv_violation_if_user(m68k_cpu *cpu, u32 op_pc) {
     if (!m68k_is_super(cpu)) {
@@ -1840,10 +1836,11 @@ static void do_unpk(m68k_cpu *cpu, u16 op, u32 op_pc) {
 
 /* ---- PMMU + coprocessor (line F) ------------------------------------- */
 
-/* TODO(pmmu): The PMMU instructions here are register stubs only. PMOVE
- * writes the cpu->tc/srp/crp/tt0/tt1/mmusr fields so the SE/30 ROM's
- * MMU-init sequence doesn't fault, but mac_read/write still use flat
- * physical addresses. PFLUSH / PLOAD / PTEST are no-ops. */
+/* PMMU instructions. PMOVE writes/reads the cpu->tc/srp/crp/tt0/tt1/mmusr
+ * registers. PTEST walks the page table and demuxes BERR cause into
+ * MMUSR W/S/I bits. PFLUSH/PLOAD are accept-and-advance (no TLB to
+ * flush in this model). Full translation lives in mac_pmmu_translate
+ * — see core/mac_mem.c (M7.6g-p milestones). */
 static void do_pmmu(m68k_cpu *cpu, u16 op, u32 op_pc) {
     if (is_priv_violation_if_user(cpu, op_pc)) return;
     u16 ext = fetch16(cpu);
