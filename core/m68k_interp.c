@@ -2928,5 +2928,13 @@ void m68k_run_until(m68k_cpu *cpu, u64 until) {
             continue;
         }
         m68k_step(cpu);
+        /* SE/30 deferred bus error — mac_read / mac_write set this when
+         * an unmapped address is touched, so the ROM's BERR-recovery
+         * mechanism (handler at vec 2 checks D7 bit 27, jumps via A6)
+         * fires after the offending instruction. */
+        if (cpu->bus_error_pending) {
+            cpu->bus_error_pending = 0;
+            m68k_exception(cpu, 2);
+        }
     }
 }

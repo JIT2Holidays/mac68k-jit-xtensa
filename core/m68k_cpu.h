@@ -80,6 +80,17 @@ typedef struct m68k_cpu {
     u32 tt0, tt1;          /* transparent translation 0 / 1  */
     u16 mmusr;             /* MMU status register            */
 
+    /* Deferred-bus-error indicator. When mac_read or mac_write on SE/30
+     * touches an unmapped address it sets this to the faulting address
+     * (with the high bit OR'd in for non-zero); the run loop and
+     * m68k_step pick it up after the current instruction and raise
+     * vector 2. The SE/30 ROM uses BERR as a hardware-probe mechanism:
+     * it sets bit 27 of D7 + a recovery handler in A6, then accesses
+     * memory; on BERR the handler at vector 2 jumps via A6. Without
+     * this the ROM cannot detect which chips are present and loops
+     * forever waiting on signals from un-modeled hardware. */
+    u32 bus_error_pending;
+
     /* Scratch slot used by a JIT block to stash its CALL0 return address
      * without modifying a1 (see jit/dispatcher.c — same trick as gbjit). */
     u32 jit_ret_pc;

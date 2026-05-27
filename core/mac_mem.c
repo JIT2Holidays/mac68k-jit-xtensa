@@ -514,6 +514,12 @@ u8 mac_read8(mac_mem *m, u32 addr) {
     u8 val = (m->model == MAC_MODEL_SE30) ? 0xFFu : 0u;
     int rgn = (m->model == MAC_MODEL_SE30) ? region_of_se30(addr)
                                            : region_of(addr);
+    /* SE/30 BERR: unmapped reads (no region) raise a bus error after
+     * the current instruction. The ROM uses BERR as a hardware-probe
+     * recovery mechanism — see m68k_cpu.bus_error_pending. */
+    if (m->model == MAC_MODEL_SE30 && rgn == RGN_NONE && m->cpu) {
+        m->cpu->bus_error_pending = addr | 0x80000000u;
+    }
     switch (rgn) {
         case RGN_VIA:    val = via_read(m, addr);  break;
         case RGN_VIA2:   val = via2_read(m, &m->via2, addr); break;
@@ -572,6 +578,10 @@ void mac_write8(mac_mem *m, u32 addr, u8 v) {
     }
     int rgn = (m->model == MAC_MODEL_SE30) ? region_of_se30(addr)
                                            : region_of(addr);
+    /* SE/30 BERR on unmapped write — same mechanism as the read path. */
+    if (m->model == MAC_MODEL_SE30 && rgn == RGN_NONE && m->cpu) {
+        m->cpu->bus_error_pending = addr | 0x80000000u;
+    }
     switch (rgn) {
         case RGN_VIA:    via_write(m, addr, v);  return;
         case RGN_VIA2:   via2_write(m, &m->via2, addr, v); return;
