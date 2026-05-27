@@ -726,7 +726,13 @@ void m68k_dispatcher_run_until(m68k_dispatcher *d, u64 until) {
             d->chain_misses++;
             if (d->arena_resets != resets_before ||
                 d->smc_invalidations != inv_before) prev = NULL;
-            if (prev && !d->no_cache) {
+            /* M6.267 — env gate: MAC68K_NO_JIT_CHAIN disables block chaining
+             * so every block dispatch goes through the IRQ poll loop. Matches
+             * interp's per-instr IRQ-poll cadence. Useful for diagnosing
+             * JIT-vs-interp boot path divergence. */
+            extern char *getenv(const char *);
+            bool no_chain = getenv("MAC68K_NO_JIT_CHAIN") != NULL;
+            if (prev && !d->no_cache && !no_chain) {
                 prev->predicted_next = b;
                 prev->predicted_next_pc = pc;
                 /* M6.62 / M6.82 — pick the chain JX target along three tiers:
