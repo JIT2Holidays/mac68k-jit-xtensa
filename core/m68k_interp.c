@@ -399,11 +399,41 @@ void m68k_exception(m68k_cpu *cpu, u32 vector) {
     cpu->sr |= SR_S;            /* enter supervisor */
     cpu->sr &= (u16)~SR_T;      /* clear trace */
     m68k_sync_sp(cpu, was_super);
-    /* Push the short (group 1/2) exception frame: PC then SR. */
-    cpu->a[7] -= 4;
-    mac_write32(cpu->mem, cpu->a[7], cpu->pc);
-    cpu->a[7] -= 2;
-    mac_write16(cpu->mem, cpu->a[7], saved_sr);
+
+    bool is_030 = (cpu->mem && cpu->mem->model == MAC_MODEL_SE30);
+    if (is_030 && vector == 2) {
+        /* M7.6r — Format-A short bus error stack frame (16 words = 32 bytes)
+         * per 68030 manual Figure 6-6. Only the SR / PC / format-vector /
+         * fault address fields are populated; the SSW + pipe + cycle-info
+         * fields stay zero. The SE/30 ROM's BERR handler reads the format
+         * word at SP+6 to decide frame size, and the fault address at
+         * SP+0x0E to know which probe failed. */
+        cpu->a[7] -= 32;
+        u32 sp = cpu->a[7];
+        mac_write16(cpu->mem, sp + 0x00, saved_sr);
+        mac_write32(cpu->mem, sp + 0x02, cpu->pc);
+        mac_write16(cpu->mem, sp + 0x06, (u16)(0xA000u | (vector * 4u)));
+        mac_write16(cpu->mem, sp + 0x08, 0);                /* SSW */
+        mac_write16(cpu->mem, sp + 0x0A, 0);                /* pipe C */
+        mac_write16(cpu->mem, sp + 0x0C, 0);                /* pipe B */
+        mac_write32(cpu->mem, sp + 0x0E, cpu->fault_addr);  /* fault LA */
+        mac_write32(cpu->mem, sp + 0x12, 0);                /* cycle 1 IB */
+        mac_write32(cpu->mem, sp + 0x16, 0);                /* cycle 2 IB */
+        mac_write32(cpu->mem, sp + 0x1A, 0);                /* cycle 3 IB */
+    } else if (is_030) {
+        /* Format-0 short frame: SR / PC / format-vector (8 bytes total). */
+        cpu->a[7] -= 8;
+        u32 sp = cpu->a[7];
+        mac_write16(cpu->mem, sp + 0, saved_sr);
+        mac_write32(cpu->mem, sp + 2, cpu->pc);
+        mac_write16(cpu->mem, sp + 6, (u16)(vector * 4u));
+    } else {
+        /* Plus / 68000 short frame: SR + PC (6 bytes), no format word. */
+        cpu->a[7] -= 4;
+        mac_write32(cpu->mem, cpu->a[7], cpu->pc);
+        cpu->a[7] -= 2;
+        mac_write16(cpu->mem, cpu->a[7], saved_sr);
+    }
     /* 68010+ vector table is relocatable via VBR; for the 68000 (Plus mode)
      * VBR is always 0, so this is bit-for-bit identical to the historical
      * `mac_read32(cpu->mem, vector * 4u)`. */
@@ -423,12 +453,23 @@ bool m68k_poll_interrupts(m68k_cpu *cpu) {
     cpu->sr &= (u16)~SR_T;
     cpu->sr = (u16)((cpu->sr & ~SR_IMASK) | (level << 8));
     m68k_sync_sp(cpu, was_super);
-    cpu->a[7] -= 4;
-    mac_write32(cpu->mem, cpu->a[7], cpu->pc);
-    cpu->a[7] -= 2;
-    mac_write16(cpu->mem, cpu->a[7], saved_sr);
+
+    u32 vector = 24u + level;
+    if (cpu->mem && cpu->mem->model == MAC_MODEL_SE30) {
+        /* M7.6r — Format-0 8-byte short frame for interrupts on 030. */
+        cpu->a[7] -= 8;
+        u32 sp = cpu->a[7];
+        mac_write16(cpu->mem, sp + 0, saved_sr);
+        mac_write32(cpu->mem, sp + 2, cpu->pc);
+        mac_write16(cpu->mem, sp + 6, (u16)(vector * 4u));
+    } else {
+        cpu->a[7] -= 4;
+        mac_write32(cpu->mem, cpu->a[7], cpu->pc);
+        cpu->a[7] -= 2;
+        mac_write16(cpu->mem, cpu->a[7], saved_sr);
+    }
     /* Autovector: level n -> vector 24+n. Relocated through VBR on 68010+. */
-    cpu->pc = mac_read32(cpu->mem, cpu->vbr + (24u + level) * 4u);
+    cpu->pc = mac_read32(cpu->mem, cpu->vbr + vector * 4u);
     cpu->stopped = 0;
     cpu->cycles += 44;
     return true;
@@ -814,7 +855,14 @@ void m68k_jit_rte(m68k_cpu *cpu) {
     u32 a7 = cpu->a[7];
     u16 sr = mac_read16(cpu->mem, a7);
     u32 pc = mac_read32(cpu->mem, a7 + 2);
-    cpu->a[7] = a7 + 6;
+    /* M7.6r — pop frame size based on format word (030 only). */
+    u32 frame_size = 6;
+    if (cpu->mem && cpu->mem->model == MAC_MODEL_SE30) {
+        u16 fmt_vec = mac_read16(cpu->mem, a7 + 6);
+        u32 fmt = (fmt_vec >> 12) & 0xFu;
+        frame_size = (fmt == 0xA) ? 32u : 8u;
+    }
+    cpu->a[7] = a7 + frame_size;
     cpu->sr = sr;
     cpu->pc = pc;
     m68k_sync_sp(cpu, was);
@@ -1847,9 +1895,13 @@ static void do_pmmu(m68k_cpu *cpu, u16 op, u32 op_pc) {
             switch (cause) {
                 case BERR_CAUSE_WP:      msr |= (1u << 12); break;   /* W */
                 case BERR_CAUSE_SUPER:   msr |= (1u << 13); break;   /* S */
-                case BERR_CAUSE_OOR:                                  /* limit-equiv */
-                case BERR_CAUSE_INVALID:
-                default:                 msr |= (1u << 11); break;   /* I */
+                case BERR_CAUSE_INVALID: msr |= (1u << 11); break;   /* I */
+                case BERR_CAUSE_OOR:     msr |= (1u << 11); break;   /* I (limit-equiv) */
+                /* CAUSE_GENERIC originates from non-PMMU code (unmapped MMIO
+                 * read/write at the leaf accessors). Inside a walk it means
+                 * the descriptor read itself faulted — MMUSR bit 15 = B. */
+                case BERR_CAUSE_GENERIC:
+                default:                 msr |= (1u << 15); break;   /* B */
             }
         }
         (void)phys;
@@ -2153,8 +2205,18 @@ void m68k_step(m68k_cpu *cpu) {
         }
         if (op == 0x4E73) {                                  /* RTE */
             bool was = m68k_is_super(cpu);
-            u16 sr = mac_read16(cpu->mem, cpu->a[7]); cpu->a[7] += 2;
-            u32 pc = mac_read32(cpu->mem, cpu->a[7]); cpu->a[7] += 4;
+            u16 sr = mac_read16(cpu->mem, cpu->a[7]);
+            u32 pc = mac_read32(cpu->mem, cpu->a[7] + 2);
+            /* M7.6r — 030 frame size depends on format word at SP+6.
+             * Plus pops 6 bytes (no format word); 030 format-0 pops 8;
+             * 030 format-A pops 32. */
+            u32 frame_size = 6;
+            if (cpu->mem && cpu->mem->model == MAC_MODEL_SE30) {
+                u16 fmt_vec = mac_read16(cpu->mem, cpu->a[7] + 6);
+                u32 fmt = (fmt_vec >> 12) & 0xFu;
+                frame_size = (fmt == 0xA) ? 32u : 8u;
+            }
+            cpu->a[7] += frame_size;
             cpu->sr = sr; cpu->pc = pc;
             m68k_sync_sp(cpu, was);
             return;
@@ -3116,6 +3178,7 @@ void m68k_run_until(m68k_cpu *cpu, u64 until) {
          * mechanism (handler at vec 2 checks D7 bit 27, jumps via A6)
          * fires after the offending instruction. */
         if (cpu->bus_error_pending) {
+            cpu->fault_addr = cpu->bus_error_pending & 0x0FFFFFFFu;
             cpu->bus_error_pending = 0;
             m68k_exception(cpu, 2);
         }

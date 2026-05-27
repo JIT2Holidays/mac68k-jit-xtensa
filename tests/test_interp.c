@@ -593,10 +593,118 @@ static int test_pmmu_translate(void) {
                    cpu.mmusr); return 1;
         }
     }
-
     mac_mem_free(&mem);
     (void)cpu; (void)pcpu;
     printf("  PMMU translate framework OK (short + long + BERR + WP + U/M + IS + PTEST)\n");
+    return 0;
+}
+
+/* M7.6r — 030 exception stack frame format.
+ * Verifies:
+ *   - SE/30 BERR (vec 2) pushes a 32-byte format-A frame containing
+ *     SR / PC / 0xA008 (format-vector) / fault address at offset 0x0E
+ *   - SE/30 non-BERR exception pushes a format-0 8-byte frame
+ *   - RTE pops the appropriate frame size for both formats
+ *   - Plus model still uses the 6-byte short frame */
+static int test_030_exception_frame(void) {
+    mac_mem mem;
+    mac_mem_init_ex(&mem, MAC_MODEL_SE30, 1024 * 1024);
+    mem.overlay = false;
+    m68k_cpu cpu;
+    m68k_reset(&cpu, &mem);
+
+    /* Plant a handler PC for vector 2 at VBR+8. */
+    cpu.vbr = 0x100;
+    mac_write32(&mem, cpu.vbr + 2 * 4, 0x800);
+
+    /* BERR-style exception: caller sets fault_addr, calls exception(2). */
+    cpu.a[7] = 0x10000;
+    u32 saved_a7 = cpu.a[7];
+    cpu.pc = 0x12345678;
+    cpu.sr = 0x2700;                          /* supervisor */
+    cpu.fault_addr = 0x0BADF00D;
+    m68k_exception(&cpu, 2);
+
+    /* Expect 32-byte frame. */
+    if (cpu.a[7] != saved_a7 - 32) {
+        printf("030 exc: BERR a7 delta=%d want -32\n",
+               (int)((i32)cpu.a[7] - (i32)saved_a7));
+        return 1;
+    }
+    if (cpu.pc != 0x800) {
+        printf("030 exc: BERR PC=%08X want 800\n", cpu.pc); return 1;
+    }
+    u32 sp = cpu.a[7];
+    if (mac_read16(&mem, sp + 0x00) != 0x2700) {
+        printf("030 exc: BERR sr@SP=0x%04X\n", mac_read16(&mem, sp));
+        return 1;
+    }
+    if (mac_read32(&mem, sp + 0x02) != 0x12345678) {
+        printf("030 exc: BERR pc@SP+2=%08X\n", mac_read32(&mem, sp + 0x02));
+        return 1;
+    }
+    if (mac_read16(&mem, sp + 0x06) != 0xA008) {
+        printf("030 exc: BERR fmt@SP+6=%04X want A008\n",
+               mac_read16(&mem, sp + 0x06));
+        return 1;
+    }
+    if (mac_read32(&mem, sp + 0x0E) != 0x0BADF00D) {
+        printf("030 exc: BERR faultAddr@SP+E=%08X\n",
+               mac_read32(&mem, sp + 0x0E));
+        return 1;
+    }
+
+    /* RTE pops the 32-byte frame. PC should restore to 0x12345678 and a7 to saved. */
+    /* Inject 0x4E73 (RTE) so we can use the normal m68k_step path. */
+    mac_write16(&mem, cpu.pc, 0x4E73);
+    m68k_step(&cpu);
+    if (cpu.a[7] != saved_a7) {
+        printf("030 RTE: a7=%08X want %08X (delta=%d)\n",
+               cpu.a[7], saved_a7, (int)((i32)cpu.a[7] - (i32)saved_a7));
+        return 1;
+    }
+    if (cpu.pc != 0x12345678) {
+        printf("030 RTE: PC=%08X want 12345678\n", cpu.pc); return 1;
+    }
+
+    /* Now a non-BERR exception (vec 4, illegal). Format-0 8-byte frame. */
+    cpu.a[7] = saved_a7;
+    cpu.pc = 0xCAFE0000;
+    cpu.sr = 0x2700;
+    mac_write32(&mem, cpu.vbr + 4 * 4, 0x900);
+    m68k_exception(&cpu, 4);
+    if (cpu.a[7] != saved_a7 - 8) {
+        printf("030 exc: vec4 a7 delta=%d want -8\n",
+               (int)((i32)cpu.a[7] - (i32)saved_a7));
+        return 1;
+    }
+    if (mac_read16(&mem, cpu.a[7] + 6) != (4u * 4u)) {
+        printf("030 exc: vec4 fmt@SP+6=%04X want 0010\n",
+               mac_read16(&mem, cpu.a[7] + 6));
+        return 1;
+    }
+
+    mac_mem_free(&mem);
+
+    /* Plus model regression: 6-byte short frame. */
+    mac_mem plus;
+    mac_mem_init_ex(&plus, MAC_MODEL_PLUS, 64 * 1024);
+    m68k_cpu pcpu;
+    m68k_reset(&pcpu, &plus);
+    pcpu.a[7] = 0x4000;
+    u32 plus_a7 = pcpu.a[7];
+    pcpu.pc = 0x1234;
+    pcpu.sr = 0x2700;
+    mac_write32(&plus, 4 * 4, 0x500);
+    m68k_exception(&pcpu, 4);
+    if (pcpu.a[7] != plus_a7 - 6) {
+        printf("plus exc: a7 delta=%d want -6\n",
+               (int)((i32)pcpu.a[7] - (i32)plus_a7));
+        mac_mem_free(&plus); return 1;
+    }
+    mac_mem_free(&plus);
+
+    printf("  030 exception/RTE format-A + format-0 + Plus 6-byte OK\n");
     return 0;
 }
 
@@ -606,6 +714,7 @@ int main(void) {
     if (test_68030_isa()) return fail("68030 ISA");
     if (test_se30_init_stable()) return fail("SE/30 init");
     if (test_pmmu_translate()) return fail("PMMU framework");
+    if (test_030_exception_frame()) return fail("030 exception frame");
 
     mac_mem mem;
     mac_mem_init(&mem, 1024 * 1024);

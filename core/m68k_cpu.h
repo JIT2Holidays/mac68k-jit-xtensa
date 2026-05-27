@@ -103,6 +103,13 @@ typedef struct m68k_cpu {
 #define BERR_CAUSE_INVALID   (3u << BERR_CAUSE_SHIFT)
 #define BERR_CAUSE_OOR       (4u << BERR_CAUSE_SHIFT)
 
+    /* M7.6r — captured faulting address for the 030 format-A BERR stack
+     * frame. The run loop pulls the LA out of bus_error_pending and
+     * stores it here before calling m68k_exception(cpu, 2). The frame
+     * builder copies this to SP+0x0E so the ROM's BERR handler can read
+     * the LA it asked for. */
+    u32 fault_addr;
+
     /* Scratch slot used by a JIT block to stash its CALL0 return address
      * without modifying a1 (see jit/dispatcher.c — same trick as gbjit). */
     u32 jit_ret_pc;
