@@ -414,6 +414,12 @@ static int test_pmmu_translate(void) {
         printf("pmmu: invalid descriptor did NOT set bus_error_pending\n");
         return 1;
     }
+    /* M7.6l — cause field. Invalid descriptor → CAUSE=INVALID. */
+    if ((cpu.bus_error_pending & BERR_CAUSE_MASK) != BERR_CAUSE_INVALID) {
+        printf("pmmu: invalid-desc cause=%08X want %08X\n",
+               cpu.bus_error_pending & BERR_CAUSE_MASK, BERR_CAUSE_INVALID);
+        return 1;
+    }
 
     /* M7.6h — long-form WP (write-protect) check. Mark long-table entry
      * 2 as WP (word0 bit 11 = 0x800) plus DT=1. Write to that page
@@ -435,6 +441,11 @@ static int test_pmmu_translate(void) {
     mac_pmmu_translate(&mem, 0x2000u, 5, true);
     if (cpu.bus_error_pending == 0) {
         printf("pmmu: WP write should set bus_error_pending\n"); return 1;
+    }
+    if ((cpu.bus_error_pending & BERR_CAUSE_MASK) != BERR_CAUSE_WP) {
+        printf("pmmu: WP cause=%08X want %08X\n",
+               cpu.bus_error_pending & BERR_CAUSE_MASK, BERR_CAUSE_WP);
+        return 1;
     }
 
     /* M7.6i — U (used) and M (modified) bit maintenance. Set up a fresh
@@ -486,6 +497,11 @@ static int test_pmmu_translate(void) {
     mac_pmmu_translate(&mem, 0x01003010u, 5, false);
     if (cpu.bus_error_pending == 0) {
         printf("pmmu: IS=8 out-of-range did not BERR\n"); return 1;
+    }
+    if ((cpu.bus_error_pending & BERR_CAUSE_MASK) != BERR_CAUSE_OOR) {
+        printf("pmmu: IS-OOR cause=%08X want %08X\n",
+               cpu.bus_error_pending & BERR_CAUSE_MASK, BERR_CAUSE_OOR);
+        return 1;
     }
 
     mac_mem_free(&mem);
