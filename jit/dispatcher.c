@@ -737,6 +737,23 @@ void m68k_dispatcher_run_until(m68k_dispatcher *d, u64 until) {
         if (cpu->stopped) { cpu->cycles += 64; continue; }
 
         u32 pc = cpu->pc;
+        /* M6.271 — match interp's fetch16 BERR for SE/30. fetch16 in
+         * the interp raises BERR for instruction fetches from PCs
+         * outside ROM (0x40800000-0x4083FFFF) when PC >= 0x40000000
+         * (slot card area). JIT compiles such blocks via mac_read16
+         * which returns 0xFF (no BERR), then runs them as line F
+         * traps — diverging from interp. Match interp's semantics by
+         * raising BERR before dispatch when PC is in that range. */
+        if (cpu->mem && cpu->mem->model == MAC_MODEL_SE30
+            && pc >= 0x40000000u
+            && (pc < 0x40800000u || pc >= 0x40840000u)) {
+            cpu->bus_error_pending = pc | 0x80000000u;
+            cpu->fault_addr = cpu->bus_error_pending & 0x0FFFFFFFu;
+            cpu->bus_error_pending = 0;
+            m68k_exception(cpu, 2);
+            prev = NULL;
+            continue;
+        }
         m68k_block *b;
         bool chain_hit = false;
 
