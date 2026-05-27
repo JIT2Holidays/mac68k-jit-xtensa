@@ -104,9 +104,13 @@ int main(int argc, char **argv) {
     u64 max_cycles = (argc > 1) ? strtoull(argv[1], NULL, 0) : 200000000ull;
 
     mac_mem mem;
-    /* Full 128 MB so the ROM's RAM-probe loop terminates cleanly — the
-     * probe sweeps to ~127 MB looking for installed banks. */
-    mac_mem_init_ex(&mem, MAC_MODEL_SE30, 128u * 1024u * 1024u);
+    /* Default 128 MB so the ROM's RAM-probe loop terminates cleanly.
+     * SE30_RAM_MB env overrides — useful for generating smaller
+     * snapshots for ctest. */
+    u32 ram_mb = 128;
+    const char *rm = getenv("SE30_RAM_MB");
+    if (rm) { unsigned long v = strtoul(rm, NULL, 0); if (v) ram_mb = (u32)v; }
+    mac_mem_init_ex(&mem, MAC_MODEL_SE30, ram_mb * 1024u * 1024u);
 
     u8 *rom_data = NULL;
     u32 rom_len = read_file("roms/MacIIx.ROM", &rom_data);

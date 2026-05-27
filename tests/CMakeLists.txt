@@ -126,3 +126,18 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/roms/disks/boot-cycle30m.snap")
                      --max-cycles 100000
              WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endif()
+
+# M7.6af — SE/30 lockstep from reset. Verifies the M7.6ad PMMU-block-
+# termination + M7.6ae JIT-dispatcher-BERR-handling fixes don't
+# regress. Without these the JIT diverges from interp at step 23
+# (~350 cycles). With them, JIT matches through 20K cycles / 2K
+# blocks. Snapshot regenerated via scripts/snap-se30-reset.sh.
+if(EXISTS "${CMAKE_SOURCE_DIR}/roms/disks/se30-reset.snap")
+    add_test(NAME diff_jit_se30_reset_lockstep
+             COMMAND $<TARGET_FILE:mac68k_host>
+                     --diff-jit-trace --no-irq
+                     --load-snapshot ${CMAKE_SOURCE_DIR}/roms/disks/se30-reset.snap
+                     --max-cycles 20000
+                     --machine se30
+             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+endif()
