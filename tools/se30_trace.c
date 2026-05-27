@@ -324,6 +324,19 @@ int main(int argc, char **argv) {
         u64 chunk_end = cpu.cycles + 1024;
         if (chunk_end > max_cycles) chunk_end = max_cycles;
         m68k_run_until(&cpu, chunk_end);
+        /* SE30_LOG_RAM_PC=1 — log first time PC enters non-ROM ranges
+         * (anything outside 0x4080xxxx-0x4083xxxx). Useful to find
+         * when boot transitions from ROM execution to RAM-loaded
+         * code (or jumps to invalid memory). */
+        {
+            static int ram_logged = 0;
+            if (!ram_logged && getenv("SE30_LOG_RAM_PC") &&
+                (cpu.pc < 0x40800000u || cpu.pc >= 0x40840000u)) {
+                fprintf(stderr, "[ram-pc] first non-ROM PC=%08X at cyc=%llu\n",
+                        cpu.pc, (unsigned long long)cpu.cycles);
+                ram_logged = 1;
+            }
+        }
     }
     note_pc(cpu.pc, cpu.cycles);
 
