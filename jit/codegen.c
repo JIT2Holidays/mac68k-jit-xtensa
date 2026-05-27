@@ -2323,6 +2323,18 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             emit_advance(&e, 0, 4);
             sext_memo_invalidate();
             inline_ops++; done = true;
+        } else if (top == 0xF && ((w & 0xFF20) == 0xF400
+                                  || (w & 0xFF20) == 0xF420)) {
+            /* M7.5h — CINV / CPUSH (68030+ cache control). Our model has
+             * no on-chip cache, so these are pure no-ops: advance PC by 2
+             * and cycles by 12 (m68k_step base 4 + do_cache 8). Matches
+             * the interpreter exactly. Privileged on real hardware — we
+             * don't check S here (TODO(priv-cache): for user-mode
+             * programs issuing these, the interpreter via m68k_step
+             * would raise vector 8; the JIT inline arm skips the check
+             * assuming supervisor, which is correct for OS code). */
+            emit_advance(&e, 2, 12);
+            inline_ops++; done = true;
         } else if (top == 0xF) {
             /* M6.137 — F-line trap. Bench-hot 0xFFFF at 21 808 hits /
              * 100 M cyc (the bench's M6.66-equivalent divergence zone
