@@ -181,7 +181,11 @@ static void write_snapshot(mac_mem *m, m68k_cpu *cpu, const char *path) {
     hdr[18] = cpu->sr;
     hdr[19] = cpu->usp;
     hdr[20] = cpu->ssp;
-    hdr[21] = hdr[22] = hdr[23] = 0;
+    /* M7.6aa — store machine model in the reserved slot so SE/30
+     * snapshots round-trip correctly. Loaders that pre-date this commit
+     * see hdr[21]=0 and continue to treat it as Plus. */
+    hdr[21] = (u32)m->model;
+    hdr[22] = hdr[23] = 0;
     fwrite(hdr, 4, 24, f);
     fwrite(&m->ram_size, 4, 1, f);
     fwrite(m->ram, 1, m->ram_size, f);
