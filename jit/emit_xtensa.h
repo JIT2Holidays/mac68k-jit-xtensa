@@ -58,6 +58,24 @@ u32 xt_xor(xt_emit *e, u8 ar, u8 as, u8 at);
  * high half that differs, and we don't read it). */
 u32 xt_mull(xt_emit *e, u8 ar, u8 as, u8 at);
 
+/* M7.6b — MUL32 / DIV32 / NSA option extensions. Not yet emitted by
+ * any JIT arm — foundation for upcoming native arms:
+ *   xt_muluh  — high 32 of 64-bit unsigned product (for MULU.L's V flag)
+ *   xt_mulsh  — high 32 of 64-bit signed product (MULS.L's V flag)
+ *   xt_quou/quos — 32-bit unsigned/signed quotient (DIVU.L/DIVS.L)
+ *   xt_remu/rems — 32-bit unsigned/signed remainder
+ *   xt_nsau   — leading zero count (BFFFO)
+ *   xt_nsa    — leading sign-bit count (general utility)
+ * All present on ESP32-S3 LX7 hardware. */
+u32 xt_muluh(xt_emit *e, u8 ar, u8 as, u8 at);
+u32 xt_mulsh(xt_emit *e, u8 ar, u8 as, u8 at);
+u32 xt_quou (xt_emit *e, u8 ar, u8 as, u8 at);
+u32 xt_quos (xt_emit *e, u8 ar, u8 as, u8 at);
+u32 xt_remu (xt_emit *e, u8 ar, u8 as, u8 at);
+u32 xt_rems (xt_emit *e, u8 ar, u8 as, u8 at);
+u32 xt_nsau (xt_emit *e, u8 ar, u8 at);
+u32 xt_nsa  (xt_emit *e, u8 ar, u8 at);
+
 /* Shifts (immediate). LX7 has SLLI/SRLI/SRAI. */
 u32 xt_slli(xt_emit *e, u8 ar, u8 as, u8 sa);       /* sa = 1..31 */
 u32 xt_srli(xt_emit *e, u8 ar, u8 as, u8 sa);       /* sa = 0..15  */

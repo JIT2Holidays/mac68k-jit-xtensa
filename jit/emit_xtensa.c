@@ -113,9 +113,35 @@ u32 xt_addx2(xt_emit *e, u8 ar, u8 as, u8 at) { return emit24(e, enc_rrr(0x9, 0,
 u32 xt_addx4(xt_emit *e, u8 ar, u8 as, u8 at) { return emit24(e, enc_rrr(0xA, 0, ar, as, at)); }
 u32 xt_sub(xt_emit *e, u8 ar, u8 as, u8 at) { return emit24(e, enc_rrr(0xC, 0, ar, as, at)); }
 u32 xt_mov(xt_emit *e, u8 ar, u8 as) { return xt_or(e, ar, as, as); }
-/* MULL: Xtensa Mul32-option encoding op0=0, op1=0x2, op2=0x8.
- * ar = (as * at) & 0xFFFFFFFF — low 32 bits of the product. */
+/* --- MUL32 / DIV32 / NSA options (Xtensa LX7 optional instructions) ---
+ * All use RRR-format with op0=0, op1=0x2 (MUL/DIV) or op1=0x4 (NSA).
+ * The op2 field selects the specific operation.
+ *
+ * Added M7.6b in support of future native JIT arms for 68030 ops that
+ * need them: MULU.L's V flag (needs MULUH), DIVU.L (needs QUOU/REMU),
+ * BFFFO (needs NSAU). These functions are not yet referenced by any
+ * JIT arm — they're foundation for upcoming work.
+ *
+ * TODO(sim-support): the host Xtensa simulator (jit/xtensa_sim.c) does
+ * NOT yet decode these opcodes. Before any JIT arm emits them, the sim
+ * needs corresponding handlers. NSA/NSAU in particular has encoding
+ * that overlaps EXTUI's op1=0x4 prefix — proper decoding must check
+ * the `s` field too. Real ESP32-S3 hardware decodes these natively. */
+
 u32 xt_mull(xt_emit *e, u8 ar, u8 as, u8 at) { return emit24(e, enc_rrr(0x8, 0x2, ar, as, at)); }
+u32 xt_muluh(xt_emit *e, u8 ar, u8 as, u8 at) { return emit24(e, enc_rrr(0xA, 0x2, ar, as, at)); }
+u32 xt_mulsh(xt_emit *e, u8 ar, u8 as, u8 at) { return emit24(e, enc_rrr(0xB, 0x2, ar, as, at)); }
+u32 xt_quou (xt_emit *e, u8 ar, u8 as, u8 at) { return emit24(e, enc_rrr(0xC, 0x2, ar, as, at)); }
+u32 xt_quos (xt_emit *e, u8 ar, u8 as, u8 at) { return emit24(e, enc_rrr(0xD, 0x2, ar, as, at)); }
+u32 xt_remu (xt_emit *e, u8 ar, u8 as, u8 at) { return emit24(e, enc_rrr(0xE, 0x2, ar, as, at)); }
+u32 xt_rems (xt_emit *e, u8 ar, u8 as, u8 at) { return emit24(e, enc_rrr(0xF, 0x2, ar, as, at)); }
+
+/* NSAU/NSA — Normalize Shift Amount (count leading zeros / sign bits).
+ * 2-operand instruction encoded with op1=0x4, op2=0xE (NSAU) or 0xF
+ * (NSA). The `s` field is fixed by the architecture to select NSA(U)
+ * within the CUST opcode group. Format: NSAU ar, at. */
+u32 xt_nsau(xt_emit *e, u8 ar, u8 at) { return emit24(e, enc_rrr(0xE, 0x4, ar, 0, at)); }
+u32 xt_nsa (xt_emit *e, u8 ar, u8 at) { return emit24(e, enc_rrr(0xF, 0x4, ar, 0, at)); }
 
 /* --- RRI8 family. op0=2; r selects op. --- */
 /*  L8UI  r=0   S8I  r=4   L16UI r=1   S16I r=5
