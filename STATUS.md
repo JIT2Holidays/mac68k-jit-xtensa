@@ -5,6 +5,81 @@
 > across the 68000 ISA, plus the trajectory-safety-aware shopping list
 > for further inline arms.
 
+## M7.0 — 68030 / Macintosh SE/30 foundation 🎯
+
+Ground-floor milestone toward booting a Mac SE/30 with System 7.0. No
+boot is attempted in this landing — the goal is to lay every piece of
+foundational scaffolding so subsequent milestones can fill in SE/30 ROM
+boot, then a System-7 disk boot.
+
+**Landed:**
+
+* `mac_machine_t` enum (`MAC_MODEL_PLUS` / `MAC_MODEL_SE30`) threaded
+  through `mac_mem` (`include/m68k_types.h`, `core/mac_mem.h`).
+* CPU register file extended with the 68010+ / 68020+ / 68030 control
+  registers (`core/m68k_cpu.h`): `vbr`, `sfc`, `dfc`, `cacr`, `caar`,
+  `msp`, `isp`, plus the PMMU stub fields (`tc`, `srp`, `crp`, `tt0`,
+  `tt1`, `mmusr`). VBR=0 at reset keeps Plus exception vectoring
+  bit-for-bit identical.
+* `m68k_exception` and `m68k_poll_interrupts` route through `cpu->vbr +
+  vector*4`. Plus mode is unchanged (VBR stays 0).
+* SE/30 MMIO map decoded (`core/mac_mem.h`, `mac_mem.c`): 32-bit address
+  bus, RAM at 0x00000000, ROM at 0x40800000 (256 KB), VIA1 0x50F00000,
+  VIA2 0x50F02000, SCC R/W 0x50F0C000/0x50F0E000, SCSI 0x50F10000 with
+  pseudo-DMA window 0x50F12000, ASC 0x50F14000, IWM/SWIM 0x50F16000.
+  Up to 128 MB RAM. No boot overlay (ROM is fixed-mapped from reset).
+* Plus path keeps its 24-bit `addr &= 0xFFFFFFu` mask; SE/30 sees full
+  32-bit addresses (gated on `m->model`).
+* `mac_mem_init_ex(m, model, ram)` is the new init entry point;
+  `mac_mem_init(m, ram)` becomes an inline wrapper that forwards
+  `MAC_MODEL_PLUS` — every existing caller stays unchanged.
+* `.Sony` driver patching gated on Plus only — won't corrupt the SE/30
+  ROM at the Plus-specific offset (0x17D30).
+* 68020/030 integer ISA additions in the interpreter
+  (`core/m68k_interp.c`): bitfield (BFTST/BFEXTU/BFEXTS/BFINS/BFCHG/
+  BFCLR/BFSET/BFFFO), long MULU.L/MULS.L (32×32→32 and ×→64), long
+  DIVU.L/DIVS.L (32÷32 and 64÷32), EXTB.L, LINK.L, RTD, MOVEC (SFC/DFC/
+  USP/VBR/CACR/CAAR/MSP/ISP/TC/TT0/TT1), MOVES, TRAPcc, CHK2/CMP2,
+  CAS/CAS2, PACK/UNPK, CINV/CPUSH (no-op), PMMU PMOVE/PFLUSH/PLOAD/
+  PTEST as register stubs (PMOVE round-trips TC/SRP/CRP/TT0/TT1/MMUSR;
+  the rest advance PC). **TODO(pmmu):** full page-table walk for 32-bit
+  mode / Virtual Memory in a later milestone.
+* Full 68020+ extension word format (memory-indirect, scaled index,
+  outer displacement) handled at runtime in `brief_index`. The JIT
+  block walker's `ea_ext_bytes` keeps its simple brief-format sizing —
+  any 020+ encoding terminates the block before getting there.
+* JIT hybrid mode (`jit/codegen.c`): under SE/30, the block walker
+  consults `is_68020_only(opcode)` and terminates the block at the
+  first 020/030 instruction, so `m68k_step` handles it. Plus path
+  skips the check (zero overhead). 8/8 ctest lockstep tests stay
+  bit-for-bit green.
+* `--machine plus|se30` CLI flag on `mac68k_host`; `MAC_GUI_MACHINE=se30`
+  env var forwarded by the GUI to the host backend.
+* New tests:
+  * `tests/test_interp.c::test_68030_isa` — BFEXTU/MULS.L/DIVS.L/
+    EXTB.L/MOVEC/RTD/LINK.L/TRAPF/PACK round-trip.
+  * `tests/test_interp.c::test_se30_init_stable` — `mac_mem_init_ex`
+    + SE/30 region decode + high-RAM access + VIA2/ASC register
+    round-trip.
+  * `tests/test_jit.c::se30-hybrid` — JIT and interpreter agree on a
+    block that mixes 68000 MOVE.L + 68020 BFEXTU; confirms the JIT
+    terminates before BFEXTU and m68k_step picks up.
+
+**Out of scope (future milestones):**
+
+* M7.x — SE/30 ROM boot (real VIA2 plumbing, ASC fill-in, ADB protocol,
+  POST sequence debug).
+* M7.x — System 7.0 boot from SCSI HD.
+* M7.x — JIT 030 inline arms (drop hybrid termination, emit native for
+  high-frequency 030 opcodes).
+* M7.x — Full PMMU translation (PTW, MMUSR, page faults).
+* M7.x — InfiniteHD validation through to the Finder desktop.
+
+Plus regression: 8/8 ctest tests pass (including all four boot-phase
+JIT/interp lockstep snapshots — boot-rom-init, boot-system-load,
+boot-cycle30m, boot-cycle100m). New SE/30 + 030-ISA tests pass.
+
+
 ## Performance evaluation — bench targets table
 
 The full bench rotation (post-M6.205) covering every workload the JIT

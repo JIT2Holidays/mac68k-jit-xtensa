@@ -27,12 +27,17 @@ void  *mac_write_watch_ctx;
 
 /* --- init / teardown --------------------------------------------------- */
 
-void mac_mem_init(mac_mem *m, u32 ram_size) {
+void mac_mem_init_ex(mac_mem *m, mac_machine_t model, u32 ram_size) {
     memset(m, 0, sizeof(*m));
+    m->model = model;
     if (ram_size == 0) ram_size = MAC_RAM_SIZE_DEFAULT;
+    if (model == MAC_MODEL_SE30 && ram_size > MAC_SE30_MAX_RAM)
+        ram_size = MAC_SE30_MAX_RAM;
     m->ram_size = ram_size;
     m->ram = (u8 *)calloc(1, ram_size);
-    m->overlay = true;
+    /* The Plus uses a VIA-driven ROM overlay at boot. The SE/30 has no
+     * overlay — ROM is mapped at a fixed high address from reset. */
+    m->overlay = (model == MAC_MODEL_PLUS);
     m->fb_base = ram_size - MAC_FB_OFFSET;
 
     m->via.t1c = 0xFFFF;
@@ -41,6 +46,17 @@ void mac_mem_init(mac_mem *m, u32 ram_size) {
     /* PA4 = 1 (overlay on) is the power-on default; the ROM clears it. */
     m->via.ora = 0x7F;
     m->via.orb = 0x87;
+
+    if (model == MAC_MODEL_SE30) {
+        /* VIA2 mirrors VIA1's reset shape; its port wiring is different
+         * (slot IRQ aggregator, SCSI IRQ, sound IRQ) but the register
+         * file behaves identically. Filled in by later milestones. */
+        m->via2.t1c = 0xFFFF;
+        m->via2.t2c = 0xFFFF;
+        m->via2.ora = 0xFF;
+        m->via2.orb = 0xFF;
+        /* ASC + ADB stubs come pre-zeroed from the memset above. */
+    }
 
     /* RTC: a plausible clock (seconds since 1904-01-01); PRAM zeroed —
      * the ROM validates PRAM and re-initialises it when invalid. */
@@ -89,8 +105,11 @@ bool mac_load_rom(mac_mem *m, const u8 *rom, u32 len) {
     memcpy(m->rom, rom, len);
     m->rom_size = len;
     /* Replace the ROM's .Sony floppy driver with the mini vMac stub so
-     * disk I/O is served as logical sectors (see core/sony.c). */
-    sony_patch_rom(m);
+     * disk I/O is served as logical sectors (see core/sony.c). The patch
+     * offsets are Plus-ROM-specific — under SE/30 we leave the ROM
+     * untouched (real IWM/SWIM disk path is a later milestone). */
+    if (m->model == MAC_MODEL_PLUS)
+        sony_patch_rom(m);
     return true;
 }
 
@@ -332,10 +351,89 @@ static void scsi_write(mac_mem *m, u32 addr, u8 v) {
     mac_scsi_reg_write(&m->scsi, (addr >> 4) & 7, v);
 }
 
+/* --- SE/30 VIA2 + ASC + ADB (stubs) ----------------------------------
+ * VIA2 on the SE/30 aggregates slot-card interrupts, the SCSI IRQ and the
+ * sound IRQ — its register file mirrors VIA1's but the PA/PB pin wiring
+ * is different. For this milestone we only need the register file to
+ * round-trip writes/reads cleanly so the ROM's VIA-probing self-tests
+ * don't wedge. ASC and ADB are pure register-file stubs.
+ *
+ * Same register-select scheme as VIA1: address bits 9..12 pick the
+ * register. */
+static u8 via2_read(mac_mem *m, via6522 *v, u32 addr) {
+    (void)m;
+    u8 r = (u8)((addr >> 9) & 0x0Fu);
+    switch (r) {
+        case 0:  return v->orb;
+        case 1: case 15: return v->ora;
+        case 2:  return v->ddrb;
+        case 3:  return v->ddra;
+        case 4:  return (u8)(v->t1c & 0xFF);
+        case 5:  return (u8)(v->t1c >> 8);
+        case 6:  return (u8)(v->t1l & 0xFF);
+        case 7:  return (u8)(v->t1l >> 8);
+        case 8:  return (u8)(v->t2c & 0xFF);
+        case 9:  return (u8)(v->t2c >> 8);
+        case 10: return v->sr;
+        case 11: return v->acr;
+        case 12: return v->pcr;
+        case 13: return v->ifr;
+        case 14: return (u8)(v->ier | 0x80u);
+        default: return 0;
+    }
+}
+
+static void via2_write(mac_mem *m, via6522 *v, u32 addr, u8 val) {
+    (void)m;
+    u8 r = (u8)((addr >> 9) & 0x0Fu);
+    switch (r) {
+        case 0:  v->orb = val; break;
+        case 1: case 15: v->ora = val; break;
+        case 2:  v->ddrb = val; break;
+        case 3:  v->ddra = val; break;
+        case 4:  v->t1l = (u16)((v->t1l & 0xFF00u) | val); break;
+        case 5:  v->t1l = (u16)((v->t1l & 0x00FFu) | ((u16)val << 8));
+                 v->t1c = v->t1l;
+                 v->ifr &= (u8)~VIA_IRQ_T1;
+                 break;
+        case 6:  v->t1l = (u16)((v->t1l & 0xFF00u) | val); break;
+        case 7:  v->t1l = (u16)((v->t1l & 0x00FFu) | ((u16)val << 8)); break;
+        case 8:  v->t2l_lo = val; break;
+        case 9:  v->t2c = (u16)((v->t2l_lo) | ((u16)val << 8));
+                 v->ifr &= (u8)~VIA_IRQ_T2;
+                 break;
+        case 10: v->sr = val; break;
+        case 11: v->acr = val; break;
+        case 12: v->pcr = val; break;
+        case 13: v->ifr &= (u8)~(val & 0x7Fu); break;
+        case 14: if (val & 0x80u) v->ier |= (u8)(val & 0x7Fu);
+                 else             v->ier &= (u8)~(val & 0x7Fu);
+                 break;
+        default: break;
+    }
+}
+
+static u8 asc_read(mac_mem *m, u32 addr) {
+    u32 off = (addr - MAC_SE30_ASC_BASE) & 0x7FFu;
+    return m->asc.regs[off];
+}
+static void asc_write(mac_mem *m, u32 addr, u8 v) {
+    u32 off = (addr - MAC_SE30_ASC_BASE) & 0x7FFu;
+    m->asc.regs[off] = v;
+}
+
 /* --- address decode ---------------------------------------------------- */
 
 /* Return a RAM/ROM pointer for plain-memory addresses, or NULL for MMIO. */
 static u8 *mem_ptr(mac_mem *m, u32 addr) {
+    if (m->model == MAC_MODEL_SE30) {
+        /* SE/30: no boot overlay. RAM at 0x00000000+, ROM at 0x40800000+. */
+        if (m->ram_size && addr < m->ram_size) return m->ram + addr;
+        if (m->rom && addr >= MAC_SE30_ROM_BASE
+                   && addr < MAC_SE30_ROM_BASE + m->rom_size)
+            return m->rom + (addr - MAC_SE30_ROM_BASE);
+        return NULL;
+    }
     if (m->overlay) {
         /* Boot overlay: ROM at 0 and 0x400000, RAM windowed at 0x600000. */
         if (addr < 0x100000u)
@@ -354,7 +452,10 @@ static u8 *mem_ptr(mac_mem *m, u32 addr) {
     return NULL;
 }
 
-enum { RGN_NONE, RGN_VIA, RGN_IWM, RGN_SCC_RD, RGN_SCC_WR, RGN_SCSI, RGN_DEBUG };
+enum {
+    RGN_NONE, RGN_VIA, RGN_IWM, RGN_SCC_RD, RGN_SCC_WR, RGN_SCSI, RGN_DEBUG,
+    RGN_VIA2, RGN_ASC, RGN_SCSI_DMA,
+};
 
 static int region_of(u32 addr) {
     if (addr >= MAC_DEBUG_BASE && addr < MAC_DEBUG_BASE + 0x10u) return RGN_DEBUG;
@@ -368,20 +469,39 @@ static int region_of(u32 addr) {
     return RGN_NONE;
 }
 
+/* SE/30 32-bit MMIO map. Each peripheral occupies a 0x2000-byte window
+ * starting at the base addresses defined in mac_mem.h. */
+static int region_of_se30(u32 addr) {
+    if (addr >= MAC_SE30_VIA1_BASE     && addr < MAC_SE30_VIA1_BASE     + 0x2000u) return RGN_VIA;
+    if (addr >= MAC_SE30_VIA2_BASE     && addr < MAC_SE30_VIA2_BASE     + 0x2000u) return RGN_VIA2;
+    if (addr >= MAC_SE30_SCC_RD_BASE   && addr < MAC_SE30_SCC_RD_BASE   + 0x2000u) return RGN_SCC_RD;
+    if (addr >= MAC_SE30_SCC_WR_BASE   && addr < MAC_SE30_SCC_WR_BASE   + 0x2000u) return RGN_SCC_WR;
+    if (addr >= MAC_SE30_SCSI_BASE     && addr < MAC_SE30_SCSI_BASE     + 0x2000u) return RGN_SCSI;
+    if (addr >= MAC_SE30_SCSI_DMA_BASE && addr < MAC_SE30_SCSI_DMA_BASE + 0x2000u) return RGN_SCSI_DMA;
+    if (addr >= MAC_SE30_ASC_BASE      && addr < MAC_SE30_ASC_BASE      + 0x2000u) return RGN_ASC;
+    if (addr >= MAC_SE30_IWM_BASE      && addr < MAC_SE30_IWM_BASE      + 0x2000u) return RGN_IWM;
+    return RGN_NONE;
+}
+
 /* --- 8-bit access ------------------------------------------------------ */
 
 u8 mac_read8(mac_mem *m, u32 addr) {
-    addr &= 0xFFFFFFu;
+    if (m->model == MAC_MODEL_PLUS) addr &= 0xFFFFFFu;
     m->reads++;
     u8 *p = mem_ptr(m, addr);
     if (p) return *p;
     u8 val = 0;
-    switch (region_of(addr)) {
+    int rgn = (m->model == MAC_MODEL_SE30) ? region_of_se30(addr)
+                                           : region_of(addr);
+    switch (rgn) {
         case RGN_VIA:    val = via_read(m, addr);  break;
+        case RGN_VIA2:   val = via2_read(m, &m->via2, addr); break;
         case RGN_IWM:    val = iwm_read(&m->iwm, addr); break;
         case RGN_SCC_RD: val = scc_read(m, addr);  break;
         case RGN_SCC_WR: val = scc_read(m, addr);  break;
         case RGN_SCSI:   val = scsi_read(m, addr); break;
+        case RGN_SCSI_DMA: val = scsi_read(m, addr); break;
+        case RGN_ASC:    val = asc_read(m, addr);  break;
         case RGN_DEBUG: {
             u32 off = addr - MAC_DEBUG_BASE;
             if (off >= MAC_DBG_CYCLES && off < MAC_DBG_CYCLES + 4 && m->cpu)
@@ -395,11 +515,17 @@ u8 mac_read8(mac_mem *m, u32 addr) {
 }
 
 void mac_write8(mac_mem *m, u32 addr, u8 v) {
-    addr &= 0xFFFFFFu;
+    if (m->model == MAC_MODEL_PLUS) addr &= 0xFFFFFFu;
     m->writes++;
     if (mac_mmio_log && !mem_ptr(m, addr)) mac_mmio_log(m, addr, v, 1, 1);
     /* RAM is writable under the overlay too (the boot code clears it). */
-    if (m->overlay) {
+    if (m->model == MAC_MODEL_SE30) {
+        if (m->ram_size && addr < m->ram_size) {
+            m->ram[addr] = v;
+            if (mac_write_watch) mac_write_watch(mac_write_watch_ctx, addr);
+            return;
+        }
+    } else if (m->overlay) {
         if (addr >= MAC_OVL_RAM_BASE && addr < MAC_OVL_RAM_BASE + 0x100000u
             && m->ram_size) {
             u32 ra = (addr - MAC_OVL_RAM_BASE) % m->ram_size;
@@ -412,11 +538,16 @@ void mac_write8(mac_mem *m, u32 addr, u8 v) {
         if (mac_write_watch) mac_write_watch(mac_write_watch_ctx, addr);
         return;
     }
-    switch (region_of(addr)) {
+    int rgn = (m->model == MAC_MODEL_SE30) ? region_of_se30(addr)
+                                           : region_of(addr);
+    switch (rgn) {
         case RGN_VIA:    via_write(m, addr, v);  return;
+        case RGN_VIA2:   via2_write(m, &m->via2, addr, v); return;
         case RGN_IWM:    iwm_write(&m->iwm, addr, v); return;
         case RGN_SCC_RD: case RGN_SCC_WR: scc_write(m, addr, v); return;
         case RGN_SCSI:   scsi_write(m, addr, v); return;
+        case RGN_SCSI_DMA: scsi_write(m, addr, v); return;
+        case RGN_ASC:    asc_write(m, addr, v); return;
         case RGN_DEBUG: {
             u32 off = addr - MAC_DEBUG_BASE;
             if (off == MAC_DBG_SERIAL) {
@@ -438,7 +569,7 @@ void mac_write8(mac_mem *m, u32 addr, u8 v) {
 /* --- 16/32-bit access (big-endian) ------------------------------------- */
 
 u16 mac_read16(mac_mem *m, u32 addr) {
-    addr &= 0xFFFFFFu;
+    if (m->model == MAC_MODEL_PLUS) addr &= 0xFFFFFFu;
     u8 *p = mem_ptr(m, addr);
     if (p) { m->reads += 2; return (u16)(((u16)p[0] << 8) | p[1]); }
     return (u16)(((u16)mac_read8(m, addr) << 8) | mac_read8(m, addr + 1));
@@ -449,11 +580,15 @@ u32 mac_read32(mac_mem *m, u32 addr) {
 }
 
 void mac_write16(mac_mem *m, u32 addr, u16 v) {
-    addr &= 0xFFFFFFu;
-    /* The patched .Sony driver pokes the extension trap with word writes. */
-    if (addr >= SONY_EXTN_BASE && addr < SONY_EXTN_BASE + 0x20u) {
-        sony_extn_write(addr - SONY_EXTN_BASE, v);
-        return;
+    if (m->model == MAC_MODEL_PLUS) {
+        addr &= 0xFFFFFFu;
+        /* The patched .Sony driver pokes the extension trap with word
+         * writes. SE/30 doesn't use the patch (sony_patch_rom is gated
+         * on Plus), so this trampoline only triggers under Plus. */
+        if (addr >= SONY_EXTN_BASE && addr < SONY_EXTN_BASE + 0x20u) {
+            sony_extn_write(addr - SONY_EXTN_BASE, v);
+            return;
+        }
     }
     mac_write8(m, addr,     (u8)(v >> 8));
     mac_write8(m, addr + 1, (u8)(v & 0xFF));

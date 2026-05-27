@@ -74,6 +74,13 @@ typedef struct m68k_decoded {
 
 m68k_decoded m68k_decode_at(m68k_cpu *cpu, u32 pc);
 
+/* True iff the opcode is a 68020+ extension (bitfield / long mul-div /
+ * MOVEC / RTD / TRAPcc / CHK2 / CMP2 / CAS / CAS2 / PACK / UNPK /
+ * EXTB.L / LINK.L / MOVES / PMMU / cache). The JIT block walker uses
+ * this in SE/30 mode to terminate the block so the interpreter handles
+ * the 020+ op. */
+bool is_68020_only(u16 op);
+
 /* CPU exception ring log {vector, faulting pc, cycle} and a debug hook
  * invoked on every line-A (Toolbox) trap. */
 extern u32 m68k_exc_log[64][3];

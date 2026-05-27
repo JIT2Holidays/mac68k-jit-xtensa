@@ -158,6 +158,58 @@ int main(void) {
     mac_mem_free(&tmp);
     rc |= run_both("demo", demo, dlen, 50000000ull);
 
+    /* SE/30 hybrid termination: a block that mixes 68000 ops with a
+     * 68020 BFEXTU. The JIT block walker should stop just before BFEXTU
+     * and the interpreter should pick up there. End state must match
+     * pure-interp execution on SE/30 mode. */
+    {
+        mac_mem mi, mj;
+        mac_mem_init_ex(&mi, MAC_MODEL_SE30, 256 * 1024);
+        mac_mem_init_ex(&mj, MAC_MODEL_SE30, 256 * 1024);
+        /* Initial SP / PC vectors in low RAM. */
+        u8 prog[64];
+        memset(prog, 0, sizeof prog);
+        m68a a;
+        m68a_init(&a, prog, sizeof prog, 0);
+        m68a_w32(&a, 0x00020000);              /* SSP */
+        m68a_w32(&a, 0x00000100);              /* PC  */
+        m68a_finish(&a);
+        mac_load_ram_image(&mi, 0, prog, 8);
+        mac_load_ram_image(&mj, 0, prog, 8);
+        /* Code at 0x100: MOVE.L #0xABCD1234, D0 ; BFEXTU D0{4:8}, D1 ; STOP */
+        u16 code[] = {
+            0x203C, 0xABCD, 0x1234,             /* MOVE.L #...,D0 */
+            0xE9C0, (u16)((1 << 12) | (4 << 6) | 8),  /* BFEXTU D0{4:8}, D1 */
+            0x4E72, 0x2700,                     /* STOP #$2700 */
+        };
+        for (size_t i = 0; i < sizeof code / sizeof code[0]; i++) {
+            mac_write16(&mi, 0x100u + (u32)(i * 2), code[i]);
+            mac_write16(&mj, 0x100u + (u32)(i * 2), code[i]);
+        }
+
+        m68k_cpu ci, cj;
+        m68k_reset(&ci, &mi);
+        m68k_reset(&cj, &mj);
+        m68k_run_until(&ci, 100000);
+
+        m68k_dispatcher d;
+        m68k_dispatcher_init(&d, &cj);
+        m68k_dispatcher_run_until(&d, 100000);
+        int bad = diff_state("se30-hybrid", &ci, &cj);
+        if (!bad) {
+            if (ci.d[1] != 0xBC) {
+                printf("  se30-hybrid: D1=%08X want 000000BC\n", ci.d[1]);
+                bad = 1;
+            } else {
+                printf("  se30-hybrid: match (interp+JIT both produced D1=0xBC)\n");
+            }
+        }
+        m68k_dispatcher_shutdown(&d);
+        mac_mem_free(&mi);
+        mac_mem_free(&mj);
+        rc |= bad;
+    }
+
     if (rc) { printf("FAIL: JIT differential\n"); return 1; }
     printf("PASS: JIT differential\n");
     return 0;

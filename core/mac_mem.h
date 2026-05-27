@@ -41,6 +41,24 @@
 #define MAC_VIA_BASE         0xE80000u
 #define MAC_DEBUG_BASE       0xF00000u
 
+/* Macintosh SE/30 memory map (32-bit address bus).
+ * Sources cross-checked against minivmac MINEM68K.h and Inside Macintosh:
+ * Hardware. The SE/30 has no boot ROM overlay — the ROM lives at a fixed
+ * high address from reset and the 68030 reads its initial SSP/PC from
+ * 0x40800000/0x40800004. */
+#define MAC_SE30_RAM_BASE       0x00000000u
+#define MAC_SE30_ROM_BASE       0x40800000u
+#define MAC_SE30_ROM_SIZE       0x00040000u   /* 256 KB */
+#define MAC_SE30_VIA1_BASE      0x50F00000u
+#define MAC_SE30_VIA2_BASE      0x50F02000u
+#define MAC_SE30_SCC_RD_BASE    0x50F0C000u   /* Z8530 read window  */
+#define MAC_SE30_SCC_WR_BASE    0x50F0E000u   /* Z8530 write window */
+#define MAC_SE30_SCSI_BASE      0x50F10000u   /* NCR 5380 (same chip as Plus) */
+#define MAC_SE30_SCSI_DMA_BASE  0x50F12000u   /* pseudo-DMA window */
+#define MAC_SE30_ASC_BASE       0x50F14000u   /* Apple Sound Chip */
+#define MAC_SE30_IWM_BASE       0x50F16000u   /* SWIM (IWM-compatible) */
+#define MAC_SE30_MAX_RAM        (128u * 1024u * 1024u)
+
 /* Mac Plus screen: 512x342, 1 bit/pixel. The main framebuffer sits a
  * fixed distance below the top of RAM. */
 #define MAC_SCREEN_W   512
@@ -156,10 +174,36 @@ typedef struct mac_scc {
     void *tx_ctx;
 } mac_scc;
 
+/* --- Apple Sound Chip (SE/30 / Mac II family) -------------------------
+ * Stubbed: reads return 0, writes are accepted but no sound is produced.
+ * Full ASC modelling is a later milestone. Holds register storage so the
+ * guest can read back what it wrote. */
+typedef struct mac_asc {
+    u8  regs[0x800];       /* 2 KB register window */
+} mac_asc;
+
+/* --- Apple Desktop Bus (SE/30 keyboard + mouse) ------------------------
+ * Stubbed: enough state for VIA-driven ADB transactions to terminate
+ * without wedging the boot ROM. No keyboard / mouse input yet. Full ADB
+ * protocol is a later milestone. */
+typedef struct mac_adb {
+    u8  state;             /* current transaction phase */
+    u8  cmd;               /* last command latched      */
+    u8  fifo[8];            /* response FIFO            */
+    u8  fifo_n;
+    u8  fifo_pos;
+} mac_adb;
+
 struct m68k_cpu;
 typedef void (*mac_serial_fn)(void *ctx, u8 byte);
 
 typedef struct mac_mem {
+    /* Which machine this memory map models. PLUS keeps the 24-bit bus +
+     * Plus MMIO map; SE30 enables the 32-bit bus + SE/30 MMIO map +
+     * VIA2/ASC/ADB devices. Default-init to PLUS so legacy callers (the
+     * one-argument mac_mem_init) get the historical Plus behavior. */
+    mac_machine_t model;
+
     u8  *ram;
     u32  ram_size;
     u8  *rom;
@@ -167,10 +211,13 @@ typedef struct mac_mem {
     bool overlay;
 
     via6522  via;
+    via6522  via2;         /* SE/30 only — slot IRQ / sound / SCSI aggregate */
     mac_rtc  rtc;
     mac_iwm  iwm;
     mac_scc  scc;
     mac_scsi scsi;
+    mac_asc  asc;          /* SE/30 only — Apple Sound Chip (stub) */
+    mac_adb  adb;          /* SE/30 only — Apple Desktop Bus (stub) */
 
     u32  fb_base;          /* active framebuffer address          */
     u8   mouse_btn;        /* 0 = pressed, 1 = up                 */
@@ -201,7 +248,14 @@ extern void (*mac_mmio_log)(mac_mem *m, u32 addr, u32 val, int is_write, int siz
 extern void (*mac_write_watch)(void *ctx, u32 addr);
 extern void  *mac_write_watch_ctx;
 
-void mac_mem_init(mac_mem *m, u32 ram_size);
+/* Initialize the memory map for the given machine and RAM size. The Plus
+ * path is the historical default — callers using the one-argument
+ * mac_mem_init wrapper below get MAC_MODEL_PLUS and the original behavior
+ * unchanged. */
+void mac_mem_init_ex(mac_mem *m, mac_machine_t model, u32 ram_size);
+static inline void mac_mem_init(mac_mem *m, u32 ram_size) {
+    mac_mem_init_ex(m, MAC_MODEL_PLUS, ram_size);
+}
 void mac_mem_free(mac_mem *m);
 bool mac_load_rom(mac_mem *m, const u8 *rom, u32 len);
 void mac_load_ram_image(mac_mem *m, u32 addr, const u8 *img, u32 len);

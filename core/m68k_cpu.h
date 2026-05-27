@@ -47,6 +47,39 @@ typedef struct m68k_cpu {
 
     u8  pending_irq;   /* highest pending interrupt level (0 = none, 1..7) */
 
+    /* 68010+ vector base register. Plus mode leaves this at 0 so exception
+     * vectoring (mac_read32(mem, vector*4)) is bit-for-bit unchanged. The
+     * SE/30 ROM moves the vector table out of low memory by writing VBR
+     * via MOVEC. */
+    u32 vbr;
+
+    /* 68010+ source / destination function codes — modes the MOVES
+     * instruction reads/writes through. We don't actually model function
+     * codes in mac_mem (all accesses are equivalent); these fields just
+     * give MOVEC something to write/read so the OS isn't surprised. */
+    u32 sfc, dfc;
+
+    /* 68020/030 cache control / cache address registers. Our emulation
+     * has no on-chip cache; these are pure scratch the guest can write
+     * and read back. */
+    u32 cacr, caar;
+
+    /* 68020+ master / interrupt stack pointers. The 68030 doesn't actually
+     * implement the split-stack mode (that's 68020-only with the right
+     * SR bit), but MOVEC to/from MSP/ISP must still round-trip values
+     * cleanly. */
+    u32 msp, isp;
+
+    /* TODO(pmmu): register stub only — the SE/30's 68030 has an on-chip
+     * PMMU. We accept PMOVE writes (so the SE/30 ROM doesn't fault) but
+     * do NOT actually translate addresses. PFLUSH / PLOAD / PTEST are
+     * no-ops. System 7 boots in 24-bit mode where the MMU is transparent;
+     * 32-bit mode / Virtual Memory will need full PTW. */
+    u64 srp, crp;          /* supervisor / CPU root pointers */
+    u32 tc;                /* translation control register   */
+    u32 tt0, tt1;          /* transparent translation 0 / 1  */
+    u16 mmusr;             /* MMU status register            */
+
     /* Scratch slot used by a JIT block to stash its CALL0 return address
      * without modifying a1 (see jit/dispatcher.c — same trick as gbjit). */
     u32 jit_ret_pc;

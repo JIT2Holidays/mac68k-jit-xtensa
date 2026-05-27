@@ -204,12 +204,20 @@ static void spawn_host_backend(const char *self, const char *rom,
          * --ram-mb 4 is the Mac Plus's hardware maximum (4 × 1 MB SIMM
          * sockets); override with MAC_GUI_RAM_MB=<n>. */
         const char *ram_mb = getenv("MAC_GUI_RAM_MB");
-        if (!ram_mb || !*ram_mb) ram_mb = "4";
+        const char *machine = getenv("MAC_GUI_MACHINE");
+        if (!machine || !*machine) machine = "plus";
+        /* Default RAM for SE/30 is 8 MB (a sane Inside-Mac config); Plus
+         * stays at its 4 MB hardware max. Either can be overridden by
+         * MAC_GUI_RAM_MB=<n>. */
+        if (!ram_mb || !*ram_mb)
+            ram_mb = (strcmp(machine, "se30") == 0) ? "8" : "4";
         if (getenv("MAC_GUI_INTERP")) {
-            execl(exe, exe, "--server", "--ram-mb", ram_mb,
+            execl(exe, exe, "--server", "--machine", machine,
+                  "--ram-mb", ram_mb,
                   "--rom", "--disk", disk, rom, (char *)NULL);
         } else {
-            execl(exe, exe, "--server", "--jit", "--ram-mb", ram_mb,
+            execl(exe, exe, "--server", "--jit", "--machine", machine,
+                  "--ram-mb", ram_mb,
                   "--rom", "--disk", disk, rom, (char *)NULL);
         }
         fprintf(stderr, "exec %s failed: %s\n", exe, strerror(errno));
@@ -277,8 +285,56 @@ static int     g_inlen;
 /* SDL audio device id (0 = no audio / opening failed). */
 static SDL_AudioDeviceID g_audio = 0;
 
+/* --- audio ring buffer + SDL callback (ported from mini vMac) ----------
+ * The backend emits MACGUI_PKT_AUDIO packets at real-time pace; we drop
+ * them into a power-of-two ring buffer here, and SDL's audio thread pulls
+ * out exactly the number of samples it needs in `sdl_audio_callback`.
+ *
+ * Using callback mode (instead of SDL_QueueAudio) avoids the packet-
+ * boundary discontinuities that produced clicks: SDL always reads a
+ * smooth contiguous stream from the ring. On underrun we ramp the output
+ * value toward 0x80 (silence) one step per sample, so brief gaps from
+ * network/scheduling jitter fade out instead of popping. */
+#define AUDIO_RING_LOG2     13
+#define AUDIO_RING_SIZE     (1u << AUDIO_RING_LOG2)
+#define AUDIO_RING_MASK     (AUDIO_RING_SIZE - 1u)
+
+static uint8_t  g_audio_ring[AUDIO_RING_SIZE];
+static volatile uint32_t g_audio_w = 0;    /* producer index */
+static volatile uint32_t g_audio_r = 0;    /* consumer index */
+static int      g_audio_v = 0x80;          /* last value, used for underrun ramp */
+
+static void sdl_audio_callback(void *userdata, Uint8 *stream, int len) {
+    (void)userdata;
+    int v = g_audio_v;
+    for (int i = 0; i < len; i++) {
+        uint32_t w = g_audio_w;        /* snapshot (single-producer) */
+        if (w != g_audio_r) {
+            v = g_audio_ring[g_audio_r & AUDIO_RING_MASK];
+            g_audio_r++;
+        } else {
+            /* Underrun: ramp toward 0x80 silence to mute pops. */
+            if (v < 0x80) v++;
+            else if (v > 0x80) v--;
+        }
+        stream[i] = (Uint8)v;
+    }
+    g_audio_v = v;
+}
+
 static void audio_handler(const uint8_t *samples, int n) {
-    if (g_audio) SDL_QueueAudio(g_audio, samples, (Uint32)n);
+    if (!g_audio) return;
+    for (int i = 0; i < n; i++) {
+        uint32_t w = g_audio_w;
+        uint32_t r = g_audio_r;
+        if ((w - r) >= AUDIO_RING_SIZE - 1u) {
+            /* Ring full — backend bursting faster than SDL drains. Skip the
+             * oldest sample (advance r by writing then dropping). */
+            g_audio_r = r + 1;
+        }
+        g_audio_ring[w & AUDIO_RING_MASK] = samples[i];
+        g_audio_w = w + 1;
+    }
 }
 
 /* Drain the socket; for each complete packet, invoke the handler. */
@@ -371,17 +427,20 @@ int main(int argc, char **argv) {
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) != 0) {
         fprintf(stderr, "SDL_Init: %s\n", SDL_GetError()); return 1;
     }
-    /* Mac Plus sound: 22255 Hz, 8-bit unsigned mono. Open with a
-     * matching spec so SDL doesn't resample. The backend emits exactly
-     * one VBL's worth of samples (370 bytes) per packet at 60Hz, so
-     * the effective rate is 22200 Hz — within SDL's resampler tolerance
-     * if the spec is unavailable. MAC_GUI_NO_AUDIO disables. */
+    /* Mac Plus sound: 22255 Hz, 8-bit unsigned mono. Use SDL callback mode
+     * (port of mini vMac's audio driver): the backend feeds a ring buffer
+     * via audio_handler and SDL pulls smooth chunks of samples from it.
+     * Callback mode avoids the packet-boundary clicks SDL_QueueAudio
+     * produced when the backend ran ahead/behind real time.
+     * MAC_GUI_NO_AUDIO disables. */
     if (!getenv("MAC_GUI_NO_AUDIO")) {
         SDL_AudioSpec want = {0}, have = {0};
         want.freq = 22255;
         want.format = AUDIO_U8;
         want.channels = 1;
-        want.samples = 1024;
+        want.samples = 512;
+        want.callback = sdl_audio_callback;
+        want.userdata = NULL;
         g_audio = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
         if (g_audio == 0)
             fprintf(stderr, "[gui] SDL_OpenAudioDevice failed: %s — silent\n",

@@ -464,22 +464,43 @@ static void scc_tx_cb(void *ctx, int channel, u8 byte) {
     fputc((int)byte, f);
 }
 
-/* Sound sink: append 8-bit PCM samples to a shared ring buffer that
- * the server loop drains as MACGUI_PKT_AUDIO packets. ~6 VBLs of
- * buffer (≈100ms) is plenty for the GUI's SDL queue to smooth over
- * network/scheduling jitter. */
-static u8     g_snd_buf[MAC_SND_SAMPLES_PER_VBL * 16];
+/* Audio FIFO: ~340ms at the 22255 Hz Mac PWM rate. snd_sink appends
+ * VBL chunks here; the server loop drains them at exactly real-time
+ * 22255 Hz so SDL receives a steady stream regardless of how fast the
+ * emulator runs. At Max speed the FIFO would otherwise burst-fill SDL's
+ * queue, then empty it, repeating — producing audible pops on every
+ * underrun. With this FIFO the emulator can race ahead but audio still
+ * plays out smoothly (the most recent ~340ms of emulator time, padded
+ * with held silence if the FIFO underruns). */
+#define AUDIO_FIFO_SAMPLES  (MAC_SND_SAMPLES_PER_VBL * 20)
+static u8     g_snd_buf[AUDIO_FIFO_SAMPLES];
 static u32    g_snd_len;
+static u8     g_snd_last = 0x80;   /* last sample sent — held on underrun */
 static void server_snd_sink(void *ctx, const u8 *samples, u32 n) {
     (void)ctx;
     if (g_snd_len + n > sizeof(g_snd_buf)) {
-        /* Drop oldest to avoid runaway latency if the GUI isn't draining. */
+        /* Drop oldest at Max speed (producer outruns the real-time drain). */
         u32 drop = g_snd_len + n - (u32)sizeof(g_snd_buf);
         memmove(g_snd_buf, g_snd_buf + drop, g_snd_len - drop);
         g_snd_len -= drop;
     }
     memcpy(g_snd_buf + g_snd_len, samples, n);
     g_snd_len += n;
+}
+
+/* Drain `n` samples from the FIFO into `out`. If the FIFO has fewer than
+ * `n` samples, pad with the last seen sample value (DC hold) rather than
+ * abrupt silence — abrupt 0x80 silence reads as a click. */
+static void server_snd_drain(u8 *out, u32 n) {
+    u32 take = n < g_snd_len ? n : g_snd_len;
+    if (take > 0) {
+        memcpy(out, g_snd_buf, take);
+        g_snd_last = g_snd_buf[take - 1];
+        if (take < g_snd_len)
+            memmove(g_snd_buf, g_snd_buf + take, g_snd_len - take);
+        g_snd_len -= take;
+    }
+    if (take < n) memset(out + take, g_snd_last, n - take);
 }
 
 static int server_loop(mac_mem *m, m68k_cpu *cpu) {
@@ -513,6 +534,10 @@ static int server_loop(mac_mem *m, m68k_cpu *cpu) {
     double pace_t0 = t0;
     u64    pace_cyc0 = cpu->cycles;
     u32    last_speed_mult = g_speed_mult;
+    /* Audio pacing: emit MAC_SND_SAMPLE_RATE samples per real-time
+     * second, independent of g_speed_mult. */
+    double audio_t0 = t0;
+    u64    audio_samples_emitted = 0;
     fprintf(stderr, "[server] running — protocol on stdin/stdout\n");
 
     while (!cpu->halted) {
@@ -572,10 +597,19 @@ static int server_loop(mac_mem *m, m68k_cpu *cpu) {
                     write_screen_bmp(m, getenv("MAC_SERVER_DUMP"));
             }
         }
-        /* Drain any accumulated sound samples (~370 bytes per VBL). */
-        if (g_snd_len > 0) {
-            send_packet(MACGUI_PKT_AUDIO, g_snd_buf, g_snd_len);
-            g_snd_len = 0;
+        /* Audio: rate-limited drain at exactly MAC_SND_SAMPLE_RATE (22255 Hz)
+         * regardless of emulator speed. At Max speed snd_sink runs ahead and
+         * the FIFO holds the most recent ~340ms; we send samples to SDL only
+         * at real-time pace so playback stays smooth without underrun pops. */
+        u64 want = (u64)((mono_now - audio_t0) * (double)MAC_SND_SAMPLE_RATE);
+        if (want > audio_samples_emitted) {
+            u32 n_emit = (u32)(want - audio_samples_emitted);
+            if (n_emit > MAC_SND_SAMPLES_PER_VBL * 4u)
+                n_emit = MAC_SND_SAMPLES_PER_VBL * 4u;   /* cap per-iter burst */
+            u8 audio_out[MAC_SND_SAMPLES_PER_VBL * 4];
+            server_snd_drain(audio_out, n_emit);
+            send_packet(MACGUI_PKT_AUDIO, audio_out, n_emit);
+            audio_samples_emitted += n_emit;
         }
         usleep(2000);
     }
@@ -658,7 +692,11 @@ static void usage(const char *a0) {
         "  --max-cycles N  stop after N cycles (default 200M)\n"
         "  --load-snapshot S  load machine snapshot S and run it (for\n"
         "                  benchmarking an engine on a frozen state)\n"
-        "  --ram-mb M      RAM size in MiB (default 1)\n"
+        "  --ram-mb M      RAM size in MiB (default 1; capped at 4 on Plus, 128 on SE/30)\n"
+        "  --machine MODE  emulated machine: 'plus' (default, 68000, 24-bit bus,\n"
+        "                  128 KB ROM) or 'se30' (68030, 32-bit bus, 256 KB ROM,\n"
+        "                  VIA1+VIA2, ASC, ADB — JIT is hybrid: 68000 ops JIT,\n"
+        "                  68020/030 ops interp via m68k_step)\n"
         "  file            raw 68k image at 0x0, or a Mac ROM with --rom;\n"
         "                  omit for the built-in demo\n",
         a0);
@@ -669,6 +707,7 @@ int main(int argc, char **argv) {
     bool is_rom = false;
     u64 max_cycles = 200000000ull;
     u32 ram_mb = 1;
+    mac_machine_t machine = MAC_MODEL_PLUS;
     const char *rom_path = NULL;
     const char *disk_path[2] = { NULL, NULL };
     int  n_disks = 0;
@@ -716,6 +755,12 @@ int main(int argc, char **argv) {
             max_cycles = strtoull(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--ram-mb") && i + 1 < argc)
             ram_mb = (u32)strtoul(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--machine") && i + 1 < argc) {
+            const char *m = argv[++i];
+            if      (!strcmp(m, "plus")) machine = MAC_MODEL_PLUS;
+            else if (!strcmp(m, "se30")) machine = MAC_MODEL_SE30;
+            else { fprintf(stderr, "--machine: expect plus|se30\n"); return 1; }
+        }
         else if (!strcmp(argv[i], "--load-snapshot") && i + 1 < argc)
             snap_load = argv[++i];
         else if (!strcmp(argv[i], "--profile")) profile = true;
@@ -745,9 +790,14 @@ int main(int argc, char **argv) {
         else rom_path = argv[i];
     }
     if (ram_mb == 0) ram_mb = 1;
+    /* SE/30 supports up to 128 MB; Plus is capped at 4 MB by the address
+     * map (RAM aliases above 4 MB are MMIO). Don't clamp here — the
+     * mac_mem_init_ex layer will clamp SE/30 to MAC_SE30_MAX_RAM, and
+     * Plus users with absurd --ram-mb values get the wrap behavior the
+     * boot code already tolerates. */
 
     mac_mem mem;
-    mac_mem_init(&mem, ram_mb * 1024u * 1024u);
+    mac_mem_init_ex(&mem, machine, ram_mb * 1024u * 1024u);
     mem.serial_sink = serial_cb;
 
     if (rom_path) {

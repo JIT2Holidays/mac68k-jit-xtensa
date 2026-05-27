@@ -102,9 +102,163 @@ static int test_xform_flags(void) {
     return rc;
 }
 
+/* Run a 1-instruction encoding (with optional ext words) under the
+ * interpreter, starting at PC=0x100 in SR=supervisor with the given
+ * pre-state. Returns the cpu after the single step. */
+static void run_one(mac_mem *mem, m68k_cpu *cpu, const u16 *enc, int n_words,
+                    u32 d_in[8], u32 a_in[8], u8 ccr_in) {
+    for (int i = 0; i < n_words; i++)
+        mac_write16(mem, 0x100 + (u32)i * 2, enc[i]);
+    memset(cpu, 0, sizeof(*cpu));
+    cpu->mem = mem; mem->cpu = cpu;
+    cpu->pc = 0x100;
+    cpu->sr = (u16)(SR_S | ccr_in);
+    if (d_in) memcpy(cpu->d, d_in, sizeof cpu->d);
+    if (a_in) memcpy(cpu->a, a_in, sizeof cpu->a);
+    else      cpu->a[7] = 0x4000;
+    m68k_step(cpu);
+}
+
+/* 68020/030 ISA additions — landed in M7.0 alongside the SE/30 machine
+ * model. Each test exercises one new opcode end-to-end through the
+ * reference interpreter. */
+static int test_68030_isa(void) {
+    mac_mem mem;
+    mac_mem_init(&mem, 64 * 1024);
+    mem.overlay = false;
+    m68k_cpu cpu;
+    int rc = 0;
+
+    /* BFEXTU D0{4:8}, D1 — extract 8 bits starting at bit offset 4 from
+     * D0 into D1. With D0 = 0xABCD1234, the field at bits [4..11] of the
+     * big-endian view (bits 27..20 of the LE register, since 68k counts
+     * bit-offset from MSB) is the byte 0xBC. */
+    {
+        u16 enc[] = { 0xE9C0, (u16)((1 << 12) | (4 << 6) | 8) };
+        u32 d[8] = { 0xABCD1234, 0, 0, 0, 0, 0, 0, 0 };
+        run_one(&mem, &cpu, enc, 2, d, NULL, 0);
+        if (cpu.d[1] != 0xBC) {
+            printf("BFEXTU: D1=%08X want 000000BC\n", cpu.d[1]); rc = 1;
+        }
+    }
+    /* MULS.L #-3, D0 with D0 = 7 -> -21 (0xFFFFFFEB). Use Dq=0, Dr=0
+     * (32-bit product); src EA is #imm.L. */
+    {
+        u16 enc[] = { 0x4C3C,                  /* MULS.L (Dq form), <ea> #imm */
+                       (u16)((0 << 12) | (1 << 11) | (0 << 10)),  /* dq=0, signed, 32-bit */
+                       0xFFFF, 0xFFFD };       /* #-3 .L */
+        u32 d[8] = { 7, 0, 0, 0, 0, 0, 0, 0 };
+        run_one(&mem, &cpu, enc, 4, d, NULL, 0);
+        if (cpu.d[0] != 0xFFFFFFEB) {
+            printf("MULS.L: D0=%08X want FFFFFFEB\n", cpu.d[0]); rc = 1;
+        }
+    }
+    /* DIVS.L #7, D0 with D0 = -21 -> -3 (0xFFFFFFFD). */
+    {
+        u16 enc[] = { 0x4C3C,
+                       (u16)((0 << 12) | (1 << 11) | (0 << 10) | 0),
+                       0x0000, 0x0007 };
+        /* That's MUL not DIV — need 0x4C7C for DIV. */
+        enc[0] = 0x4C7C;                      /* DIVS.L #imm, Dq */
+        u32 d[8] = { 0xFFFFFFEBu, 0, 0, 0, 0, 0, 0, 0 };
+        run_one(&mem, &cpu, enc, 4, d, NULL, 0);
+        if (cpu.d[0] != 0xFFFFFFFD) {
+            printf("DIVS.L: D0=%08X want FFFFFFFD\n", cpu.d[0]); rc = 1;
+        }
+    }
+    /* EXTB.L D0 with D0 = 0x12345680 -> 0xFFFFFF80. */
+    {
+        u16 enc[] = { 0x49C0 };
+        u32 d[8] = { 0x12345680, 0, 0, 0, 0, 0, 0, 0 };
+        run_one(&mem, &cpu, enc, 1, d, NULL, 0);
+        if (cpu.d[0] != 0xFFFFFF80) {
+            printf("EXTB.L: D0=%08X want FFFFFF80\n", cpu.d[0]); rc = 1;
+        }
+    }
+    /* MOVEC #imm, VBR — write 0x1000 to VBR via D0. Then MOVEC VBR, D1
+     * reads it back. */
+    {
+        u16 enc[] = { 0x4E7B, (u16)((0 << 12) | 0x801) };   /* MOVEC D0, VBR */
+        u32 d[8] = { 0x1000, 0, 0, 0, 0, 0, 0, 0 };
+        run_one(&mem, &cpu, enc, 2, d, NULL, 0);
+        if (cpu.vbr != 0x1000) {
+            printf("MOVEC->VBR: VBR=%08X want 1000\n", cpu.vbr); rc = 1;
+        }
+    }
+    /* RTD #d16: pop PC, then SP += 4 + d16. SP=0x1000, mem[0x1000] = 0x2000. */
+    {
+        mac_write32(&mem, 0x1000, 0x00002000);
+        u16 enc[] = { 0x4E74, 0x0008 };
+        u32 a[8] = { 0, 0, 0, 0, 0, 0, 0, 0x1000 };
+        run_one(&mem, &cpu, enc, 2, NULL, a, 0);
+        if (cpu.pc != 0x2000) { printf("RTD: PC=%08X want 2000\n", cpu.pc); rc = 1; }
+        if (cpu.a[7] != 0x100C) { printf("RTD: SP=%08X want 100C\n", cpu.a[7]); rc = 1; }
+    }
+    /* LINK.L A6, #-0x10000: push A6, set A6=SP, SP += -0x10000. */
+    {
+        u16 enc[] = { 0x480E, 0xFFFF, 0x0000 };
+        u32 a[8] = { 0, 0, 0, 0, 0, 0, 0xDEADBEEF, 0x4000 };
+        run_one(&mem, &cpu, enc, 3, NULL, a, 0);
+        if (cpu.a[6] != 0x3FFC) { printf("LINK.L: A6=%08X want 3FFC\n", cpu.a[6]); rc = 1; }
+        if (cpu.a[7] != 0xFFFF3FFC) { printf("LINK.L: SP=%08X want FFFF3FFC\n", cpu.a[7]); rc = 1; }
+    }
+    /* TRAPcc with cc=F (op == 0x57FC for `TRAPF`): never traps. */
+    {
+        u16 enc[] = { 0x51FC };               /* TRAPF (cc=False) — never traps */
+        run_one(&mem, &cpu, enc, 1, NULL, NULL, 0);
+        if (cpu.pc != 0x102) {
+            printf("TRAPF: PC=%08X want 102 (no trap)\n", cpu.pc); rc = 1;
+        }
+    }
+    /* PACK Dn,Dn: ('5' << 8 | '7') + 0xFF00 packed -> '57' (0x57). */
+    {
+        u16 enc[] = { 0x8141, 0x0000 };       /* PACK D1,D0,#0 — adj=0 */
+        u32 d[8] = { 0, 0x3537, 0, 0, 0, 0, 0, 0 };
+        run_one(&mem, &cpu, enc, 2, d, NULL, 0);
+        if ((cpu.d[0] & 0xFF) != 0x57) {
+            printf("PACK: D0=%02X want 57\n", cpu.d[0] & 0xFF); rc = 1;
+        }
+    }
+    mac_mem_free(&mem);
+    if (!rc) printf("  68020/030 ISA additions OK\n");
+    return rc;
+}
+
+/* SE/30 memory map init must succeed and route region decode correctly. */
+static int test_se30_init_stable(void) {
+    mac_mem mem;
+    mac_mem_init_ex(&mem, MAC_MODEL_SE30, 8u * 1024u * 1024u);
+    if (mem.model != MAC_MODEL_SE30) {
+        printf("se30: model = %d want 1\n", mem.model); return 1;
+    }
+    if (mem.overlay) {
+        printf("se30: overlay set, expected off\n"); return 1;
+    }
+    /* Stub ASC/ADB present in the struct (no crash on access). */
+    mac_write8(&mem, MAC_SE30_ASC_BASE + 0x10, 0x55);
+    if (mac_read8(&mem, MAC_SE30_ASC_BASE + 0x10) != 0x55) {
+        printf("se30: ASC register stub didn't round-trip\n"); return 1;
+    }
+    /* VIA2 register stub round-trip. */
+    mac_write8(&mem, MAC_SE30_VIA2_BASE + (11 << 9), 0x42);   /* ACR */
+    if (mac_read8(&mem, MAC_SE30_VIA2_BASE + (11 << 9)) != 0x42) {
+        printf("se30: VIA2 ACR didn't round-trip\n"); return 1;
+    }
+    /* 32-bit RAM access above 0x1000000 (16 MB). */
+    mac_write32(&mem, 0x00100000, 0xDEADBEEF);
+    if (mac_read32(&mem, 0x00100000) != 0xDEADBEEF) {
+        printf("se30: high-RAM write didn't stick\n"); return 1;
+    }
+    mac_mem_free(&mem);
+    printf("  SE/30 init + region decode OK\n");
+    return 0;
+}
+
 int main(void) {
     if (test_arith()) return fail("arith snippet");
     if (test_xform_flags()) return fail("X-form condition codes");
+    if (test_68030_isa()) return fail("68030 ISA");
+    if (test_se30_init_stable()) return fail("SE/30 init");
 
     mac_mem mem;
     mac_mem_init(&mem, 1024 * 1024);

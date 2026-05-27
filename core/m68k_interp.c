@@ -84,15 +84,48 @@ typedef struct {
     u32 imm;     /* IMM: immediate value     */
 } ea_t;
 
-/* Resolve the brief-format index displacement used by modes (d8,An,Xn)
- * and (d8,PC,Xn). */
+/* Resolve the index displacement used by modes (d8,An,Xn) and
+ * (d8,PC,Xn). On the 68000 only the brief format (bit 8 = 0) is legal;
+ * on the 68020+ bit 8 = 1 selects the full extension format, which adds
+ * a scaled index, an optional base displacement (word or long) and
+ * memory-indirect modes with an outer displacement. */
 static u32 brief_index(m68k_cpu *cpu, u32 base) {
     u16 ext = fetch16(cpu);
     int ireg = (ext >> 12) & 7;
     u32 ival = (ext & 0x8000) ? cpu->a[ireg] : cpu->d[ireg];
     if (!(ext & 0x0800)) ival = (u32)(i32)(i16)(u16)ival;   /* word index */
-    i32 disp = (i8)(ext & 0xFF);
-    return base + ival + (u32)disp;
+    if (!(ext & 0x0100)) {
+        /* Brief format — single signed-byte displacement. */
+        i32 disp = (i8)(ext & 0xFF);
+        return base + ival + (u32)disp;
+    }
+    /* Full format (68020+). */
+    int scale = (ext >> 9) & 3;       /* 0..3 → ×1,×2,×4,×8 */
+    bool bs = (ext & 0x80) != 0;      /* base suppress */
+    bool is = (ext & 0x40) != 0;      /* index suppress */
+    int bd_size = (ext >> 4) & 3;     /* 0 reserved, 1 null, 2 word, 3 long */
+    int iis = ext & 7;                /* indirect / outer disp selector */
+    u32 bd = 0;
+    if (bd_size == 2) bd = (u32)(i32)(i16)fetch16(cpu);
+    else if (bd_size == 3) bd = fetch32(cpu);
+    u32 base_eff = bs ? 0u : base;
+    u32 idx_eff = is ? 0u : (ival << scale);
+    u32 intermediate = base_eff + bd;
+    if (iis == 0) {
+        /* No memory indirection. */
+        return intermediate + idx_eff;
+    }
+    /* Memory-indirect: pre-indexed if iis in 1..3 (and IS clear), or
+     * post-indexed if iis in 5..7. With IS set, all 1..3 are plain
+     * memory-indirect (index has no effect since it's suppressed). */
+    bool postindexed = (iis >= 5);
+    int od_sel = iis & 3;             /* 0/1/2/3 — null/null/word/long */
+    u32 od = 0;
+    if (od_sel == 2) od = (u32)(i32)(i16)fetch16(cpu);
+    else if (od_sel == 3) od = fetch32(cpu);
+    u32 addr = postindexed ? intermediate : intermediate + idx_eff;
+    if (cpu->mem) addr = mac_read32(cpu->mem, addr);
+    return addr + (postindexed ? idx_eff : 0u) + od;
 }
 
 /* Decode an effective address. Consumes extension words and applies the
@@ -360,7 +393,10 @@ void m68k_exception(m68k_cpu *cpu, u32 vector) {
     mac_write32(cpu->mem, cpu->a[7], cpu->pc);
     cpu->a[7] -= 2;
     mac_write16(cpu->mem, cpu->a[7], saved_sr);
-    cpu->pc = mac_read32(cpu->mem, vector * 4u);
+    /* 68010+ vector table is relocatable via VBR; for the 68000 (Plus mode)
+     * VBR is always 0, so this is bit-for-bit identical to the historical
+     * `mac_read32(cpu->mem, vector * 4u)`. */
+    cpu->pc = mac_read32(cpu->mem, cpu->vbr + vector * 4u);
     cpu->cycles += 34;
 }
 
@@ -380,8 +416,8 @@ bool m68k_poll_interrupts(m68k_cpu *cpu) {
     mac_write32(cpu->mem, cpu->a[7], cpu->pc);
     cpu->a[7] -= 2;
     mac_write16(cpu->mem, cpu->a[7], saved_sr);
-    /* Autovector: level n -> vector 24+n. */
-    cpu->pc = mac_read32(cpu->mem, (24u + level) * 4u);
+    /* Autovector: level n -> vector 24+n. Relocated through VBR on 68010+. */
+    cpu->pc = mac_read32(cpu->mem, cpu->vbr + (24u + level) * 4u);
     cpu->stopped = 0;
     cpu->cycles += 44;
     return true;
@@ -1189,6 +1225,655 @@ void m68k_jit_move_l_postinc_to_dn_mmio(m68k_cpu *cpu) {
     m68k_set_ccr(cpu, ccr);
 }
 
+/* ============================================================
+ * 68020/68030 ISA additions (M7.0 — SE/30 foundation milestone)
+ * ============================================================
+ *
+ * These helpers implement the integer-ISA extensions that the 68030 in the
+ * Mac SE/30 needs. They are gated by encoding only — the bit patterns
+ * never collide with valid 68000 encodings, so adding them is safe for
+ * Plus mode (Plus ROM never emits them; existing handlers either don't
+ * match or raise illegal-instruction, both of which the new handlers
+ * supersede only when the new patterns actually fire).
+ *
+ * Coverage:
+ *   bitfield      BFTST / BFEXTU / BFEXTS / BFCHG / BFCLR / BFSET / BFFFO / BFINS
+ *   long mul/div  MULU.L / MULS.L (32×32, 32×32→64) / DIVU.L / DIVS.L (32÷32, 64÷32)
+ *   short adds    EXTB.L / LINK.L / RTD #d16
+ *   control regs  MOVEC ctl-reg<->Rn (SFC/DFC/USP/VBR/CACR/CAAR/MSP/ISP)
+ *   moves         MOVES <ea>,Rn / Rn,<ea>  (function code modes — modelled as plain access)
+ *   trap          TRAPcc (with optional .W / .L operand)
+ *   bounds        CHK2 / CMP2
+ *   compare-swap  CAS / CAS2 (non-atomic — the guest is single-core)
+ *   bcd packing   PACK / UNPK
+ *   PMMU stubs    PMOVE TC/SRP/CRP/TT0/TT1/MMUSR (register-only; no translation)
+ *                 PFLUSH / PLOAD / PTEST — no-op advance
+ *   cache         CINV / CPUSH — no-op advance
+ *
+ * TODO(pmmu): full page-table walk + address translation. This milestone
+ * accepts PMOVE writes so the SE/30 ROM doesn't fault during init, but
+ * mac_read/write still go through the flat physical address. System 7
+ * boots in 24-bit mode where the MMU is transparent; 32-bit Mode / Virtual
+ * Memory will need full PTW. */
+
+static bool is_priv_violation_if_user(m68k_cpu *cpu, u32 op_pc) {
+    if (!m68k_is_super(cpu)) {
+        m68k_unimpl(cpu, op_pc, 8);   /* privilege violation */
+        return true;
+    }
+    return false;
+}
+
+/* ---- bitfield ops ----------------------------------------------------- */
+
+static u32 bf_offset_resolve(m68k_cpu *cpu, u16 ext) {
+    /* Bit 11 = Do (offset dynamic via Dn). Bits 10..6 = offset value or Dn idx. */
+    if (ext & 0x0800) return cpu->d[(ext >> 6) & 7];
+    return (ext >> 6) & 0x1F;
+}
+
+static u32 bf_width_resolve(m68k_cpu *cpu, u16 ext) {
+    /* Bit 5 = Dw (width dynamic via Dn). Bits 4..0 = width (0 means 32). */
+    u32 w;
+    if (ext & 0x0020) w = cpu->d[ext & 7] & 0x1F;
+    else              w = ext & 0x1F;
+    if (w == 0) w = 32;
+    return w;
+}
+
+/* Read up to 5 bytes covering a bitfield window starting at byte_addr,
+ * with bit_off in [0..7], width in [1..32]. Returns the field right-
+ * aligned in a u32 (bits above the field are zero). */
+static u32 bf_read_mem(m68k_cpu *cpu, u32 byte_addr, u32 bit_off, u32 width) {
+    u32 total_bits = bit_off + width;
+    u32 nbytes = (total_bits + 7u) / 8u;   /* 1..5 */
+    u64 v = 0;
+    for (u32 i = 0; i < nbytes; i++)
+        v = (v << 8) | mac_read8(cpu->mem, byte_addr + i);
+    u32 shift = (nbytes * 8u) - (bit_off + width);
+    return (u32)((v >> shift) & ((1ull << width) - 1ull));
+}
+
+static void bf_write_mem(m68k_cpu *cpu, u32 byte_addr, u32 bit_off,
+                         u32 width, u32 field) {
+    u32 total_bits = bit_off + width;
+    u32 nbytes = (total_bits + 7u) / 8u;
+    u64 v = 0;
+    for (u32 i = 0; i < nbytes; i++)
+        v = (v << 8) | mac_read8(cpu->mem, byte_addr + i);
+    u32 shift = (nbytes * 8u) - (bit_off + width);
+    u64 mask = ((1ull << width) - 1ull) << shift;
+    v = (v & ~mask) | (((u64)field & ((1ull << width) - 1ull)) << shift);
+    for (u32 i = 0; i < nbytes; i++)
+        mac_write8(cpu->mem, byte_addr + (nbytes - 1 - i), (u8)((v >> (i * 8)) & 0xFF));
+}
+
+static void do_bitfield(m68k_cpu *cpu, u16 op, u32 op_pc) {
+    u16 ext = fetch16(cpu);
+    int op_sel = (op >> 8) & 7;   /* 0=BFTST,1=BFEXTU,2=BFCHG,3=BFEXTS,
+                                   * 4=BFCLR,5=BFFFO,6=BFSET,7=BFINS */
+    int mode = (op >> 3) & 7, reg = op & 7;
+    int dn_arg = (ext >> 12) & 7;
+    u32 offset = bf_offset_resolve(cpu, ext);
+    u32 width  = bf_width_resolve(cpu, ext);
+    bool is_reg = (mode == 0);
+    if (is_reg && width > 32) width = 32;
+
+    /* Read the field. */
+    u32 field;
+    u32 byte_addr = 0, bit_off = 0;
+    u32 rdn = 0;
+    if (is_reg) {
+        /* Register operand: offset is taken mod 32; width clipped to 32. */
+        u32 off32 = offset & 31u;
+        rdn = cpu->d[reg];
+        /* Bits in field are bits (31-off..31-off-width+1) of Dn. */
+        u32 left_shift = off32;
+        u32 right_shift = 32u - width;
+        /* Sign-aware: BFEXTS does an arithmetic right shift below; here we
+         * just produce the bits zero-extended. */
+        field = (rdn << left_shift) >> right_shift;
+    } else {
+        ea_t e = ea_decode(cpu, mode, reg, 1);
+        if (e.kind != EA_MEM) { illegal(cpu, op); return; }
+        i32 soff = (i32)offset;
+        byte_addr = (u32)((i32)e.addr + (soff >> 3));
+        bit_off = (u32)(soff & 7);
+        if (soff < 0) {
+            /* For negative offsets (only allowed when the offset is dynamic),
+             * normalise so bit_off is in [0..7]. */
+            if (bit_off != 0) {
+                bit_off = (u32)(8 - (((-soff) - 1) % 8 + 1));
+            }
+        }
+        field = bf_read_mem(cpu, byte_addr, bit_off, width);
+    }
+
+    /* CCR from the field (Z = field == 0; N = MSB of field). V = C = 0. */
+    u8 ccr = m68k_get_ccr(cpu) & CCR_X;
+    if (field == 0) ccr |= CCR_Z;
+    if (field & (1u << (width - 1))) ccr |= CCR_N;
+    m68k_set_ccr(cpu, ccr);
+
+    switch (op_sel) {
+    case 0:   /* BFTST: flags only */
+        break;
+    case 1: { /* BFEXTU */
+        cpu->d[dn_arg] = field;
+        break;
+    }
+    case 3: { /* BFEXTS */
+        u32 mask = (width >= 32) ? 0xFFFFFFFFu : ((1u << width) - 1u);
+        if (field & (1u << (width - 1)))
+            cpu->d[dn_arg] = field | ~mask;
+        else
+            cpu->d[dn_arg] = field;
+        break;
+    }
+    case 5: { /* BFFFO: find first one. Result = offset + leading-zero count
+               * within the width-wide window. If all zero, result = offset + width. */
+        u32 lz = 0;
+        for (u32 i = 0; i < width; i++) {
+            if (field & (1u << (width - 1 - i))) break;
+            lz++;
+        }
+        cpu->d[dn_arg] = offset + lz;
+        break;
+    }
+    case 2:   /* BFCHG */
+    case 4:   /* BFCLR */
+    case 6: { /* BFSET */
+        u32 new_field = (op_sel == 2) ? (~field) : (op_sel == 4) ? 0u : 0xFFFFFFFFu;
+        u32 mask = (width >= 32) ? 0xFFFFFFFFu : ((1u << width) - 1u);
+        new_field &= mask;
+        if (is_reg) {
+            /* Write back into Dn at the same bit range. */
+            u32 off32 = offset & 31u;
+            u32 left = (32u - width - off32) & 31u;
+            u32 dst_mask = mask << left;
+            cpu->d[reg] = (cpu->d[reg] & ~dst_mask) | ((new_field << left) & dst_mask);
+        } else {
+            bf_write_mem(cpu, byte_addr, bit_off, width, new_field);
+        }
+        break;
+    }
+    case 7: { /* BFINS */
+        u32 src = cpu->d[dn_arg];
+        u32 mask = (width >= 32) ? 0xFFFFFFFFu : ((1u << width) - 1u);
+        u32 new_field = src & mask;
+        /* CCR for BFINS is computed from the source-field bits, not the
+         * pre-existing memory. Recompute. */
+        ccr = m68k_get_ccr(cpu) & CCR_X;
+        if (new_field == 0) ccr |= CCR_Z;
+        if (new_field & (1u << (width - 1))) ccr |= CCR_N;
+        m68k_set_ccr(cpu, ccr);
+        if (is_reg) {
+            u32 off32 = offset & 31u;
+            u32 left = (32u - width - off32) & 31u;
+            u32 dst_mask = mask << left;
+            cpu->d[reg] = (cpu->d[reg] & ~dst_mask) | ((new_field << left) & dst_mask);
+        } else {
+            bf_write_mem(cpu, byte_addr, bit_off, width, new_field);
+        }
+        break;
+    }
+    default: illegal(cpu, op); return;
+    }
+    cpu->cycles += is_reg ? 6 : 12;
+    (void)op_pc;
+}
+
+/* ---- long multiply / divide ------------------------------------------- */
+
+static void do_long_muldiv(m68k_cpu *cpu, u16 op, u32 op_pc) {
+    bool is_div = (op & 0x0040) != 0;
+    int mode = (op >> 3) & 7, reg = op & 7;
+    u16 ext = fetch16(cpu);
+    bool sgn = (ext & 0x0800) != 0;
+    int dq = (ext >> 12) & 7;
+    int dr = ext & 7;
+    bool sz64 = (ext & 0x0400) != 0;
+    ea_t e = ea_decode(cpu, mode, reg, 4);
+    u32 src = ea_read(cpu, &e, 4);
+    if (!is_div) {
+        /* MULU.L / MULS.L */
+        if (sz64) {
+            /* 32 × 32 -> 64-bit; high half in Dr, low half in Dq. */
+            u64 a = sgn ? (u64)(i64)(i32)cpu->d[dq] : (u64)cpu->d[dq];
+            u64 b = sgn ? (u64)(i64)(i32)src        : (u64)src;
+            u64 r = sgn ? (u64)((i64)a * (i64)b) : a * b;
+            cpu->d[dq] = (u32)(r & 0xFFFFFFFFu);
+            cpu->d[dr] = (u32)(r >> 32);
+            u8 ccr = m68k_get_ccr(cpu) & CCR_X;
+            if (r == 0) ccr |= CCR_Z;
+            if ((i64)r < 0 && sgn) ccr |= CCR_N;
+            else if (!sgn && (r >> 63)) ccr |= CCR_N;
+            m68k_set_ccr(cpu, ccr);
+        } else {
+            /* 32 × 32 -> 32-bit result in Dq; V set if result overflows 32 bits. */
+            u64 a = sgn ? (u64)(i64)(i32)cpu->d[dq] : (u64)cpu->d[dq];
+            u64 b = sgn ? (u64)(i64)(i32)src        : (u64)src;
+            u64 r = sgn ? (u64)((i64)a * (i64)b) : a * b;
+            u32 r32 = (u32)(r & 0xFFFFFFFFu);
+            cpu->d[dq] = r32;
+            u8 ccr = m68k_get_ccr(cpu) & CCR_X;
+            if (r32 == 0) ccr |= CCR_Z;
+            if (r32 & 0x80000000u) ccr |= CCR_N;
+            bool overflow;
+            if (sgn) {
+                i64 sr = (i64)r;
+                overflow = sr < (i64)(i32)0x80000000 || sr > (i64)(i32)0x7FFFFFFF;
+            } else {
+                overflow = (r >> 32) != 0;
+            }
+            if (overflow) ccr |= CCR_V;
+            m68k_set_ccr(cpu, ccr);
+        }
+        cpu->cycles += 40;
+    } else {
+        /* DIVU.L / DIVS.L */
+        if (src == 0) { m68k_exception(cpu, 5); return; }
+        if (sz64) {
+            /* 64 ÷ 32 -> 32q + 32r. Dividend = (Dr:Dq); quotient in Dq, remainder in Dr. */
+            if (sgn) {
+                i64 dividend = (i64)(((u64)cpu->d[dr] << 32) | cpu->d[dq]);
+                i32 divisor = (i32)src;
+                i64 q = dividend / divisor;
+                i64 r = dividend % divisor;
+                if (q > (i64)(i32)0x7FFFFFFF || q < (i64)(i32)0x80000000) {
+                    u8 ccr = m68k_get_ccr(cpu) & CCR_X;
+                    ccr |= CCR_V;
+                    m68k_set_ccr(cpu, ccr);
+                } else {
+                    cpu->d[dq] = (u32)(i32)q;
+                    cpu->d[dr] = (u32)(i32)r;
+                    u8 ccr = m68k_get_ccr(cpu) & CCR_X;
+                    if (q == 0) ccr |= CCR_Z;
+                    if (q < 0)  ccr |= CCR_N;
+                    m68k_set_ccr(cpu, ccr);
+                }
+            } else {
+                u64 dividend = ((u64)cpu->d[dr] << 32) | cpu->d[dq];
+                u32 divisor = src;
+                u64 q = dividend / divisor;
+                u64 r = dividend % divisor;
+                if (q > 0xFFFFFFFFu) {
+                    u8 ccr = m68k_get_ccr(cpu) & CCR_X;
+                    ccr |= CCR_V;
+                    m68k_set_ccr(cpu, ccr);
+                } else {
+                    cpu->d[dq] = (u32)q;
+                    cpu->d[dr] = (u32)r;
+                    u8 ccr = m68k_get_ccr(cpu) & CCR_X;
+                    if (q == 0) ccr |= CCR_Z;
+                    if (q & 0x80000000u) ccr |= CCR_N;
+                    m68k_set_ccr(cpu, ccr);
+                }
+            }
+        } else {
+            /* 32 ÷ 32 -> 32q in Dq, 32r in Dr. */
+            if (sgn) {
+                i32 dividend = (i32)cpu->d[dq];
+                i32 divisor  = (i32)src;
+                if (divisor == 0) { m68k_exception(cpu, 5); return; }
+                /* Avoid INT_MIN / -1 overflow trap (undefined in C). */
+                i32 q, r;
+                if (dividend == (i32)0x80000000 && divisor == -1) {
+                    u8 ccr = m68k_get_ccr(cpu) & CCR_X;
+                    ccr |= CCR_V;
+                    m68k_set_ccr(cpu, ccr);
+                    cpu->cycles += 80;
+                    return;
+                }
+                q = dividend / divisor;
+                r = dividend - q * divisor;
+                cpu->d[dq] = (u32)q;
+                if (dr != dq) cpu->d[dr] = (u32)r;
+                u8 ccr = m68k_get_ccr(cpu) & CCR_X;
+                if (q == 0) ccr |= CCR_Z;
+                if (q < 0)  ccr |= CCR_N;
+                m68k_set_ccr(cpu, ccr);
+            } else {
+                u32 q = cpu->d[dq] / src;
+                u32 r = cpu->d[dq] - q * src;
+                cpu->d[dq] = q;
+                if (dr != dq) cpu->d[dr] = r;
+                u8 ccr = m68k_get_ccr(cpu) & CCR_X;
+                if (q == 0) ccr |= CCR_Z;
+                if (q & 0x80000000u) ccr |= CCR_N;
+                m68k_set_ccr(cpu, ccr);
+            }
+        }
+        cpu->cycles += 80;
+    }
+    (void)op_pc;
+}
+
+/* ---- MOVEC ------------------------------------------------------------ */
+
+static u32 *movec_ctlreg(m68k_cpu *cpu, u16 sel) {
+    /* Encodings from the 68030 PRM. We accept the 68020 set plus the 68030
+     * PMMU registers (TC, ITT0/1, DTT0/1, SRP, CRP, MMUSR) — see the
+     * separate PMMU helpers for the wider TC/SRP/CRP. Only 32-bit regs
+     * are returned through this pointer; SRP/CRP are 64-bit and handled
+     * directly. */
+    switch (sel) {
+    case 0x000: return &cpu->sfc;
+    case 0x001: return &cpu->dfc;
+    case 0x002: return &cpu->cacr;
+    case 0x800: return &cpu->usp;
+    case 0x801: return &cpu->vbr;
+    case 0x802: return &cpu->caar;
+    case 0x803: return &cpu->msp;
+    case 0x804: return &cpu->isp;
+    case 0x003: return &cpu->tc;     /* PMMU TC — 68030 */
+    case 0x004: return &cpu->tt0;
+    case 0x005: return &cpu->tt1;
+    default:    return NULL;
+    }
+}
+
+static void do_movec(m68k_cpu *cpu, u16 op, u32 op_pc) {
+    if (is_priv_violation_if_user(cpu, op_pc)) return;
+    u16 ext = fetch16(cpu);
+    /* Direction is encoded in OPCODE bit 0:
+     *   0x4E7A: bit 0 = 0 → ctl-reg → Rn
+     *   0x4E7B: bit 0 = 1 → Rn → ctl-reg
+     * Ext word bit 15 = A/D flag for the general register. */
+    int dir_to_ctl = (op & 1) != 0;
+    int gen_reg = (ext >> 12) & 0xF; /* bit 15 = A/D, bits 14-12 = idx */
+    u32 *p = movec_ctlreg(cpu, ext & 0xFFF);
+    if (!p) { illegal(cpu, op); return; }
+    u32 *gr = (gen_reg < 8) ? &cpu->d[gen_reg] : &cpu->a[gen_reg - 8];
+    if (dir_to_ctl) *p = *gr;
+    else            *gr = *p;
+    cpu->cycles += 12;
+}
+
+/* ---- MOVES ----------------------------------------------------------- */
+static void do_moves(m68k_cpu *cpu, u16 op, u32 op_pc) {
+    if (is_priv_violation_if_user(cpu, op_pc)) return;
+    u16 ext = fetch16(cpu);
+    int sz = ((op >> 6) & 3);
+    sz = sz == 0 ? 1 : sz == 1 ? 2 : 4;
+    int mode = (op >> 3) & 7, reg = op & 7;
+    int gen_reg = (ext >> 12) & 0xF;
+    bool to_mem = (ext & 0x0800) != 0;
+    u32 *gr = (gen_reg < 8) ? &cpu->d[gen_reg] : &cpu->a[gen_reg - 8];
+    ea_t e = ea_decode(cpu, mode, reg, sz);
+    if (to_mem) {
+        u32 v = (gen_reg < 8) ? (*gr & size_mask(sz)) : *gr;
+        ea_write(cpu, &e, sz, v);
+    } else {
+        u32 v = ea_read(cpu, &e, sz);
+        if (gen_reg < 8) {
+            cpu->d[gen_reg] = (cpu->d[gen_reg] & ~size_mask(sz)) | (v & size_mask(sz));
+        } else {
+            cpu->a[gen_reg - 8] = sext(v, sz);
+        }
+    }
+    cpu->cycles += 12;
+}
+
+/* ---- TRAPcc / TRAPV ---------------------------------------------------- */
+static void do_trapcc(m68k_cpu *cpu, u16 op, u32 op_pc) {
+    int cc = (op >> 8) & 0xF;
+    int opmode = op & 7;
+    if (opmode == 2) fetch16(cpu);              /* skip .W operand */
+    else if (opmode == 3) fetch32(cpu);         /* skip .L operand */
+    /* opmode == 4: no operand. Anything else is illegal. */
+    if (opmode != 2 && opmode != 3 && opmode != 4) {
+        illegal(cpu, op); return;
+    }
+    if (cond_true(cpu, cc)) m68k_exception(cpu, 7);
+    (void)op_pc;
+}
+
+/* ---- CHK2 / CMP2 ----------------------------------------------------- */
+static void do_chk2_cmp2(m68k_cpu *cpu, u16 op, u32 op_pc) {
+    u16 ext = fetch16(cpu);
+    int sz = (op >> 9) & 3;
+    sz = sz == 0 ? 1 : sz == 1 ? 2 : 4;
+    int mode = (op >> 3) & 7, reg = op & 7;
+    bool is_chk2 = (ext & 0x0800) != 0;
+    int regn = (ext >> 12) & 0xF;
+    bool is_addr = (regn & 8) != 0;
+    ea_t e = ea_decode(cpu, mode, reg, sz);
+    u32 lo = ea_read(cpu, &e, sz);
+    u32 hi;
+    if (sz == 1)      hi = mac_read8 (cpu->mem, e.addr + 1);
+    else if (sz == 2) hi = mac_read16(cpu->mem, e.addr + 2);
+    else              hi = mac_read32(cpu->mem, e.addr + 4);
+    i32 ilo = (i32)sext(lo, sz), ihi = (i32)sext(hi, sz);
+    i32 v;
+    if (is_addr) v = (i32)cpu->a[regn & 7];
+    else         v = (i32)sext(cpu->d[regn & 7], sz);
+    u8 ccr = m68k_get_ccr(cpu) & CCR_X;
+    bool out_of_range = (v < ilo) || (v > ihi);
+    bool equal_bound  = (v == ilo) || (v == ihi);
+    if (equal_bound) ccr |= CCR_Z;
+    if (out_of_range) ccr |= CCR_C;
+    m68k_set_ccr(cpu, ccr);
+    if (is_chk2 && out_of_range) m68k_exception(cpu, 6);
+    cpu->cycles += 18;
+    (void)op_pc;
+}
+
+/* ---- CAS / CAS2 ------------------------------------------------------ */
+static void do_cas(m68k_cpu *cpu, u16 op, u32 op_pc) {
+    u16 ext = fetch16(cpu);
+    int sz = (op >> 9) & 3;
+    sz = sz == 1 ? 1 : sz == 2 ? 2 : 4;
+    int mode = (op >> 3) & 7, reg = op & 7;
+    int dc = ext & 7;
+    int du = (ext >> 6) & 7;
+    ea_t e = ea_decode(cpu, mode, reg, sz);
+    u32 mem = ea_read(cpu, &e, sz);
+    u32 cmp = cpu->d[dc] & size_mask(sz);
+    u32 r = mem - cmp;
+    set_flags_cmp(cpu, sz, cmp, mem, r);
+    if ((mem & size_mask(sz)) == cmp)
+        ea_write(cpu, &e, sz, cpu->d[du]);
+    else {
+        cpu->d[dc] = (cpu->d[dc] & ~size_mask(sz)) | (mem & size_mask(sz));
+    }
+    cpu->cycles += 18;
+    (void)op_pc;
+}
+
+static void do_cas2(m68k_cpu *cpu, u16 op, u32 op_pc) {
+    u16 ext1 = fetch16(cpu);
+    u16 ext2 = fetch16(cpu);
+    int sz = ((op & 0x0200) != 0) ? 4 : 2;
+    int rn1 = (ext1 >> 12) & 0xF, rn2 = (ext2 >> 12) & 0xF;
+    int du1 = (ext1 >> 6) & 7,    du2 = (ext2 >> 6) & 7;
+    int dc1 = ext1 & 7,           dc2 = ext2 & 7;
+    u32 addr1 = (rn1 & 8) ? cpu->a[rn1 & 7] : cpu->d[rn1 & 7];
+    u32 addr2 = (rn2 & 8) ? cpu->a[rn2 & 7] : cpu->d[rn2 & 7];
+    u32 m1 = (sz == 2) ? mac_read16(cpu->mem, addr1) : mac_read32(cpu->mem, addr1);
+    u32 m2 = (sz == 2) ? mac_read16(cpu->mem, addr2) : mac_read32(cpu->mem, addr2);
+    u32 c1 = cpu->d[dc1] & size_mask(sz);
+    u32 c2 = cpu->d[dc2] & size_mask(sz);
+    u32 r1 = m1 - c1;
+    set_flags_cmp(cpu, sz, c1, m1, r1);
+    if ((m1 & size_mask(sz)) == c1) {
+        u32 r2 = m2 - c2;
+        set_flags_cmp(cpu, sz, c2, m2, r2);
+        if ((m2 & size_mask(sz)) == c2) {
+            if (sz == 2) {
+                mac_write16(cpu->mem, addr1, (u16)cpu->d[du1]);
+                mac_write16(cpu->mem, addr2, (u16)cpu->d[du2]);
+            } else {
+                mac_write32(cpu->mem, addr1, cpu->d[du1]);
+                mac_write32(cpu->mem, addr2, cpu->d[du2]);
+            }
+            cpu->cycles += 24;
+            (void)op_pc;
+            return;
+        }
+        cpu->d[dc1] = (cpu->d[dc1] & ~size_mask(sz)) | (m1 & size_mask(sz));
+        cpu->d[dc2] = (cpu->d[dc2] & ~size_mask(sz)) | (m2 & size_mask(sz));
+    } else {
+        cpu->d[dc1] = (cpu->d[dc1] & ~size_mask(sz)) | (m1 & size_mask(sz));
+    }
+    cpu->cycles += 24;
+    (void)op_pc;
+}
+
+/* ---- PACK / UNPK ----------------------------------------------------- */
+static void do_pack(m68k_cpu *cpu, u16 op, u32 op_pc) {
+    int dy = op & 7, dx = (op >> 9) & 7;
+    bool predec = (op & 0x0008) != 0;
+    u16 adj = fetch16(cpu);
+    u16 src;
+    if (predec) {
+        cpu->a[dy] -= 2;
+        u8 hi = mac_read8(cpu->mem, cpu->a[dy]);
+        u8 lo = mac_read8(cpu->mem, cpu->a[dy] + 1);
+        src = (u16)(((u16)hi << 8) | lo);
+    } else {
+        src = (u16)(cpu->d[dy] & 0xFFFF);
+    }
+    u16 sum = (u16)(src + adj);
+    u8 packed = (u8)(((sum >> 4) & 0xF0) | (sum & 0x0F));
+    if (predec) {
+        cpu->a[dx] -= 1;
+        mac_write8(cpu->mem, cpu->a[dx], packed);
+    } else {
+        cpu->d[dx] = (cpu->d[dx] & 0xFFFFFF00u) | packed;
+    }
+    cpu->cycles += 6;
+    (void)op_pc;
+}
+
+static void do_unpk(m68k_cpu *cpu, u16 op, u32 op_pc) {
+    int dy = op & 7, dx = (op >> 9) & 7;
+    bool predec = (op & 0x0008) != 0;
+    u16 adj = fetch16(cpu);
+    u8 src;
+    if (predec) {
+        cpu->a[dy] -= 1;
+        src = mac_read8(cpu->mem, cpu->a[dy]);
+    } else {
+        src = (u8)(cpu->d[dy] & 0xFF);
+    }
+    u16 unp = (u16)(((src & 0xF0) << 4) | (src & 0x0F));
+    unp = (u16)(unp + adj);
+    if (predec) {
+        cpu->a[dx] -= 2;
+        mac_write8(cpu->mem, cpu->a[dx],     (u8)(unp >> 8));
+        mac_write8(cpu->mem, cpu->a[dx] + 1, (u8)(unp & 0xFF));
+    } else {
+        cpu->d[dx] = (cpu->d[dx] & 0xFFFF0000u) | unp;
+    }
+    cpu->cycles += 8;
+    (void)op_pc;
+}
+
+/* ---- PMMU + coprocessor (line F) ------------------------------------- */
+
+/* TODO(pmmu): The PMMU instructions here are register stubs only. PMOVE
+ * writes the cpu->tc/srp/crp/tt0/tt1/mmusr fields so the SE/30 ROM's
+ * MMU-init sequence doesn't fault, but mac_read/write still use flat
+ * physical addresses. PFLUSH / PLOAD / PTEST are no-ops. */
+static void do_pmmu(m68k_cpu *cpu, u16 op, u32 op_pc) {
+    if (is_priv_violation_if_user(cpu, op_pc)) return;
+    u16 ext = fetch16(cpu);
+    int mode = (op >> 3) & 7, reg = op & 7;
+    int p_op = (ext >> 13) & 7;
+    /* PMOVE: ext bits 15-13 = 010 (to/from MMU register), 011 (with FD bit). */
+    if (p_op == 2 || p_op == 3) {
+        bool to_mmu = (ext & 0x0200) == 0;        /* 0 = mem->MMU, 1 = MMU->mem */
+        int p_reg = (ext >> 10) & 7;              /* 0=TC, 2=SRP, 3=CRP */
+        ea_t e = ea_decode(cpu, mode, reg, 4);
+        if (e.kind != EA_MEM) { illegal(cpu, op); return; }
+        if (to_mmu) {
+            if (p_reg == 0) {
+                cpu->tc = mac_read32(cpu->mem, e.addr);
+            } else if (p_reg == 2 || p_reg == 3) {
+                u64 hi = mac_read32(cpu->mem, e.addr);
+                u64 lo = mac_read32(cpu->mem, e.addr + 4);
+                if (p_reg == 2) cpu->srp = (hi << 32) | lo;
+                else            cpu->crp = (hi << 32) | lo;
+            }
+            /* Other p_reg values (TT0=4, TT1=5, MMUSR=6) — write through to
+             * tt0/tt1/mmusr. Not all combos are valid on 68030 but the ROM's
+             * write sequence is what counts. */
+            if (p_reg == 4)      cpu->tt0 = mac_read32(cpu->mem, e.addr);
+            else if (p_reg == 5) cpu->tt1 = mac_read32(cpu->mem, e.addr);
+            else if (p_reg == 6) cpu->mmusr = (u16)mac_read16(cpu->mem, e.addr);
+        } else {
+            if (p_reg == 0)       mac_write32(cpu->mem, e.addr, cpu->tc);
+            else if (p_reg == 2)  { mac_write32(cpu->mem, e.addr,     (u32)(cpu->srp >> 32));
+                                    mac_write32(cpu->mem, e.addr + 4, (u32)(cpu->srp & 0xFFFFFFFFu)); }
+            else if (p_reg == 3)  { mac_write32(cpu->mem, e.addr,     (u32)(cpu->crp >> 32));
+                                    mac_write32(cpu->mem, e.addr + 4, (u32)(cpu->crp & 0xFFFFFFFFu)); }
+            else if (p_reg == 4)  mac_write32(cpu->mem, e.addr, cpu->tt0);
+            else if (p_reg == 5)  mac_write32(cpu->mem, e.addr, cpu->tt1);
+            else if (p_reg == 6)  mac_write16(cpu->mem, e.addr, cpu->mmusr);
+        }
+        cpu->cycles += 8;
+        return;
+    }
+    /* PFLUSH / PLOAD / PTEST — accept and advance. ext bits identify the
+     * exact form but for stubs we just need to NOT raise an exception. */
+    if ((ext & 0xE000) == 0x2000 || (ext & 0xE000) == 0x0000
+        || (ext & 0xE000) == 0x8000) {
+        /* Some forms have an <ea>; decode if mode != reg-direct to consume
+         * any extension words. */
+        if (mode > 1) ea_decode(cpu, mode, reg, 4);
+        cpu->cycles += 8;
+        return;
+    }
+    illegal(cpu, op);
+}
+
+/* CINV / CPUSH — no-op advance. The ext word is implicit in the opcode. */
+static void do_cache(m68k_cpu *cpu, u16 op, u32 op_pc) {
+    if (is_priv_violation_if_user(cpu, op_pc)) return;
+    (void)op;
+    cpu->cycles += 8;
+}
+
+/* ---- predicate the JIT block walker consults ------------------------- */
+bool is_68020_only(u16 op) {
+    /* Bitfield: BFTST/BFEXTU/BFCHG/BFEXTS/BFCLR/BFFFO/BFSET/BFINS — all
+     * 8 forms share bits 15-11 = 11101 and bits 7-6 = 11, distinguished
+     * only by bits 10-8 which the mask 0xF8C0 erases. */
+    if ((op & 0xF8C0) == 0xE8C0) return true;
+    /* MULU.L / MULS.L / DIVU.L / DIVS.L */
+    if ((op & 0xFFC0) == 0x4C00 || (op & 0xFFC0) == 0x4C40) return true;
+    /* EXTB.L */
+    if ((op & 0xFFF8) == 0x49C0) return true;
+    /* LINK.L */
+    if ((op & 0xFFF8) == 0x4808) return true;
+    /* RTD */
+    if (op == 0x4E74) return true;
+    /* MOVEC */
+    if (op == 0x4E7A || op == 0x4E7B) return true;
+    /* MOVES */
+    if ((op & 0xFFC0) == 0x0E00 || (op & 0xFFC0) == 0x0E40
+        || (op & 0xFFC0) == 0x0E80) return true;
+    /* TRAPcc */
+    if ((op & 0xF0F8) == 0x50F8 && (op & 0x0007) >= 2) return true;
+    /* CHK2 / CMP2: same encoding shape as the reserved-sz ORI/ANDI/etc
+     * forms; we only treat sz != 3 as the 020+ CHK2/CMP2. */
+    if ((op & 0xF9C0) == 0x00C0 && ((op >> 9) & 3) != 3) return true;
+    /* CAS — bits 10-9 (size field) must be nonzero; sz=00 is BSET static
+     * on 68000, not CAS. */
+    if ((op & 0xF9C0) == 0x08C0 && ((op >> 9) & 3) != 0) return true;
+    /* CAS2 — fixed encodings only. */
+    if (op == 0x0CFC || op == 0x0EFC) return true;
+    /* PACK / UNPK */
+    if ((op & 0xF1F0) == 0x8140) return true;
+    if ((op & 0xF1F0) == 0x8180) return true;
+    /* PMMU coprocessor (line F, cp-id = 0) */
+    if ((op & 0xFE00) == 0xF000) return true;
+    /* CINV / CPUSH */
+    if ((op & 0xFF20) == 0xF400 || (op & 0xFF20) == 0xF420) return true;
+    return false;
+}
+
 void m68k_step(m68k_cpu *cpu) {
     /* Once the CPU has halted (e.g. the guest wrote the debug exit port),
      * further steps are no-ops. This keeps a JIT block — which may contain
@@ -1212,6 +1897,35 @@ void m68k_step(m68k_cpu *cpu) {
         int op9 = (op >> 9) & 7;
         int szf = (op >> 6) & 3;
         int mode = (op >> 3) & 7, reg = op & 7;
+        /* 68020+ CHK2 / CMP2 / CAS / CAS2 sit on top of the same line-0
+         * encoding space. CHK2/CMP2 use bits 7-6 = 11 with op9 in {0,1,2}
+         * (size); CAS has op9 with bit 11 = 1 (so op9 in {4,5,6,7}) and
+         * bits 7-6 = 11; CAS2 has the same prefix as CAS plus mode=7/
+         * reg=4 (xxx).L addressing-style decode actually it's a fixed
+         * encoding 0x0CFC / 0x0EFC. These must be filtered BEFORE the
+         * Plus 68000 immediate / bit-op dispatch because they overlap
+         * with mis-decoded ORI/EORI/CMPI for the .L size. */
+        /* CHK2 / CMP2: bits 15-12=0, bit 11=0, bit 8=0, bits 7-6=11, sz
+         * field (bits 10-9) in {00,01,10}. The reserved sz=11 case stays
+         * in the existing immediate ALU dispatch — though 68000 never
+         * emits it. */
+        if ((op & 0xF9C0) == 0x00C0 && ((op >> 9) & 3) != 3) {
+            do_chk2_cmp2(cpu, op, op_pc); return;
+        }
+        /* CAS2: fixed encodings 0x0CFC (.W) / 0x0EFC (.L). */
+        if (op == 0x0CFC || op == 0x0EFC) { do_cas2(cpu, op, op_pc); return; }
+        /* CAS: bits 15-12=0, bit 11=1, bit 8=0, bits 7-6=11, sz != 00.
+         * The "sz != 00" check is essential: bits 11-8 = 1000 (i.e. sz=00)
+         * is the 68000 static bit-op group (BTST/BCHG/BCLR/BSET #imm,<ea>),
+         * not CAS. */
+        if ((op & 0xF9C0) == 0x08C0 && ((op >> 9) & 3) != 0) {
+            do_cas(cpu, op, op_pc); return;
+        }
+        /* MOVES — 0000 1110 ss mm mrrr (privileged). */
+        if (((op & 0xFFC0) == 0x0E00) || ((op & 0xFFC0) == 0x0E40)
+            || ((op & 0xFFC0) == 0x0E80)) {
+            do_moves(cpu, op, op_pc); return;
+        }
         /* MOVEP — 0000 ddd1 ooo 001 aaa. It shares the dynamic-bit-op
          * opcode space but is distinguished by the An addressing mode
          * (bit ops cannot target an address register). Transfers Dn to/
@@ -1305,6 +2019,38 @@ void m68k_step(m68k_cpu *cpu) {
 
     /* ---- 0100: misc -------------------------------------------------- */
     case 0x4: {
+        /* 68020+ additions that fall in line-4: RTD, MOVEC, LINK.L, EXTB.L,
+         * 32-bit MUL/DIV. Filter before the 68000 dispatch. */
+        if (op == 0x4E74) {                                  /* RTD #d16 */
+            i16 d = (i16)fetch16(cpu);
+            cpu->pc = mac_read32(cpu->mem, cpu->a[7]);
+            cpu->a[7] += 4 + (u32)(i32)d;
+            cpu->cycles += 16;
+            return;
+        }
+        if (op == 0x4E7A || op == 0x4E7B) {                  /* MOVEC */
+            do_movec(cpu, op, op_pc); return;
+        }
+        if ((op & 0xFFF8) == 0x4808) {                       /* LINK.L An,#d32 */
+            int an = op & 7;
+            i32 d = (i32)fetch32(cpu);
+            cpu->a[7] -= 4;
+            mac_write32(cpu->mem, cpu->a[7], cpu->a[an]);
+            cpu->a[an] = cpu->a[7];
+            cpu->a[7] += (u32)d;
+            cpu->cycles += 12;
+            return;
+        }
+        if ((op & 0xFFF8) == 0x49C0) {                       /* EXTB.L Dn */
+            int dn = op & 7;
+            cpu->d[dn] = (u32)(i32)(i8)(u8)cpu->d[dn];
+            set_flags_logic(cpu, 4, cpu->d[dn]);
+            return;
+        }
+        if ((op & 0xFFC0) == 0x4C00 || (op & 0xFFC0) == 0x4C40) {
+            /* MULU.L / MULS.L (0x4C00) / DIVU.L / DIVS.L (0x4C40). */
+            do_long_muldiv(cpu, op, op_pc); return;
+        }
         /* Fixed-encoding instructions first. */
         if (op == 0x4E71) { return; }                       /* NOP */
         if (op == 0x4E70) { cpu->halted = M68K_HALT_RESET; cpu->chain_budget = 0; return; } /* RESET -> stop */
@@ -1528,10 +2274,16 @@ void m68k_step(m68k_cpu *cpu) {
         return;
     }
 
-    /* ---- 0101: ADDQ/SUBQ/Scc/DBcc ------------------------------------ */
+    /* ---- 0101: ADDQ/SUBQ/Scc/DBcc/TRAPcc ----------------------------- */
     case 0x5: {
         int szf = (op >> 6) & 3;
         int mode = (op >> 3) & 7, reg = op & 7;
+        /* 68020+ TRAPcc: 0101 cccc 11111 OPMODE, where OPMODE = 010/011/100
+         * (.W / .L / no operand). Bits 5-3 = 11111 i.e. mode = 7 and reg
+         * in {2,3,4}. */
+        if (szf == 3 && mode == 7 && (reg == 2 || reg == 3 || reg == 4)) {
+            do_trapcc(cpu, op, op_pc); return;
+        }
         if (szf == 3) {
             int cc = (op >> 8) & 0xF;
             if (mode == 1) {                                 /* DBcc */
@@ -1655,6 +2407,9 @@ void m68k_step(m68k_cpu *cpu) {
             cpu->cycles += 6;
             return;
         }
+        /* 68020+ PACK: 1000 ddd 1 0100 X rrr — distinguished from SBCD by
+         * bits 8-3 being 1 0100X (PACK) vs 1 0000X (SBCD). */
+        if ((op & 0x01F0) == 0x0140) { do_pack(cpu, op, op_pc); return; }
         int sz = szf == 0 ? 1 : szf == 1 ? 2 : 4;
         bool to_ea = (op >> 8) & 1;
         ea_t e = ea_decode(cpu, mode, reg, sz);
@@ -1838,6 +2593,8 @@ void m68k_step(m68k_cpu *cpu) {
             cpu->cycles += 6;
             return;
         }
+        /* 68020+ UNPK: 1100 ddd 1 1000 X rrr. */
+        if ((op & 0x01F0) == 0x0180) { do_unpk(cpu, op, op_pc); return; }
         /* EXG: opcode bits 8..3 select mode. */
         if ((op & 0x0130) == 0x0100) {
             int rx = (op >> 9) & 7, ry = op & 7;
@@ -1870,8 +2627,14 @@ void m68k_step(m68k_cpu *cpu) {
         return;
     }
 
-    /* ---- 1110: shifts / rotates -------------------------------------- */
+    /* ---- 1110: shifts / rotates / bitfield (020+) -------------------- */
     case 0xE: {
+        /* 68020+ bitfield: 1110 1XXX 11mm mrrr. Bits 10-8 select the op
+         * (BFTST/BFEXTU/BFCHG/BFEXTS/BFCLR/BFFFO/BFSET/BFINS), bits 7-6 =
+         * 11 distinguish from the shifts (bits 7-6 = szf, where szf=3
+         * means memory shift not bitfield). The bitfield ops use bits
+         * 7-6 = 11 + bit 11 = 1, while memory shifts have bit 11 = 0. */
+        if ((op & 0xF8C0) == 0xE8C0) { do_bitfield(cpu, op, op_pc); return; }
         int szf = (op >> 6) & 3;
         if (szf == 3) {
             /* Memory shift by 1. op bits 10..9 select op, bit 8 dir. */
@@ -1914,8 +2677,18 @@ void m68k_step(m68k_cpu *cpu) {
         m68k_unimpl(cpu, op_pc, 10);   /* vector 10 @ 0x28 */
         return;
 
-    /* ---- 1111: line-F emulator -------------------------------------- */
+    /* ---- 1111: line-F emulator + 68020+ coprocessor + cache --------- */
     case 0xF:
+        /* CINV / CPUSH — 1111 0100 0CXX XXX (bits 11-8 = 0100, bit 5 = 0/1).
+         * Both are no-ops in our model (no on-chip cache). */
+        if ((op & 0xFF20) == 0xF400 || (op & 0xFF20) == 0xF420) {
+            do_cache(cpu, op, op_pc); return;
+        }
+        /* PMMU instructions on the 68030 use line F coprocessor 0
+         * (op bits 11-9 = 000). PMOVE/PFLUSH/PLOAD/PTEST decode here. */
+        if ((op & 0xFE00) == 0xF000) {
+            do_pmmu(cpu, op, op_pc); return;
+        }
         m68k_unimpl(cpu, op_pc, 11);   /* vector 11 @ 0x2C */
         return;
 
@@ -1929,8 +2702,17 @@ void m68k_step(m68k_cpu *cpu) {
 
 /* A lightweight re-walk of just the addressing modes, to size an
  * instruction without executing it. Mirrors ea_decode's extension-word
- * consumption. Returns extra bytes beyond the opcode word. */
+ * consumption. Returns extra bytes beyond the opcode word.
+ *
+ * Note: callers pass the instruction start as `pc` (not the actual ext
+ * word position), so this function must remain a pure function of
+ * (mode, reg, sz) — it cannot peek at the real ext word. The 68000 only
+ * uses the brief format for modes 6 and 7.3 (2 bytes); the 68020+ "full"
+ * format (4-10 bytes) is handled at JIT-walk time by is_68020_only
+ * detecting bit 8 of the ext word and terminating the block, and at
+ * interp-time by brief_index reading the full-format fields directly. */
 static u32 ea_ext_bytes(m68k_cpu *cpu, u32 pc, int mode, int reg, int sz) {
+    (void)cpu; (void)pc;
     switch (mode) {
         case 5: return 2;
         case 6: return 2;
@@ -1943,7 +2725,7 @@ static u32 ea_ext_bytes(m68k_cpu *cpu, u32 pc, int mode, int reg, int sz) {
                 case 4: return (sz == 4) ? 4 : 2;
                 default: return 0;
             }
-        default: (void)cpu; (void)pc; return 0;
+        default: return 0;
     }
 }
 

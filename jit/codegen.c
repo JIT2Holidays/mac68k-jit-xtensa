@@ -4,7 +4,23 @@
  * other instruction becomes a CALLX0 to the reference interpreter's
  * m68k_step. The interpreter fallback makes the JIT correct by
  * construction — the JIT differential test exists to catch the inline
- * paths drifting from the oracle. */
+ * paths drifting from the oracle.
+ *
+ * SE/30 (M7.0): the JIT operates in HYBRID mode under MAC_MODEL_SE30 —
+ * the block walker terminates at any 68020+ opcode (see is_68020_only)
+ * so the interpreter handles 020/030 instructions. As a consequence,
+ * every inline arm and every `abs_addr &= 0xFFFFFFu` 24-bit-bus mask in
+ * this file remains correct: the JIT only ever sees 68000-compatible
+ * code, which on Plus uses the 24-bit bus and on SE/30 happens to only
+ * touch low addresses through the same 24-bit-compatible EAs. SE/30-
+ * specific MMIO (0x50F00000 family) is reached exclusively from 030
+ * opcodes or through PC values that the SE/30 ROM holds in registers
+ * the JIT doesn't track — neither produces a JIT block that emits a
+ * 24-bit-masked computed EA into SE/30 MMIO. The 24-bit masks are
+ * thus a Plus invariant by way of the hybrid termination.
+ * TODO(se30-jit): when the JIT grows native 030 inline arms in a later
+ * milestone, audit every mask site (mac_read / mac_write derived EAs
+ * and the helper-arg paths). */
 
 #include "codegen.h"
 #include "emit_xtensa.h"
@@ -1793,6 +1809,19 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
     for (;;) {
         if (n_ops >= block_cap) break;
         m68k_decoded d = m68k_decode_at(cpu, cur);
+        /* M7.0 — hybrid JIT/interp mode for 68030 (SE/30). When the
+         * walker encounters a 68020+ opcode (bitfield, long mul/div,
+         * MOVEC, RTD, TRAPcc, CHK2/CMP2, CAS/CAS2, PACK/UNPK, EXTB.L,
+         * LINK.L, MOVES, PMMU coproc, cache), terminate the block
+         * BEFORE the 020+ op. The dispatcher then picks up at PC = cur
+         * and runs the interpreter for that instruction; subsequent
+         * blocks restart at cur + d.length. Plus mode skips the check
+         * (Plus code never emits 020+) so existing JIT behavior is
+         * bit-for-bit identical. */
+        if (cpu->mem && cpu->mem->model == MAC_MODEL_SE30
+            && is_68020_only(d.opcode)) {
+            break;
+        }
         op_word[n_ops] = d.opcode;
         op_pc[n_ops] = cur;
         n_ops++;
