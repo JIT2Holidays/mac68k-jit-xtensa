@@ -9932,6 +9932,69 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             base[entry_off + jlink_pos + 2] = (u8)(jw_link >> 16);
 
             inline_ops++; done = true;
+        } else if ((w & 0xFFF8) == 0x4808) {
+            /* M7.5j — LINK.L An,#d32 (68020+). Identical to LINK.W
+             * (above) except the displacement is a signed 32-bit value
+             * loaded from op_pc+2 and the instruction length is 6 bytes.
+             * Cycles 16 (base 4 + do_link_long 12). */
+            int an = w & 7;
+            u32 d32_hi = mac_read16(cpu->mem, op_pc[i] + 2);
+            u32 d32_lo = mac_read16(cpu->mem, op_pc[i] + 4);
+            i32 d32 = (i32)((d32_hi << 16) | d32_lo);
+
+            emit_advance_flush(&e);
+            emit_read_g(&e, &rc, G_A(7), 8);
+            xt_addi (&e, 8, 8, -4);
+
+            emit_l32r_at(&e, 9, lit_off[LITERAL_RAM_BOUNDS],
+                         entry_off + e.len);
+            xt_and  (&e, 10, 8, 9);
+            emit_cache_flush(&e, &rc);
+            i32 op_pc_linkl = 6, op_cyc_linkl = 16;
+            g_helper_touched_mask = (u16)((1u << G_A(an)) | (1u << G_A(7)));
+            xt_beqz (&e, 10, (i32)(6u + helper_step_after_flush_undo_size(&rc, op_pc_linkl, op_cyc_linkl)));
+            emit_helper_step_after_flush_undo(&e, lit_off[HELPER_M68K_STEP],
+                                              entry_off, &rc, op_pc_linkl, op_cyc_linkl);
+            g_helper_touched_mask = 0xFFFFu;
+            u32 jlinkl_pos = e.len;
+            xt_j    (&e, 4);
+
+            emit_write_g(&e, &rc, G_A(7), 8);
+            emit_read_g(&e, &rc, G_A(an), 11);
+
+            emit_l32r_at(&e, 9, lit_off[ADDR_RAM_BASE],
+                         entry_off + e.len);
+            xt_add  (&e, 9, 9, 8);
+            xt_extui(&e, 12, 11, 24, 7);
+            xt_s8i  (&e, 12, 9, 0);
+            xt_extui(&e, 12, 11, 16, 7);
+            xt_s8i  (&e, 12, 9, 1);
+            xt_extui(&e, 12, 11,  8, 7);
+            xt_s8i  (&e, 12, 9, 2);
+            xt_extui(&e, 12, 11,  0, 7);
+            xt_s8i  (&e, 12, 9, 3);
+
+            emit_write_g(&e, &rc, G_A(an), 8);
+
+            emit_read_g(&e, &rc, G_A(7), 11);
+            if (d32 >= -128 && d32 <= 127) {
+                xt_addi(&e, 11, 11, d32);
+            } else {
+                emit_load_imm(&e, 12, 10, (u32)d32);
+                xt_add (&e, 11, 11, 12);
+            }
+            emit_write_g(&e, &rc, G_A(7), 11);
+
+            emit_advance(&e, op_pc_linkl, op_cyc_linkl);
+
+            u32 here_linkl = e.len;
+            i32 jo_linkl = (i32)(here_linkl - jlinkl_pos) - 4;
+            u32 jw_linkl = ((u32)((u32)jo_linkl & 0x3FFFFu) << 6) | 0x06u;
+            base[entry_off + jlinkl_pos    ] = (u8)jw_linkl;
+            base[entry_off + jlinkl_pos + 1] = (u8)(jw_linkl >> 8);
+            base[entry_off + jlinkl_pos + 2] = (u8)(jw_linkl >> 16);
+
+            inline_ops++; done = true;
         } else if ((w & 0xFFF8) == 0x4E58) {
             /* M6.173 — UNLK An. thinkc8-folder-open bench's 0x4E5E
              * (UNLK A6) at PC=0x3E9800 — subroutine epilogue stack-frame
