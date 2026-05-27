@@ -46,17 +46,21 @@
  * Hardware. The SE/30 has no boot ROM overlay — the ROM lives at a fixed
  * high address from reset and the 68030 reads its initial SSP/PC from
  * 0x40800000/0x40800004. */
+/* Empirically verified against the Mac IIx/SE-30 ROM's MMIO access
+ * pattern (via tools/se30_trace.c). The SE/30 puts the SCC at
+ * $50F04000 (not the Mac IIx style $50FD0000), VIA1 at $50F00000, and
+ * the ASC at $50F14000. */
 #define MAC_SE30_RAM_BASE       0x00000000u
 #define MAC_SE30_ROM_BASE       0x40800000u
 #define MAC_SE30_ROM_SIZE       0x00040000u   /* 256 KB */
-#define MAC_SE30_VIA1_BASE      0x50F00000u
-#define MAC_SE30_VIA2_BASE      0x50F02000u
-#define MAC_SE30_SCC_RD_BASE    0x50F0C000u   /* Z8530 read window  */
-#define MAC_SE30_SCC_WR_BASE    0x50F0E000u   /* Z8530 write window */
-#define MAC_SE30_SCSI_BASE      0x50F10000u   /* NCR 5380 (same chip as Plus) */
+#define MAC_SE30_VIA1_BASE      0x50F00000u   /* 6522 VIA #1 */
+#define MAC_SE30_VIA2_BASE      0x50F02000u   /* 6522 VIA #2 */
+#define MAC_SE30_SCC_RD_BASE    0x50F04000u   /* Z8530 (single window — no separate R/W) */
+#define MAC_SE30_SCC_WR_BASE    0x50F06000u   /* SCC write alias */
+#define MAC_SE30_SCSI_BASE      0x50F10000u   /* NCR 5380 */
 #define MAC_SE30_SCSI_DMA_BASE  0x50F12000u   /* pseudo-DMA window */
 #define MAC_SE30_ASC_BASE       0x50F14000u   /* Apple Sound Chip */
-#define MAC_SE30_IWM_BASE       0x50F16000u   /* SWIM (IWM-compatible) */
+#define MAC_SE30_IWM_BASE       0x50F16000u   /* SWIM */
 #define MAC_SE30_MAX_RAM        (128u * 1024u * 1024u)
 
 /* Mac Plus screen: 512x342, 1 bit/pixel. The main framebuffer sits a
