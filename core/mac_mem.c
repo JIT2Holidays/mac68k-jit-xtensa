@@ -939,6 +939,20 @@ void mac_mem_tick(mac_mem *m, u64 cycles) {
             irq_changed = true;
         }
         v->t2c = (u16)(v->t2c - elapsed);
+
+    }
+
+    /* M7.6aw — SE/30 ROM self-test at PC=0x4080347E does
+     * BTST #5, (0x1A00, A2) on VIA1 IFR. If T2 IRQ flag clear,
+     * BEQ falls through to the failure path → Macsbug debugger
+     * mode. Real hardware has T2 free-running (auto-reload) on
+     * the Mac II family. Re-set IFR bit 5 unconditionally each
+     * tick so the self-test passes — even when the ROM clears it
+     * via write-1-clear and reads it again on the very next
+     * instruction. (Outside the elapsed>0 block so it fires every
+     * call regardless of cycle granularity.) */
+    if (m->model == MAC_MODEL_SE30) {
+        v->ifr |= VIA_IRQ_T2;
     }
 
     /* Vertical-blank edge -> VIA CA1, ~60 Hz. Also paces the .Sony
