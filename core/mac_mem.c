@@ -485,14 +485,14 @@ static void asc_write(mac_mem *m, u32 addr, u8 v) {
 /* Return a RAM/ROM pointer for plain-memory addresses, or NULL for MMIO. */
 static u8 *mem_ptr(mac_mem *m, u32 addr) {
     if (m->model == MAC_MODEL_SE30) {
-        /* ROM is always mapped at 0x40800000. While the boot overlay is
-         * on, the ROM is ALSO mirrored at low addresses (0x00000000+)
-         * so the CPU's reset vector fetch at 0x00000000 hits ROM. After
-         * the first write to the Glue overlay register (handled in
-         * mac_write8), RAM takes over the low address window. */
-        if (m->rom && addr >= MAC_SE30_ROM_BASE
-                   && addr < MAC_SE30_ROM_BASE + m->rom_size)
-            return m->rom + (addr - MAC_SE30_ROM_BASE);
+        /* ROM is mapped throughout 0x40000000-0x4FFFFFFF (256MB region),
+         * aliased every rom_size bytes (256KB). minivmac uses
+         * cmpmask=0xF0000000 cmpvalu=0x40000000 usemask=ROM_size-1.
+         * Late-boot code polls aliases like 0x407FFFA3 (= ROM[0x3FFA3]),
+         * so we need to support the full 256MB ROM region. */
+        if (m->rom && (addr & 0xF0000000u) == 0x40000000u) {
+            return m->rom + ((addr & 0x0FFFFFFFu) % m->rom_size);
+        }
         if (m->overlay) {
             if (m->rom && addr < m->rom_size) return m->rom + addr;
         } else {
