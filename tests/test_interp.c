@@ -348,6 +348,7 @@ static int test_pmmu_translate(void) {
      * tables. Use a single second-level table for simplicity. */
     u32 top_table = 0x6000u;
     u32 mid_table = 0x6100u;
+    cpu.tc = 0;                                            /* disable for setup */
     /* Top entry 0 → mid_table (DT=2 short pointer). */
     mac_write32(&mem, top_table + 0 * 4, mid_table | 2u);
     /* Mid entry 5 → phys page 0x50000 (DT=2 short page). */
@@ -366,7 +367,13 @@ static int test_pmmu_translate(void) {
 
     /* M7.6f — long-form (8-byte) descriptor test. Same idea as the
      * short-form 1-level test, but entries are 8 bytes each: word 0 has
-     * the DT/flags, word 1 has the full 32-bit address. */
+     * the DT/flags, word 1 has the full 32-bit address.
+     *
+     * IMPORTANT: TC.E must be 0 during page-table setup, otherwise
+     * mac_write32 (M7.6g plumb-in) tries to TRANSLATE the table address
+     * before writing — but the table doesn't exist yet, so writes go
+     * astray. Disable, write, then enable. */
+    cpu.tc = 0;
     u32 long_table = 0x5000u;
     /* Entry 0 (8 bytes): word0=0x00000001 (DT=1 page), word1=0x00040000 (page addr). */
     mac_write32(&mem, long_table + 0 * 8 + 0, 0x00000001u);
@@ -395,6 +402,7 @@ static int test_pmmu_translate(void) {
 
     /* M7.6e — invalid descriptor → bus error. Set up a 1-level table
      * where the LA we translate lands on an invalid (DT=0) leaf. */
+    cpu.tc = 0;                                            /* disable for setup write */
     mac_write32(&mem, table_base + 2 * 4, 0x00000000u);   /* DT=0 invalid */
     cpu.tc = 0x80000000u | (4u << 20) | (4u << 12);       /* back to 1-level */
     cpu.srp = ((u64)table_base << 32) | 2u;

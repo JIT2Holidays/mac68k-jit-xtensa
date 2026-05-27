@@ -519,6 +519,13 @@ static int region_of_se30(u32 addr) {
 
 u8 mac_read8(mac_mem *m, u32 addr) {
     if (m->model == MAC_MODEL_PLUS) addr &= 0xFFFFFFu;
+    /* M7.6g — PMMU translation, gated on SE/30 + TC.E + not-recursing.
+     * For TC.E=0 (current default) the call is a single branch + return,
+     * so the per-access cost is minimal. */
+    else if (m->cpu && (m->cpu->tc & 0x80000000u) && !m->pmmu_in_walk) {
+        u8 fc = m68k_is_super(m->cpu) ? 5u : 1u;   /* sup/user data */
+        addr = mac_pmmu_translate(m, addr, fc);
+    }
     m->reads++;
     u8 *p = mem_ptr(m, addr);
     if (p) return *p;
@@ -560,6 +567,10 @@ u8 mac_read8(mac_mem *m, u32 addr) {
 
 void mac_write8(mac_mem *m, u32 addr, u8 v) {
     if (m->model == MAC_MODEL_PLUS) addr &= 0xFFFFFFu;
+    else if (m->cpu && (m->cpu->tc & 0x80000000u) && !m->pmmu_in_walk) {
+        u8 fc = m68k_is_super(m->cpu) ? 5u : 1u;
+        addr = mac_pmmu_translate(m, addr, fc);
+    }
     m->writes++;
     if (mac_mmio_log && !mem_ptr(m, addr)) mac_mmio_log(m, addr, v, 1, 1);
     /* SE/30: Glue chip overlay register at 0x5FFFFFFE/F. Any write to
@@ -666,6 +677,7 @@ void mac_write32(mac_mem *m, u32 addr, u32 v) {
 u32 mac_pmmu_translate(mac_mem *m, u32 logical_addr, u8 fc) {
     (void)fc;
     if (m->model != MAC_MODEL_SE30 || !m->cpu) return logical_addr;
+    if (m->pmmu_in_walk) return logical_addr;   /* recursion guard */
 
     m68k_cpu *cpu = m->cpu;
 
@@ -755,6 +767,9 @@ u32 mac_pmmu_translate(mac_mem *m, u32 logical_addr, u8 fc) {
      * the PARENT descriptor's DT: DT=2 → short (4 bytes), DT=3 → long
      * (8 bytes). Root pointer's DT acts as the parent for level 0. */
     u32 entry_sz = (dt == 3) ? 8u : 4u;
+    /* Set the recursion guard before issuing descriptor reads so they
+     * bypass per-access translation. Cleared on every return path. */
+    m->pmmu_in_walk = 1;
     for (int level = 0; level < n_levels; level++) {
         shift -= (u32)level_bits[level];
         u32 idx = (logical_addr >> shift) & ((1u << level_bits[level]) - 1u);
@@ -773,6 +788,7 @@ u32 mac_pmmu_translate(mac_mem *m, u32 logical_addr, u8 fc) {
              * address; the exception will redirect cpu->pc on the
              * next m68k_run_until tick. */
             cpu->bus_error_pending = logical_addr | 0x80000000u;
+            m->pmmu_in_walk = 0;
             return logical_addr;
         }
         if (level == n_levels - 1) {
@@ -790,6 +806,7 @@ u32 mac_pmmu_translate(mac_mem *m, u32 logical_addr, u8 fc) {
                 page_phys = desc0 & ~((1u << page_size_bits) - 1u);
             }
             u32 page_offset = logical_addr & ((1u << page_size_bits) - 1u);
+            m->pmmu_in_walk = 0;
             return page_phys | page_offset;
         }
         /* Non-leaf: pointer to next-level table. */
@@ -803,6 +820,7 @@ u32 mac_pmmu_translate(mac_mem *m, u32 logical_addr, u8 fc) {
         entry_sz = (desc_dt == 3) ? 8u : 4u;
     }
     /* Should not reach here. */
+    m->pmmu_in_walk = 0;
     return logical_addr;
 }
 

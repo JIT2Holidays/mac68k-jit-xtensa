@@ -242,6 +242,13 @@ typedef struct mac_mem {
     struct m68k_cpu *cpu;
 
     u64  reads, writes;
+
+    /* M7.6g — re-entrancy guard for the PMMU walker. Set non-zero while
+     * mac_pmmu_translate is executing so the descriptor-table reads it
+     * issues (via mac_read32) bypass the per-access translation step
+     * that this same call is performing. Without the guard, every
+     * descriptor read would recurse into translate(). */
+    u8   pmmu_in_walk;
 } mac_mem;
 
 extern void (*mac_mmio_log)(mac_mem *m, u32 addr, u32 val, int is_write, int size);
