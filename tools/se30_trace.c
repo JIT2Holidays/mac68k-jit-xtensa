@@ -153,6 +153,19 @@ int main(int argc, char **argv) {
 
     u64 sample_every = 32;
     u64 next_sample = 0;
+    /* SE30_DUMP_AT=<cyc>: after reaching that cycle, single-step the next
+     * SE30_DUMP_N instructions (default 500) and dump each PC + dn/an
+     * registers to stderr. Enough to see one full hot-loop iteration. */
+    u64 dump_at = ~0ull;
+    u32 dump_n = 500;
+    const char *da = getenv("SE30_DUMP_AT");
+    if (da) {
+        dump_at = strtoull(da, NULL, 0);
+        const char *dn = getenv("SE30_DUMP_N");
+        if (dn) dump_n = (u32)strtoul(dn, NULL, 0);
+        fprintf(stderr, "[se30_trace] will dump %u insns at cyc=%llu\n",
+                dump_n, (unsigned long long)dump_at);
+    }
     /* Single-step so we can hook every instruction's PC. m68k_step doesn't
      * have a callback, so we just run one instruction at a time and read
      * cpu.pc between steps. That's slow but fine for a debug trace. */
@@ -166,6 +179,24 @@ int main(int argc, char **argv) {
             fprintf(stderr, "[se30_trace] injected SCC byte 0x%02X at cyc=%llu\n",
                     inject_byte, (unsigned long long)cpu.cycles);
             injected = true;
+        }
+        if (dump_at != ~0ull && cpu.cycles >= dump_at && dump_n > 0) {
+            for (u32 i = 0; i < dump_n && !cpu.halted; i++) {
+                u32 pc = cpu.pc;
+                u16 op = mac_read16(&mem, pc);
+                fprintf(stderr,
+                    "  STEP pc=%08X op=%04X "
+                    "d0-d7=%08X,%08X,%08X,%08X,%08X,%08X,%08X,%08X "
+                    "a0-a7=%08X,%08X,%08X,%08X,%08X,%08X,%08X,%08X sr=%04X\n",
+                    pc, op,
+                    cpu.d[0], cpu.d[1], cpu.d[2], cpu.d[3],
+                    cpu.d[4], cpu.d[5], cpu.d[6], cpu.d[7],
+                    cpu.a[0], cpu.a[1], cpu.a[2], cpu.a[3],
+                    cpu.a[4], cpu.a[5], cpu.a[6], cpu.a[7], cpu.sr);
+                m68k_step(&cpu);
+            }
+            dump_n = 0;
+            continue;
         }
         u64 chunk_end = cpu.cycles + 1024;
         if (chunk_end > max_cycles) chunk_end = max_cycles;
