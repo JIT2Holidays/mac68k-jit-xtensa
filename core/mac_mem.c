@@ -634,10 +634,9 @@ void mac_write8(mac_mem *m, u32 addr, u8 v) {
     }
     int rgn = (m->model == MAC_MODEL_SE30) ? region_of_se30(addr)
                                            : region_of(addr);
-    /* SE/30 BERR on unmapped write — same mechanism as the read path. */
-    if (m->model == MAC_MODEL_SE30 && rgn == RGN_NONE && m->cpu) {
-        m->cpu->bus_error_pending = addr | 0x80000000u;
-    }
+    /* SE/30: unmapped writes are silently dropped (open-bus). Matches
+     * minivmac Glue chip — does NOT raise BERR for empty NuBus slots or
+     * other unmapped regions. The ROM doesn't rely on BERR-on-write. */
     switch (rgn) {
         case RGN_VIA:    via_write(m, addr, v);  return;
         case RGN_VIA2:   via2_write(m, &m->via2, addr, v); return;
