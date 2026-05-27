@@ -43,6 +43,46 @@ static u64 first_cyc[RGN_COUNT];
 static struct { u32 pc; u64 n; } hot[HOT_BUCKETS];
 static u32 hot_n;
 
+/* MMIO trace — bucketed by addr. Records read/write counts and last value. */
+#define MMIO_BUCKETS 1024u
+static struct {
+    u32 addr;
+    u64 reads, writes;
+    u32 last_rd_val, last_wr_val;
+    u64 last_rd_cyc, last_wr_cyc;
+} mmio[MMIO_BUCKETS];
+
+static void note_mmio(u32 addr, u32 val, int is_write, int size, u64 cyc) {
+    (void)size;
+    u32 h = (addr * 2654435761u) % MMIO_BUCKETS;
+    for (u32 i = 0; i < 64; i++) {
+        u32 j = (h + i) % MMIO_BUCKETS;
+        if (mmio[j].reads == 0 && mmio[j].writes == 0) {
+            mmio[j].addr = addr;
+        }
+        if (mmio[j].addr == addr || (mmio[j].reads == 0 && mmio[j].writes == 0)) {
+            mmio[j].addr = addr;
+            if (is_write) {
+                mmio[j].writes++;
+                mmio[j].last_wr_val = val;
+                mmio[j].last_wr_cyc = cyc;
+            } else {
+                mmio[j].reads++;
+                mmio[j].last_rd_val = val;
+                mmio[j].last_rd_cyc = cyc;
+            }
+            return;
+        }
+    }
+}
+
+/* Global pointer to active mac_mem so the mmio_log callback can read cycles. */
+static struct m68k_cpu *g_cpu;
+static void mmio_log_cb(mac_mem *m, u32 addr, u32 val, int is_write, int size) {
+    (void)m;
+    note_mmio(addr, val, is_write, size, g_cpu ? g_cpu->cycles : 0);
+}
+
 static void note_pc(u32 pc, u64 cyc) {
     if (pc >= 0x40800000u && pc < 0x40840000u) {
         u32 idx = (pc - 0x40800000u) / RGN_SIZE;
@@ -76,6 +116,8 @@ int main(int argc, char **argv) {
 
     m68k_cpu cpu;
     m68k_reset(&cpu, &mem);
+    g_cpu = &cpu;
+    mac_mmio_log = mmio_log_cb;
     fprintf(stderr, "[se30_trace] reset PC=0x%08X SSP=0x%08X SR=0x%04X\n",
             cpu.pc, cpu.a[7], cpu.sr);
 
@@ -123,6 +165,28 @@ int main(int argc, char **argv) {
         fprintf(stderr, "  PC=0x%08X  samples=%llu\n",
                 hot[best].pc, (unsigned long long)hot[best].n);
         hot[best].n = 0;
+    }
+
+    /* MMIO access summary — top 30 most-accessed addresses. */
+    fprintf(stderr, "\n[se30_trace] hot MMIO addresses (top 30 by access count):\n");
+    for (int t = 0; t < 30; t++) {
+        u32 best = 0;
+        u64 best_n = 0;
+        for (u32 i = 0; i < MMIO_BUCKETS; i++) {
+            u64 n = mmio[i].reads + mmio[i].writes;
+            if (n > best_n) { best_n = n; best = i; }
+        }
+        if (best_n == 0) break;
+        fprintf(stderr, "  0x%08X  rd=%llu (last=0x%X @cyc=%llu)  wr=%llu (last=0x%X @cyc=%llu)\n",
+                mmio[best].addr,
+                (unsigned long long)mmio[best].reads,
+                mmio[best].last_rd_val,
+                (unsigned long long)mmio[best].last_rd_cyc,
+                (unsigned long long)mmio[best].writes,
+                mmio[best].last_wr_val,
+                (unsigned long long)mmio[best].last_wr_cyc);
+        mmio[best].reads = 0;
+        mmio[best].writes = 0;
     }
 
     /* Last few exceptions. */
