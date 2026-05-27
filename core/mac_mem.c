@@ -693,69 +693,82 @@ u32 mac_pmmu_translate(mac_mem *m, u32 logical_addr, u8 fc) {
         return logical_addr;  /* transparent — no walk */
     }
 
-    /* M7.6c — minimal page-table walk for one-level short-form mapping.
+    /* M7.6c/d — page-table walk for short-form descriptors, up to four
+     * levels (TIA/TIB/TIC/TID).
      *
-     * 68030 PMMU translation:
-     *   - Root pointer (SRP for supervisor / CRP for user, picked by
-     *     TC.FCL and the access FC). The pointer's low 4 bits encode
-     *     descriptor format (DT field): 0=invalid, 1=page, 2=short, 3=long.
-     *   - TC's TIA/TIB/TIC/TID fields specify how many LA bits each
-     *     level consumes (4 bits each, max 15 bits per level).
-     *   - Page size is 2^(8+TC.PS) bytes (PS in TC bits 23-20, 0..7
-     *     giving 256B to 32KB).
+     * 68030 PMMU layout:
+     *   - Root pointer (SRP for supervisor / CRP for user). Low 32 bits
+     *     are a descriptor (DT field in bits 0-1); high 32 bits point
+     *     at the root table.
+     *   - TC.PS (bits 23-20) gives page size = 2^(8+PS).
+     *   - TC.IS (bits 19-16) gives initial-shift count; high `IS` bits
+     *     of LA are skipped (matched against root descriptor LIMIT, if
+     *     long format — we ignore LIMIT for short).
+     *   - TC.TIA / TIB / TIC / TID (bits 15-12 / 11-8 / 7-4 / 3-0) give
+     *     the index widths for each level (in bits). Zero = level not
+     *     used; the walk stops at the first zero level.
      *
-     * This implementation handles the SIMPLE case: TC configures only
-     * one level (TIB=TIC=TID=0), short-format root pointer with 4-byte
-     * entries, no usage/limit fields. Anything more complex returns
-     * the logical address unchanged with a TODO marker.
-     *
-     * For the common case where the OS sets up a flat 1:1 mapping
-     * (System 7 in 32-bit mode usually does), this matches behavior. */
+     * This implementation handles short-form (4-byte) descriptors only.
+     * TODO(pmmu-long): 8-byte long-format descriptors with LIMIT/SUP/WP. */
 
     bool is_supervisor = (fc & 4) != 0;
     u64 rp = is_supervisor ? cpu->srp : cpu->crp;
-    /* SRP/CRP low 32 bits = descriptor; high 32 bits = pointer. */
+    /* SRP/CRP low 32 = descriptor; high 32 = table pointer. */
     u8 dt = (u8)(rp & 3);
     if (dt == 0) return logical_addr;       /* invalid → no translation */
     u32 table_base = (u32)(rp >> 32) & 0xFFFFFFF0u;
 
-    /* TIA = bits 15-12 of TC (top-level index width). */
-    int tia = (cpu->tc >> 12) & 0xF;
-    int tib = (cpu->tc >> 8)  & 0xF;
-    int tic = (cpu->tc >> 4)  & 0xF;
-    int tid = (cpu->tc >> 0)  & 0xF;
-    int ps  = (cpu->tc >> 20) & 0xF;        /* page size = 2^(8+ps); typical 4 for 4KB */
-    int is_field = (cpu->tc >> 16) & 0xF;   /* initial shift count */
+    int level_bits[4] = {
+        (int)((cpu->tc >> 12) & 0xF),   /* TIA */
+        (int)((cpu->tc >> 8)  & 0xF),   /* TIB */
+        (int)((cpu->tc >> 4)  & 0xF),   /* TIC */
+        (int)((cpu->tc >> 0)  & 0xF),   /* TID */
+    };
+    int ps = (cpu->tc >> 20) & 0xF;     /* page size = 2^(8+ps) */
 
-    if (tib != 0 || tic != 0 || tid != 0) {
-        /* Multi-level walk: TODO(pmmu-multi-level). */
-        return logical_addr;
-    }
-    if (tia == 0) return logical_addr;      /* no levels configured */
+    if (level_bits[0] == 0) return logical_addr; /* no levels configured */
 
-    /* Single-level walk:
-     *   - Skip is_field high bits of LA
-     *   - Take next tia bits as table index
-     *   - Remaining (8+ps) bits are the in-page offset
-     */
     u32 page_size_bits = (u32)(8 + ps);
-    u32 idx_shift = page_size_bits;
-    u32 idx_mask = (1u << tia) - 1u;
-    u32 idx = (logical_addr >> idx_shift) & idx_mask;
-    (void)is_field;
+    /* Build the bit position from which each level's index is extracted.
+     * Start at the bit just above the page-offset field, and consume
+     * level_bits[i] bits per level moving DOWN. */
+    u32 shift = page_size_bits;
+    /* Find total walk-bit count so we can compute the per-level shift
+     * from the top down. */
+    int n_levels = 0;
+    for (int i = 0; i < 4 && level_bits[i] != 0; i++) n_levels++;
+    /* Total walked bits = sum of level_bits. */
+    int total_idx_bits = 0;
+    for (int i = 0; i < n_levels; i++) total_idx_bits += level_bits[i];
+    /* The TOP-level's index extracts bits at offset
+     *   page_size_bits + (TIB + TIC + TID),
+     * and each subsequent level shifts down by its own width. */
+    shift = page_size_bits + (u32)total_idx_bits;
 
-    /* Read the descriptor: short-format = 4 bytes. */
-    u32 desc_addr = (table_base + idx * 4u) & 0xFFFFFFFCu;
-    u32 desc = mac_read32(m, desc_addr);
-    u8 desc_dt = (u8)(desc & 3);
-    if (desc_dt == 0) {
-        /* Invalid descriptor — would normally trigger a bus error. We
-         * conservatively pass through for now. TODO(pmmu-fault). */
-        return logical_addr;
+    u32 cur_table = table_base;
+    for (int level = 0; level < n_levels; level++) {
+        shift -= (u32)level_bits[level];
+        u32 idx = (logical_addr >> shift) & ((1u << level_bits[level]) - 1u);
+        u32 desc_addr = (cur_table + idx * 4u) & 0xFFFFFFFCu;
+        u32 desc = mac_read32(m, desc_addr);
+        u8 desc_dt = (u8)(desc & 3);
+        if (desc_dt == 0) {
+            /* Invalid descriptor → would normally bus-error.
+             * TODO(pmmu-fault). Pass through for now. */
+            return logical_addr;
+        }
+        if (level == n_levels - 1) {
+            /* Leaf: this is a page descriptor. Combine page-aligned
+             * address with the in-page offset. */
+            u32 page_phys = desc & ~((1u << page_size_bits) - 1u);
+            u32 page_offset = logical_addr & ((1u << page_size_bits) - 1u);
+            return page_phys | page_offset;
+        }
+        /* Non-leaf: pointer to next-level table. Mask off DT/U/M bits. */
+        cur_table = desc & 0xFFFFFFF0u;
     }
-    u32 page_phys = desc & ~((1u << page_size_bits) - 1u);
-    u32 page_offset = logical_addr & ((1u << page_size_bits) - 1u);
-    return page_phys | page_offset;
+    /* Should not reach here. */
+    return logical_addr;
 }
 
 void mac_mem_tick(mac_mem *m, u64 cycles) {

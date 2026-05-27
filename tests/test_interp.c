@@ -334,15 +334,39 @@ static int test_pmmu_translate(void) {
         printf("pmmu: 1-level PTW LA=0x1ABC → phys=%08X want 20ABC\n", phys);
         return 1;
     }
-    /* Multi-level (TIB != 0) → pass-through (TODO). */
-    cpu.tc |= (4u << 8);  /* set TIB = 4 */
-    if (mac_pmmu_translate(&mem, 0x100u, 5) != 0x100u) {
-        printf("pmmu: multi-level should pass-through (TODO)\n"); return 1;
+    /* M7.6d — two-level walk test. TIA=2 (4-entry top table), TIB=4
+     * (16-entry second-level table), PS=4 (4KB pages). LA layout:
+     *   [31..14] unused
+     *   [13..12] TIA index (2 bits → 4 entries)
+     *   [11..8]  TIB index (4 bits → 16 entries) ... wait that overlaps
+     * Actually let me put level offsets ABOVE the page bits properly:
+     *   bits 17..16: TIA index (2 bits)
+     *   bits 15..12: TIB index (4 bits)
+     *   bits 11..0:  in-page offset (12 bits for 4KB pages)
+     *
+     * Top-level table at 0x6000, 4 entries pointing to 4 second-level
+     * tables. Use a single second-level table for simplicity. */
+    u32 top_table = 0x6000u;
+    u32 mid_table = 0x6100u;
+    /* Top entry 0 → mid_table (DT=2 short pointer). */
+    mac_write32(&mem, top_table + 0 * 4, mid_table | 2u);
+    /* Mid entry 5 → phys page 0x50000 (DT=2 short page). */
+    mac_write32(&mem, mid_table + 5 * 4, 0x00050002u);
+    cpu.srp = ((u64)top_table << 32) | 2u;
+    /* TC.E=1, PS=4, TIA=2, TIB=4. */
+    cpu.tc = 0x80000000u | (4u << 20) | (2u << 12) | (4u << 8);
+    /* LA bits 17-16 = 00 (top idx 0); bits 15-12 = 0101 (mid idx 5);
+     * bits 11-0 = 0xABC. So LA = 0x5ABC. Expected phys = 0x50000 | 0xABC
+     * = 0x50ABC. */
+    u32 phys2 = mac_pmmu_translate(&mem, 0x5ABCu, 5);
+    if (phys2 != 0x50ABCu) {
+        printf("pmmu: 2-level PTW LA=0x5ABC → phys=%08X want 50ABC\n", phys2);
+        return 1;
     }
 
     mac_mem_free(&mem);
     (void)cpu; (void)pcpu;
-    printf("  PMMU translate framework OK (incl 1-level PTW)\n");
+    printf("  PMMU translate framework OK (1-level + 2-level PTW)\n");
     return 0;
 }
 
