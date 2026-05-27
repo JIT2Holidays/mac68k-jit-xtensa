@@ -660,6 +660,45 @@ void mac_write32(mac_mem *m, u32 addr, u32 v) {
 
 /* --- periodic peripheral tick ----------------------------------------- */
 
+/* M7.6a — PMMU translation framework. See mac_mem.h for the full
+ * design notes. Currently returns the logical address unchanged in all
+ * cases; real PTW is TODO(pmmu-ptw). */
+u32 mac_pmmu_translate(mac_mem *m, u32 logical_addr, u8 fc) {
+    (void)fc;
+    if (m->model != MAC_MODEL_SE30 || !m->cpu) return logical_addr;
+
+    m68k_cpu *cpu = m->cpu;
+
+    /* TC bit 31 = E (translation enable). If clear, no translation. */
+    if (!(cpu->tc & 0x80000000u)) return logical_addr;
+
+    /* Transparent Translation check (TT0, TT1). Each is 32 bits:
+     *   bit 15      E (enable)
+     *   bits 14-13  CI / RW (cache inhibit, read/write)
+     *   bits 7-4    Function Code Base
+     *   bits 3-0    Function Code Mask (0 = exact match)
+     *   bits 23-16  Logical Address Mask
+     *   bits 31-24  Logical Address Base
+     * If TT.E and ((FC & ~mask) == base) and ((LA[31-24] & ~LA-mask) ==
+     * LA base) the access is transparent (no PTW). */
+    for (int i = 0; i < 2; i++) {
+        u32 tt = (i == 0) ? cpu->tt0 : cpu->tt1;
+        if (!(tt & 0x00008000u)) continue;  /* TT.E clear */
+        u8 fc_base = (u8)((tt >> 4) & 0xF);
+        u8 fc_mask = (u8)(tt & 0xF);
+        if (((fc ^ fc_base) & ~fc_mask) != 0) continue;
+        u8 la_base = (u8)(tt >> 24);
+        u8 la_mask = (u8)(tt >> 16);
+        if ((((u8)(logical_addr >> 24)) ^ la_base) & ~la_mask) continue;
+        return logical_addr;  /* transparent — no walk */
+    }
+
+    /* TODO(pmmu-ptw): real page-table walk via SRP/CRP. For now return
+     * logical addr unchanged so existing behavior (no translation) is
+     * preserved. */
+    return logical_addr;
+}
+
 void mac_mem_tick(mac_mem *m, u64 cycles) {
     via6522 *v = &m->via;
     bool irq_changed = false;

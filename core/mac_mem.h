@@ -286,6 +286,26 @@ void mac_write32(mac_mem *m, u32 addr, u32 v);
 
 void mac_mem_tick(mac_mem *m, u64 cycles);
 
+/* M7.6a — 68030 PMMU translation framework. Returns the physical
+ * address for a given logical address, performing transparent-
+ * translation (TT0/TT1) checks and a page-table walk when TC.E is
+ * enabled. Currently a no-op for our use case:
+ *   - SE/30 boot runs in 24-bit mode with TC.E = 0 → pass-through
+ *   - TT0/TT1 enabled → pass-through (the "transparent" case)
+ *   - TC.E = 1 → return logical addr unchanged with TODO(pmmu-ptw)
+ *     (real PTW not implemented yet)
+ *
+ * Hook is NOT yet wired into mac_read/mac_write — code at boot doesn't
+ * exercise translation, and adding a per-access function call has
+ * non-trivial perf cost. Will be plumbed in when a real workload needs
+ * translation (System 7 in 32-bit mode, Virtual Memory).
+ *
+ * `fc` is the function code (0-7). For our purposes typically:
+ *   - User Data = 1, User Code = 2
+ *   - Supervisor Data = 5, Supervisor Code = 6
+ *   - CPU Space (interrupt ack) = 7 */
+u32 mac_pmmu_translate(mac_mem *m, u32 logical_addr, u8 fc);
+
 /* Recompute the VIA IRQ summary and cpu->pending_irq. Public so the
  * keyboard code (core/mac_input.c) can raise the shift-register IRQ. */
 void mac_via_recalc_irq(mac_mem *m);

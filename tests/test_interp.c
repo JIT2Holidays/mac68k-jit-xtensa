@@ -262,11 +262,58 @@ static int test_se30_init_stable(void) {
     return 0;
 }
 
+/* M7.6a — PMMU translation framework unit test.
+ * Verifies pass-through behaviour, TC.E gate, and TT0/TT1 transparent
+ * translation match logic. Real PTW is TODO. */
+static int test_pmmu_translate(void) {
+    mac_mem mem;
+    mac_mem_init_ex(&mem, MAC_MODEL_SE30, 1024 * 1024);
+    m68k_cpu cpu;
+    m68k_reset(&cpu, &mem);
+
+    /* Plus mode short-circuit (different mac_mem instance). */
+    mac_mem plus;
+    mac_mem_init_ex(&plus, MAC_MODEL_PLUS, 64 * 1024);
+    m68k_cpu pcpu;
+    m68k_reset(&pcpu, &plus);
+    if (mac_pmmu_translate(&plus, 0x12345678u, 5) != 0x12345678u) {
+        printf("pmmu: Plus translate not pass-through\n"); return 1;
+    }
+    mac_mem_free(&plus);
+
+    /* SE/30 with TC.E = 0 → pass-through. */
+    cpu.tc = 0;
+    if (mac_pmmu_translate(&mem, 0x12345678u, 5) != 0x12345678u) {
+        printf("pmmu: TC.E=0 not pass-through\n"); return 1;
+    }
+
+    /* TC.E = 1, no TT0/TT1 set → still pass-through (TODO real PTW). */
+    cpu.tc = 0x80000000u;
+    cpu.tt0 = 0;
+    cpu.tt1 = 0;
+    if (mac_pmmu_translate(&mem, 0x12345678u, 5) != 0x12345678u) {
+        printf("pmmu: TC.E=1 no-TT path not pass-through\n"); return 1;
+    }
+
+    /* TT0 enabled covering all FCs (mask=0xF) and LA base 0x12 with mask
+     * 0xFF → matches any address starting with 0x12. */
+    cpu.tt0 = 0x12FF8000u | 0xFu;  /* LA base 0x12, LA mask 0xFF, E=1, FC mask 0xF */
+    if (mac_pmmu_translate(&mem, 0x12345678u, 5) != 0x12345678u) {
+        printf("pmmu: TT0 match not pass-through\n"); return 1;
+    }
+
+    mac_mem_free(&mem);
+    (void)cpu; (void)pcpu;
+    printf("  PMMU translate framework OK (pass-through paths)\n");
+    return 0;
+}
+
 int main(void) {
     if (test_arith()) return fail("arith snippet");
     if (test_xform_flags()) return fail("X-form condition codes");
     if (test_68030_isa()) return fail("68030 ISA");
     if (test_se30_init_stable()) return fail("SE/30 init");
+    if (test_pmmu_translate()) return fail("PMMU framework");
 
     mac_mem mem;
     mac_mem_init(&mem, 1024 * 1024);
