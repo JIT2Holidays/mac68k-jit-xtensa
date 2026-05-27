@@ -563,6 +563,36 @@ static int test_pmmu_translate(void) {
                    cpu.mmusr); return 1;
         }
     }
+    /* M7.6p — PTEST write direction against a WP page → MMUSR bit 12 (W). */
+    {
+        /* Long-form table at long_table; entry 2 was set WP=1 in the
+         * WP test. Re-arm it cleanly here. Page 0 of long-form is
+         * already valid (DT=1, phys 0x40000) — use it for the
+         * instruction fetch (identity-map again). */
+        cpu.tc = 0;
+        mac_write32(&mem, long_table + 0 * 8 + 0, 0x00000001u);   /* page 0 → phys 0 */
+        mac_write32(&mem, long_table + 0 * 8 + 4, 0x00000000u);
+        mac_write32(&mem, long_table + 2 * 8 + 0, 0x00000801u);   /* page 2 DT=1 WP=1 */
+        mac_write32(&mem, long_table + 2 * 8 + 4, 0x000C0000u);
+        cpu.srp = ((u64)long_table << 32) | 3u;
+        cpu.tc = 0x80000000u | (4u << 20) | (4u << 12);
+        cpu.bus_error_pending = 0;
+        cpu.mmusr = 0;
+        /* PTEST with RW=0 (write) → bit 9 clear. ext = 0x8000 | 0x1400 = 0x9400. */
+        mac_write16(&mem, 0x200, 0xF011);
+        mac_write16(&mem, 0x202, 0x9400);
+        cpu.pc = 0x200;
+        cpu.sr |= SR_S;
+        cpu.a[1] = 0x2000;                    /* page 2 → WP */
+        m68k_step(&cpu);
+        if (cpu.bus_error_pending != 0) {
+            printf("pmmu: PTEST(W) leaked BERR\n"); return 1;
+        }
+        if ((cpu.mmusr & (1u << 12)) == 0) {
+            printf("pmmu: PTEST(W) WP MMUSR=%04X, expected W bit\n",
+                   cpu.mmusr); return 1;
+        }
+    }
 
     mac_mem_free(&mem);
     (void)cpu; (void)pcpu;
