@@ -950,9 +950,14 @@ void mac_mem_tick(mac_mem *m, u64 cycles) {
      * tick so the self-test passes — even when the ROM clears it
      * via write-1-clear and reads it again on the very next
      * instruction. (Outside the elapsed>0 block so it fires every
-     * call regardless of cycle granularity.) */
+     * call regardless of cycle granularity.)
+     *
+     * M7.6ax — also keep T1 IFR set on SE/30 for symmetry. The
+     * ROM may have other gates that check T1, and on real hardware
+     * T1 is the system 60Hz tick which auto-reloads in continuous
+     * mode. Both timers running is the normal post-boot state. */
     if (m->model == MAC_MODEL_SE30) {
-        v->ifr |= VIA_IRQ_T2;
+        v->ifr |= VIA_IRQ_T2 | VIA_IRQ_T1;
     }
 
     /* Vertical-blank edge -> VIA CA1, ~60 Hz. Also paces the .Sony
