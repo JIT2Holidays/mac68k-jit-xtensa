@@ -653,9 +653,15 @@ static int load_snapshot(mac_mem *m, m68k_cpu *cpu, const char *path) {
     u32 hdr[24], ram_size = 0, rom_size = 0;
     int rc = -2;
     if (fread(hdr, 4, 24, f) == 24 && hdr[0] == 0x4D414331u
-        && fread(&ram_size, 4, 1, f) == 1 && ram_size && ram_size <= 64u*1024*1024) {
+        && fread(&ram_size, 4, 1, f) == 1 && ram_size
+        /* SE/30 RAM can be up to 128 MB; Plus stays ≤ 4 MB. The 64 MB
+         * cap was historical — relax to support SE/30 snapshots. */
+        && ram_size <= 128u*1024*1024) {
         mac_mem_free(m);
-        mac_mem_init(m, ram_size);
+        /* M7.6ab — honor machine model from snapshot hdr[21]. Old
+         * snapshots have 0 (PLUS) — backwards-compatible. */
+        mac_machine_t snap_model = (mac_machine_t)hdr[21];
+        mac_mem_init_ex(m, snap_model, ram_size);
         if (fread(m->ram, 1, ram_size, f) == ram_size
             && fread(&rom_size, 4, 1, f) == 1
             && rom_size && rom_size <= 4u*1024*1024) {
