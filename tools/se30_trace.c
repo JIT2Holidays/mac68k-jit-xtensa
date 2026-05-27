@@ -147,6 +147,30 @@ int main(int argc, char **argv) {
     fprintf(stderr, "[se30_trace] reset PC=0x%08X SSP=0x%08X SR=0x%04X\n",
             cpu.pc, cpu.a[7], cpu.sr);
 
+    /* SE30_SAVE_RESET=<path>: write a machine snapshot at reset (cycle 0)
+     * so the diff-jit-trace harness can lockstep JIT vs interp from
+     * the very first instruction. Matches write_snapshot()'s on-disk
+     * layout in port/host/main.c — must stay in sync. */
+    const char *save_reset = getenv("SE30_SAVE_RESET");
+    if (save_reset) {
+        FILE *sf = fopen(save_reset, "wb");
+        if (sf) {
+            u32 hdr[24] = {0};
+            hdr[0] = 0x4D414331u;
+            for (int i = 0; i < 8; i++) { hdr[1+i] = cpu.d[i]; hdr[9+i] = cpu.a[i]; }
+            hdr[17] = cpu.pc; hdr[18] = cpu.sr;
+            hdr[19] = cpu.usp; hdr[20] = cpu.ssp;
+            hdr[21] = (u32)mem.model;
+            fwrite(hdr, 4, 24, sf);
+            fwrite(&mem.ram_size, 4, 1, sf);
+            fwrite(mem.ram, 1, mem.ram_size, sf);
+            fwrite(&mem.rom_size, 4, 1, sf);
+            fwrite(mem.rom, 1, mem.rom_size, sf);
+            fclose(sf);
+            fprintf(stderr, "[se30_trace] saved reset snapshot to %s\n", save_reset);
+        }
+    }
+
     /* Optional: inject a byte into SCC channel A at a fixed cycle to
      * test whether the post-ASC outer loop is purely SCC-poll-waiting.
      * SE30_INJECT_BYTE=<hex> SE30_INJECT_AT=<cyc> env vars. */
