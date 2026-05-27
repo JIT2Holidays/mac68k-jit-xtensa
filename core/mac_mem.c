@@ -790,6 +790,14 @@ u32 mac_pmmu_translate(mac_mem *m, u32 logical_addr, u8 fc, bool is_write) {
             m->pmmu_in_walk = 0;
             return logical_addr;
         }
+        /* M7.6i — U (used) bit maintenance: every descriptor we walk
+         * gets U=1 written back. Bit 3 of desc0 for both short- and
+         * long-form. Skip the write if it's already set to avoid
+         * write storms. */
+        if ((desc0 & (1u << 3)) == 0) {
+            desc0 |= (1u << 3);
+            mac_write32(m, desc_addr, desc0);
+        }
         if (level == n_levels - 1) {
             /* Leaf: this is a page descriptor. Combine page-aligned
              * address with the in-page offset.
@@ -816,6 +824,13 @@ u32 mac_pmmu_translate(mac_mem *m, u32 logical_addr, u8 fc, bool is_write) {
                     m->pmmu_in_walk = 0;
                     return logical_addr;
                 }
+            }
+            /* M7.6i — M (modified) bit on writes. Bit 4 of desc0 in
+             * both short and long form. Set only if write and not
+             * already set. */
+            if (is_write && (desc0 & (1u << 4)) == 0) {
+                desc0 |= (1u << 4);
+                mac_write32(m, desc_addr, desc0);
             }
             u32 page_phys;
             if (entry_sz == 8u) {

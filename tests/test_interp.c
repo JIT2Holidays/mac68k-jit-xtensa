@@ -437,9 +437,40 @@ static int test_pmmu_translate(void) {
         printf("pmmu: WP write should set bus_error_pending\n"); return 1;
     }
 
+    /* M7.6i — U (used) and M (modified) bit maintenance. Set up a fresh
+     * short-form entry with U=0/M=0, translate it once for read, expect
+     * U=1 M=0. Translate again for write, expect U=1 M=1. */
+    cpu.tc = 0;
+    /* Entry 3 of short-form table_base: page addr 0x000D0000, DT=1 only. */
+    mac_write32(&mem, table_base + 3 * 4, 0x000D0001u);
+    cpu.srp = ((u64)table_base << 32) | 2u;
+    cpu.tc = 0x80000000u | (4u << 20) | (4u << 12);
+    cpu.bus_error_pending = 0;
+    /* LA 0x3010 → page 3 → phys 0x000D0010. Read first. */
+    u32 ph_um = mac_pmmu_translate(&mem, 0x3010u, 5, false);
+    if (cpu.bus_error_pending != 0 || ph_um != 0x000D0010u) {
+        printf("pmmu: U/M read phys=%08X berr=%08X\n",
+               ph_um, cpu.bus_error_pending); return 1;
+    }
+    cpu.tc = 0;
+    u32 after_r = mac_read32(&mem, table_base + 3 * 4);
+    cpu.tc = 0x80000000u | (4u << 20) | (4u << 12);
+    if ((after_r & (1u << 3)) == 0 || (after_r & (1u << 4)) != 0) {
+        printf("pmmu: U=1 M=0 after read, got desc=%08X\n", after_r);
+        return 1;
+    }
+    /* Now write — expect M=1 too. */
+    mac_pmmu_translate(&mem, 0x3010u, 5, true);
+    cpu.tc = 0;
+    u32 after_w = mac_read32(&mem, table_base + 3 * 4);
+    if ((after_w & (1u << 3)) == 0 || (after_w & (1u << 4)) == 0) {
+        printf("pmmu: U=1 M=1 after write, got desc=%08X\n", after_w);
+        return 1;
+    }
+
     mac_mem_free(&mem);
     (void)cpu; (void)pcpu;
-    printf("  PMMU translate framework OK (short + long form + BERR + WP)\n");
+    printf("  PMMU translate framework OK (short + long + BERR + WP + U/M)\n");
     return 0;
 }
 
