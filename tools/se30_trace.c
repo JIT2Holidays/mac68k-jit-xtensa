@@ -162,6 +162,21 @@ int main(int argc, char **argv) {
     }
     bool injected = (inject_at == ~0ull);
 
+    /* SE30_INJECT_STREAM=<hex bytes>: after inject_at fires, keep refilling
+     * SCC ch A RX whenever it's empty, cycling through the byte stream.
+     * Lets us test how the ROM consumes serial input — e.g.
+     * SE30_INJECT_STREAM=0D0A1B5B5D injects "\r\n\e[]" repeatedly. */
+    u8 stream[64]; u32 stream_n = 0, stream_idx = 0;
+    const char *is = getenv("SE30_INJECT_STREAM");
+    if (is) {
+        for (u32 i = 0; is[i] && is[i+1] && stream_n < 64; i += 2) {
+            char hex[3] = { is[i], is[i+1], 0 };
+            stream[stream_n++] = (u8)strtoul(hex, NULL, 16);
+        }
+        fprintf(stderr, "[se30_trace] inject stream: %u bytes, cycle every poll\n",
+                stream_n);
+    }
+
     u64 sample_every = 32;
     u64 next_sample = 0;
     /* SE30_DUMP_AT=<cyc>: after reaching that cycle, single-step the next
@@ -190,6 +205,11 @@ int main(int argc, char **argv) {
             fprintf(stderr, "[se30_trace] injected SCC byte 0x%02X at cyc=%llu\n",
                     inject_byte, (unsigned long long)cpu.cycles);
             injected = true;
+        }
+        /* Stream-mode: keep ch A RX queue refilled. */
+        if (stream_n > 0 && injected && !mem.scc.ch[1].rx_avail) {
+            mac_scc_rx(&mem, 1, stream[stream_idx % stream_n]);
+            stream_idx++;
         }
         if (dump_at != ~0ull && cpu.cycles >= dump_at && dump_n > 0) {
             for (u32 i = 0; i < dump_n && !cpu.halted; i++) {
