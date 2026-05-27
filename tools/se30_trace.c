@@ -377,6 +377,11 @@ int main(int argc, char **argv) {
             fprintf(stderr, "\n");
         }
     }
+    /* Dump RAM[0xBA..0xE0] — the zero-divide trap PC area. */
+    fprintf(stderr, "[se30_trace] RAM[0xBA..0xE0]:");
+    for (int i = 0xBA; i < 0xE0; i++)
+        fprintf(stderr, " %02X", mem.ram[i]);
+    fprintf(stderr, "\n");
     /* Dump RAM at specific low-memory globals used by boot. */
     fprintf(stderr, "[se30_trace] RAM[0x120]=%02X RAM[0x1C00..0x1C04]=%02X%02X%02X%02X "
             "RAM[0xCC0..0xCC4]=%02X%02X%02X%02X\n",
