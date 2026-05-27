@@ -90,6 +90,19 @@ void m68k_reset(m68k_cpu *cpu, struct mac_mem *mem) {
 /* ---- instruction stream fetch ---------------------------------------- */
 
 static inline u16 fetch16(m68k_cpu *cpu) {
+    /* SE/30: instruction fetch from non-ROM, non-RAM addresses raises
+     * BERR. The Mac IIx ROM does JMP (slot_base) to probe for executable
+     * card code at slot 8/9/... (0x80000000, 0x90000000, ...) — empty
+     * slots BERR. Without BERR, the open-bus 0xFFFF read fires an
+     * F-line trap that infinite-loops. Data reads at the same addresses
+     * (slot magic-value CMP probes) still return 0xFF — see mac_read*.
+     * Valid PC ranges: RAM (< 0x40000000 with wrap) + ROM
+     * 0x40800000-0x4083FFFF. */
+    if (cpu->mem && cpu->mem->model == MAC_MODEL_SE30
+        && cpu->pc >= 0x40000000u
+        && (cpu->pc < 0x40800000u || cpu->pc >= 0x40840000u)) {
+        cpu->bus_error_pending = cpu->pc | 0x80000000u;
+    }
     u16 w = mac_read16(cpu->mem, cpu->pc);
     cpu->pc += 2;
     return w;
