@@ -206,6 +206,103 @@ int main(void) {
         rc |= bad;
     }
 
+    /* M7.5b — LINK.L decode test. Validates m68k_decode_at sizes the
+     * 6-byte LINK.L correctly so the block walker doesn't fall into the
+     * d32 displacement bytes mis-decoded as instructions. */
+    {
+        mac_mem mi, mj;
+        mac_mem_init_ex(&mi, MAC_MODEL_SE30, 64 * 1024);
+        mac_mem_init_ex(&mj, MAC_MODEL_SE30, 64 * 1024);
+        u8 prog[64];
+        memset(prog, 0, sizeof prog);
+        m68a aa;
+        m68a_init(&aa, prog, sizeof prog, 0);
+        m68a_w32(&aa, 0x00010000);
+        m68a_w32(&aa, 0x00000100);
+        m68a_finish(&aa);
+        mac_load_ram_image(&mi, 0, prog, 8);
+        mac_load_ram_image(&mj, 0, prog, 8);
+        /* MOVEA.L #0x4000,A6 ; MOVEA.L #0x4000,A7 ; LINK.L A6,#-0x10000 ; STOP. */
+        u16 code[] = {
+            0x2C7C, 0x0000, 0x4000,           /* MOVEA.L #0x00004000, A6 */
+            0x2E7C, 0x0000, 0x4000,           /* MOVEA.L #0x00004000, A7 */
+            0x480E, 0xFFFF, 0x0000,           /* LINK.L A6, #-0x10000 */
+            0x4E72, 0x2700,                   /* STOP #$2700 */
+        };
+        for (size_t i = 0; i < sizeof code / sizeof code[0]; i++) {
+            mac_write16(&mi, 0x100u + (u32)(i * 2), code[i]);
+            mac_write16(&mj, 0x100u + (u32)(i * 2), code[i]);
+        }
+        m68k_cpu ci, cj;
+        m68k_reset(&ci, &mi);
+        m68k_reset(&cj, &mj);
+        m68k_run_until(&ci, 100000);
+        m68k_dispatcher d;
+        m68k_dispatcher_init(&d, &cj);
+        m68k_dispatcher_run_until(&d, 100000);
+        int bad = diff_state("se30-linkl", &ci, &cj);
+        if (!bad) printf("  se30-linkl: match (LINK.L correctly sized in walker)\n");
+        m68k_dispatcher_shutdown(&d);
+        mac_mem_free(&mi);
+        mac_mem_free(&mj);
+        rc |= bad;
+    }
+
+    /* M7.5b — RTD decode test. Validates m68k_decode_at marks RTD as
+     * a block terminator so the walker stops before reading bytes past
+     * RTD as phantom opcodes. */
+    {
+        mac_mem mi, mj;
+        mac_mem_init_ex(&mi, MAC_MODEL_SE30, 64 * 1024);
+        mac_mem_init_ex(&mj, MAC_MODEL_SE30, 64 * 1024);
+        u8 prog[64];
+        memset(prog, 0, sizeof prog);
+        m68a aa;
+        m68a_init(&aa, prog, sizeof prog, 0);
+        m68a_w32(&aa, 0x00010000);
+        m68a_w32(&aa, 0x00000100);
+        m68a_finish(&aa);
+        mac_load_ram_image(&mi, 0, prog, 8);
+        mac_load_ram_image(&mj, 0, prog, 8);
+        /* Put a return address 0x200 at SP=0x1000, set up SP, then RTD #8
+         * which should pop PC=0x200, SP+=4+8 = 0x100C. Then STOP at 0x200. */
+        mac_write32(&mi, 0x1000, 0x00000200);
+        mac_write32(&mj, 0x1000, 0x00000200);
+        mac_write16(&mi, 0x200, 0x4E72);     /* STOP */
+        mac_write16(&mi, 0x202, 0x2700);
+        mac_write16(&mj, 0x200, 0x4E72);
+        mac_write16(&mj, 0x202, 0x2700);
+        /* MOVEA.L #0x1000, A7 ; RTD #8. */
+        u16 code[] = {
+            0x2E7C, 0x0000, 0x1000,           /* MOVEA.L #0x1000, A7 */
+            0x4E74, 0x0008,                   /* RTD #8 */
+        };
+        for (size_t i = 0; i < sizeof code / sizeof code[0]; i++) {
+            mac_write16(&mi, 0x100u + (u32)(i * 2), code[i]);
+            mac_write16(&mj, 0x100u + (u32)(i * 2), code[i]);
+        }
+        m68k_cpu ci, cj;
+        m68k_reset(&ci, &mi);
+        m68k_reset(&cj, &mj);
+        m68k_run_until(&ci, 100000);
+        m68k_dispatcher d;
+        m68k_dispatcher_init(&d, &cj);
+        m68k_dispatcher_run_until(&d, 100000);
+        int bad = diff_state("se30-rtd", &ci, &cj);
+        if (!bad) {
+            if (ci.pc != 0x204 || ci.a[7] != 0x100C) {
+                printf("  se30-rtd: PC=%08X SP=%08X want 0x204/0x100C\n",
+                       ci.pc, ci.a[7]); bad = 1;
+            } else {
+                printf("  se30-rtd: match — PC=0x204, SP=0x100C\n");
+            }
+        }
+        m68k_dispatcher_shutdown(&d);
+        mac_mem_free(&mi);
+        mac_mem_free(&mj);
+        rc |= bad;
+    }
+
     /* SE/30 hybrid termination: a block that mixes 68000 ops with a
      * 68020 BFEXTU. The JIT block walker should stop just before BFEXTU
      * and the interpreter should pick up there. End state must match

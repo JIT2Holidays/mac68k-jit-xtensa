@@ -2802,17 +2802,32 @@ m68k_decoded m68k_decode_at(m68k_cpu *cpu, u32 pc) {
             }
             if ((op & 0xFFF0) == 0x4E40) { d.ends_block = true; break; }  /* TRAP */
             if (op == 0x4E72) { d.length += 2; d.ends_block = true; break; } /* STOP */
+            /* M7.5b — RTD #d16 (68020+, 0x4E74): control-flow terminator,
+             * 4 bytes (op + d16). Without ends_block the JIT block walker
+             * keeps reading past the RTD and decodes wrong bytes; without
+             * the +2 length the next op is mis-aligned. */
+            if (op == 0x4E74) { d.length += 2; d.ends_block = true; break; }
+            /* M7.5b — MOVEC Rc<->Rn (0x4E7A/0x4E7B): 4 bytes (op + ext).
+             * Default fallthrough's mode-6 EA decode accidentally sizes
+             * to 4, so this is just for clarity. Not a block terminator. */
+            if (op == 0x4E7A || op == 0x4E7B) { d.length += 2; break; }
             if ((op & 0xFFC0) == 0x4EC0 || (op & 0xFFC0) == 0x4E80) {
                 d.length += ea_ext_bytes(cpu, pc, mode, reg, 4);          /* JMP/JSR */
                 d.ends_block = true; break;
             }
             if ((op & 0xFFF8) == 0x4E50) { d.length += 2; break; }        /* LINK */
+            /* M7.5b — LINK.L An,#d32 (68020+, 0x4808-0x480F): 6 bytes
+             * (op + d32). Without this the default fallthrough's mode-1
+             * (An) sizes LINK.L to just 2 bytes and the walker decodes
+             * the d32 displacement as 2 phantom instructions. */
+            if ((op & 0xFFF8) == 0x4808) { d.length += 4; break; }
             /* 2-byte instructions with NO effective-address field — these
              * must not fall through to the generic EA-extension sizing,
              * which would mis-read their register bits as an EA mode. */
             if (op == 0x4E71 || op == 0x4E76 ||                           /* NOP, TRAPV */
                 (op & 0xFFF8) == 0x4840 ||                                /* SWAP */
                 (op & 0xFFB8) == 0x4880 ||                                /* EXT  */
+                (op & 0xFFF8) == 0x49C0 ||                                /* EXTB.L (68020+) */
                 (op & 0xFFF8) == 0x4E58 ||                                /* UNLK */
                 (op & 0xFFF0) == 0x4E60) {                                /* MOVE USP */
                 break;
