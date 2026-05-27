@@ -1864,9 +1864,11 @@ bool is_68020_only(u16 op) {
     if ((op & 0xF9C0) == 0x08C0 && ((op >> 9) & 3) != 0) return true;
     /* CAS2 — fixed encodings only. */
     if (op == 0x0CFC || op == 0x0EFC) return true;
-    /* PACK / UNPK */
-    if ((op & 0xF1F0) == 0x8140) return true;
-    if ((op & 0xF1F0) == 0x8180) return true;
+    /* PACK (line 8) / UNPK (line C). Both have a 16-bit adjustment word
+     * following the opcode. Earlier this file's UNPK mask was 0x8180
+     * which is on line 8 — but UNPK lives on line C (0xC180+). */
+    if ((op & 0xF1F0) == 0x8140) return true;   /* PACK */
+    if ((op & 0xF1F0) == 0xC180) return true;   /* UNPK */
     /* PMMU coprocessor (line F, cp-id = 0) */
     if ((op & 0xFE00) == 0xF000) return true;
     /* CINV / CPUSH */
@@ -1897,6 +1899,18 @@ bool m68k_jit_can_inline_020(u16 op) {
     /* M7.5e — 32-bit MUL/DIV via m68k_step bridge. */
     if ((op & 0xFFC0) == 0x4C00) return true;   /* MULU.L / MULS.L */
     if ((op & 0xFFC0) == 0x4C40) return true;   /* DIVU.L / DIVS.L */
+
+    /* M7.5f — line 0 020+ ops + TRAPcc + PACK/UNPK. All sized correctly
+     * by m68k_decode_at and handled by m68k_step. */
+    if ((op & 0xF9C0) == 0x00C0 && ((op >> 9) & 3) != 3) return true; /* CHK2/CMP2 */
+    if (op == 0x0CFC || op == 0x0EFC) return true;                    /* CAS2 */
+    if ((op & 0xF9C0) == 0x08C0 && ((op >> 9) & 3) != 0) return true; /* CAS */
+    if ((op & 0xFFC0) == 0x0E00 || (op & 0xFFC0) == 0x0E40
+        || (op & 0xFFC0) == 0x0E80) return true;                      /* MOVES */
+    /* TRAPcc — opmode in {.W, .L, no-op} (reg 2/3/4 with mode=7, szf=3). */
+    if ((op & 0xF0F8) == 0x50F8 && (op & 7) >= 2 && (op & 7) <= 4) return true;
+    if ((op & 0xF1F0) == 0x8140) return true;   /* PACK */
+    if ((op & 0xF1F0) == 0xC180) return true;   /* UNPK */
 
     return false;
 }
@@ -2780,6 +2794,30 @@ m68k_decoded m68k_decode_at(m68k_cpu *cpu, u32 pc) {
 
     switch (top) {
         case 0x0: {
+            /* M7.5f — 68020+ ops in line 0 (sized before the 68000 fall-
+             * through). All have a mandatory ext word at op+2; CAS2 has
+             * two ext words. */
+            if ((op & 0xF9C0) == 0x00C0 && ((op >> 9) & 3) != 3) {
+                /* CHK2 / CMP2 */
+                d.length += 2 + ea_ext_bytes(cpu, pc + 2, mode, reg, 1);
+                break;
+            }
+            if (op == 0x0CFC || op == 0x0EFC) {
+                /* CAS2 — fixed 6 bytes (op + 2 ext words). */
+                d.length += 4;
+                break;
+            }
+            if ((op & 0xF9C0) == 0x08C0 && ((op >> 9) & 3) != 0) {
+                /* CAS */
+                d.length += 2 + ea_ext_bytes(cpu, pc + 2, mode, reg, 4);
+                break;
+            }
+            if ((op & 0xFFC0) == 0x0E00 || (op & 0xFFC0) == 0x0E40
+                || (op & 0xFFC0) == 0x0E80) {
+                /* MOVES */
+                d.length += 2 + ea_ext_bytes(cpu, pc + 2, mode, reg, 4);
+                break;
+            }
             int op9 = (op >> 9) & 7;
             if (((op >> 8) & 1) && mode == 1) {
                 d.length += 2;                  /* MOVEP: 16-bit displacement */
@@ -2906,6 +2944,17 @@ m68k_decoded m68k_decode_at(m68k_cpu *cpu, u32 pc) {
         }
         case 0x5: {
             if (szf == 3 && mode == 1) { d.length += 2; d.ends_block = true; break; } /* DBcc */
+            /* M7.5f — TRAPcc (68020+): 0101 cccc 11111 OPMODE where
+             * OPMODE in {010 (.W), 011 (.L), 100 (no operand)}. Encoded
+             * as szf=3, mode=7, reg in {2,3,4}. .W form has 16-bit
+             * operand; .L form has 32-bit operand; no-operand is just
+             * 2 bytes. */
+            if (szf == 3 && mode == 7 && (reg == 2 || reg == 3 || reg == 4)) {
+                if (reg == 2)      d.length += 2;   /* TRAPcc.W */
+                else if (reg == 3) d.length += 4;   /* TRAPcc.L */
+                /* reg == 4: no operand, 2 bytes total. */
+                break;
+            }
             d.length += ea_ext_bytes(cpu, pc, mode, reg, sz);
             break;
         }
@@ -2935,6 +2984,15 @@ m68k_decoded m68k_decode_at(m68k_cpu *cpu, u32 pc) {
              * step's internal fetch), not from the wrong compile-time
              * op_pc. But any new inline arm for the phantom's opcode
              * would corrupt execution. */
+            /* M7.5f — 68020+ PACK (line 8) / UNPK (line C). Both have a
+             * 16-bit adjustment word following the opcode (no EA bytes
+             * because operands are register pair or pre-decrement pair). */
+            if (top == 0x8 && (op & 0x01F0) == 0x0140) {
+                d.length += 2; break;            /* PACK */
+            }
+            if (top == 0xC && (op & 0x01F0) == 0x0180) {
+                d.length += 2; break;            /* UNPK */
+            }
             int adj_sz;
             if (szf == 3) {
                 bool a_long = (top == 0x9 || top == 0xB || top == 0xD)
