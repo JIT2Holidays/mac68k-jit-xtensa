@@ -500,3 +500,77 @@ further wins on those require deeper architectural moves
 (variable-count shifts, native ESP32 chain measurement, M6.66
 root-cause fix, per-flag-CCR liveness, trampoline-preserve-a4..a7).
 See `memory/host-perf-saturation.md`.
+
+## M7 — 68020/030 extensions (SE/30 path)
+
+The M7 arc added 68020/030 integer-ISA support and a Macintosh SE/30
+hardware model alongside the Plus path. The JIT operates in HYBRID
+mode under `MAC_MODEL_SE30`: the block walker terminates only on
+020+ opcodes the JIT can't handle, allowing 68000 ops to compile as
+usual and 020+ ops to either run inline or bridge through m68k_step.
+
+### Decoder coverage (all 68020+ ops correctly sized)
+
+| Op class | Mask | Length |
+|----------|------|--------|
+| Bitfield (8 variants) | `0xF8C0 == 0xE8C0` | 4 + EA |
+| MULU.L / MULS.L | `0xFFC0 == 0x4C00` | 4 + EA |
+| DIVU.L / DIVS.L | `0xFFC0 == 0x4C40` | 4 + EA |
+| EXTB.L Dn | `0xFFF8 == 0x49C0` | 2 |
+| LINK.L An,#d32 | `0xFFF8 == 0x4808` | 6 |
+| RTD #d16 | `op == 0x4E74` | 4 (ends_block) |
+| MOVEC | `op == 0x4E7A/0x4E7B` | 4 |
+| MOVES | `0xFFC0 == 0x0E00/0x0E40/0x0E80` | 4 + EA |
+| TRAPcc (.W/.L/none) | `0xF0F8 == 0x50F8 + 7 in {2,3,4}` | 2/4/6 |
+| CHK2 / CMP2 | `0xF9C0 == 0x00C0` (sz ≠ 3) | 4 + EA |
+| CAS | `0xF9C0 == 0x08C0` (sz ≠ 0) | 4 + EA |
+| CAS2 | `op == 0x0CFC/0x0EFC` | 6 |
+| PACK | `0xF1F0 == 0x8140` | 4 |
+| UNPK | `0xF1F0 == 0xC180` | 4 |
+| CINV / CPUSH | `0xFF20 == 0xF400/0xF420` | 2 |
+| PMMU (cp-id 0) | `0xFE00 == 0xF000` | 4 + EA |
+
+### JIT inline arms (M7.5)
+
+14 native inline arms emit Xtensa LX7 directly without the m68k_step
+fallback. Plus mode is bit-for-bit unchanged (the arms are gated on
+`m68k_jit_can_inline_020`, which only fires under SE/30 mode).
+
+| Milestone | Op | Codegen pattern |
+|-----------|----|-----------------|
+| M7.5a | EXTB.L Dn | `slli 24; srai 24` (sign-ext .B → .L) |
+| M7.5h | CINV / CPUSH | `emit_advance(2, 12)` — pure no-op |
+| M7.5i | MOVEC ctl↔Rn | `l32i`/`s32i` between Dn/An and cpu_state field |
+| M7.5j | LINK.L An,#d32 | fast-path mirror of LINK.W with 32-bit disp |
+| M7.5l | TRAPF (cc=F) | `emit_advance(len, 4)` — never traps |
+| M7.5m | BFEXTU Dn{off:wid},Dm (static) | `slli off; srli (32-wid)` |
+| M7.5n | BFTST (flags-only) | shift to MSB, emit_logic_flags |
+| M7.5o | BFEXTS Dn{off:wid},Dm (static) | `slli off; srai (32-wid)` |
+| M7.5p | BFCHG / BFCLR / BFSET Dn (static) | compile-time mask + XOR/AND/OR |
+| M7.5q | BFINS Dm,Dn{off:wid} (static) | mask field, OR in source bits |
+| M7.5r | PACK / UNPK Dn-Dn,#adj16 | nibble extract + add + nibble pack |
+
+### 020+ ops via m68k_step bridge (kept in block, not natively inlined)
+
+Each is in `m68k_jit_can_inline_020` so the JIT block walker doesn't
+terminate at them, but the actual op is dispatched via the default
+`emit_helper_step` bridge. Native inline candidates for future work:
+
+| Op | Reason still bridging |
+|----|----------------------|
+| BFFFO | Needs Xtensa NSAU emitter + sim support (xt_nsau added in M7.6b; sim TODO) |
+| MULU.L (V flag) / MULS.L (V flag) | Needs MULUH/MULSH for overflow detection (xt_muluh/xt_mulsh added in M7.6b; sim TODO) |
+| DIVU.L / DIVS.L | Needs QUOU/QUOS for division (added in M7.6b; sim TODO) |
+| RTD #d16 | Needs `emit_helper_step_size` API not yet exposed |
+| MOVES | Memory access with function code — complex EA decode |
+| TRAPcc cc!=F | Conditional control flow with PC mutation |
+| CHK2 / CMP2 / CAS / CAS2 | Rare in practice |
+| PMMU instructions | Stubs only (M7.0); real PTW is M7.6's TODO |
+
+### PMMU (M7.6)
+
+Register stubs land in M7.0 (`cpu->tc/srp/crp/tt0/tt1/mmusr`). The
+M7.6a translation framework (`mac_pmmu_translate`) adds TC.E gate +
+TT0/TT1 transparent-translation check, but real page-table walking
+(via SRP/CRP) is still TODO — needs a 32-bit-mode workload (System
+7.5+ with Virtual Memory) to test against.
