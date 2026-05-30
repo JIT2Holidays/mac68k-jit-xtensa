@@ -485,7 +485,7 @@ static m68k_block *l2_rehydrate(m68k_dispatcher *d, u32 pc) {
     for (u32 i = 0; i < e->code_size; i += 4)
         *(u32 *)(iram + i) = *(u32 *)(e->bytes + i);
     codecache_finalize(&d->cc, iram + e->entry_off, e->code_size - e->entry_off);
-    m68k_block *b = (m68k_block *)calloc(1, sizeof(*b));
+    m68k_block *b = m68k_block_alloc();
     if (!b) { codecache_free(&d->cc, (u32)(iram - d->cc.base), e->code_size); return NULL; }
     b->pc_start = e->pc_start; b->pc_end = e->pc_end; b->n_ops = e->n_ops;
     b->code = iram; b->code_size = e->code_size; b->entry_off = e->entry_off;

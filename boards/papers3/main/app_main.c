@@ -560,6 +560,15 @@ void app_main(void) {
                      (unsigned long long)d_l2r, (unsigned long long)d_l2p,
                      (unsigned long long)d_l2e,
                      (unsigned long long)(s_disp.l2_publishes - s_disp.l2_evicts));
+            /* Compile cost breakdown (CCOUNT, from codegen.c): setup vs emit
+             * vs finalize — to localize whether 1-op ROM-block fixed overhead
+             * (setup/final) or the op-emit body dominates first-compile cost. */
+            extern u64 g_prof_csetup, g_prof_cemit, g_prof_cfinal;
+            static u64 p_cs, p_ce, p_cf;
+            ESP_LOGI(TAG, "   compile%%: setup %.0f emit %.0f final %.0f",
+                     100.0*(g_prof_csetup-p_cs)/whz, 100.0*(g_prof_cemit-p_ce)/whz,
+                     100.0*(g_prof_cfinal-p_cf)/whz);
+            p_cs=g_prof_csetup; p_ce=g_prof_cemit; p_cf=g_prof_cfinal;
             /* WORST-PERIOD tracker — boot time is dominated by the SLOWEST
              * windows; peak MHz is meaningless. Latch the lowest-MHz window's
              * full profile (after a short warm-up past the cold ROM phase) and

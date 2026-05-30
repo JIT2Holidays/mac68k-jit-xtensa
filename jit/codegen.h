@@ -207,5 +207,6 @@ int m68k_block_static_successors(const m68k_block *b, struct mac_mem *mem,
                                  u32 out[2]);
 
 void m68k_block_free(m68k_block *b);
+m68k_block *m68k_block_alloc(void);   /* pooled zeroed m68k_block */
 
 #endif

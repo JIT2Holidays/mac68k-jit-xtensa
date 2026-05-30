@@ -355,6 +355,19 @@ static u8  *g_scratch;
 static u32  g_scratch_cap;
 static inline void sext_memo_invalidate(void) { g_sext_valid = false; }
 
+/* Compile sub-profiler: where m68k_compile_block's host cycles go
+ * (setup = decode+literal-fill+analysis+prologue; emit = the op body loop;
+ * final = scratch->IRAM copy + finalize + block alloc). Read by the board
+ * heartbeat to decide what to optimize. Negligible overhead. */
+u64 g_prof_csetup, g_prof_cemit, g_prof_cfinal;
+#if defined(ESP_PLATFORM)
+static inline u32 cg_ccount(void){ u32 v; __asm__ volatile("rsr.ccount %0":"=r"(v)); return v; }
+#else
+static inline u32 cg_ccount(void){ return 0; }
+#endif
+#define CG_T(v)        u32 v = cg_ccount()
+#define CG_LAP(fld,v)  do { u32 _n = cg_ccount(); g_prof_##fld += (u32)(_n - (v)); (v) = _n; } while (0)
+
 static void emit_sr_flush(xt_emit *e) {
     if (g_sr_dirty) { xt_s16i(e, R_SR, R_CPU, OFF_SR); g_sr_dirty = false; }
 }
@@ -1853,6 +1866,7 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
                      (cpu->mem && cpu->mem->overlay && cpu->mem->rom &&
                       pc < cpu->mem->rom_size);
     u32 block_cap = tight_irq ? 1u : M68K_MAX_OPS_PER_BLOCK;
+    CG_T(_cgt);
     u16 op_word[M68K_MAX_OPS_PER_BLOCK];
     u32 op_pc  [M68K_MAX_OPS_PER_BLOCK];
     u32 n_ops = 0;
@@ -2211,6 +2225,7 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
     u32 body_off = entry_off + e.len;
 
     /* 6. Body. */
+    CG_LAP(csetup, _cgt);
     u32 inline_ops = 0, helper_ops = 0;
     for (u32 i = 0; i < n_ops; i++) {
         u16 w = op_word[i];
@@ -12430,6 +12445,7 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
         return NULL;
     }
     xt_flush_pending(&e);
+    CG_LAP(cemit, _cgt);
 
     u32 actual = align_up_4(entry_off + e.len);
     /* Relocate the finished block scratch -> executable slot, 32-bit stores
@@ -12439,7 +12455,7 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
     codecache_finalize(cc, iram + entry_off, e.len);
     codecache_trim(cc, iram, actual, total);
 
-    m68k_block *b = (m68k_block *)calloc(1, sizeof(*b));
+    m68k_block *b = m68k_block_alloc();
     if (!b) {
         codecache_free(cc, (u32)(iram - cc->base), actual);
         return NULL;
@@ -12482,6 +12498,7 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
         b->content_hash = h;
     }
     b->hash_next = NULL;
+    CG_LAP(cfinal, _cgt);
     return b;
 }
 
@@ -12563,6 +12580,33 @@ int m68k_block_static_successors(const m68k_block *b, struct mac_mem *mem,
     return 1;
 }
 
+/* Block-struct pool. m68k_block structs are allocated on every compile AND
+ * every L2 rehydrate, and freed on every eviction/SMC-drop — ~50k+ alloc/free
+ * per 2M-cycle window during the relocation phase. Pooling them avoids that
+ * heap churn (calloc/free with allocator locking). Capped so the pool can't
+ * grow unbounded; overflow falls back to free(). */
+#define M68K_BLOCK_POOL_CAP 512u
+static m68k_block *g_block_pool;   /* freelist linked via hash_next */
+static u32         g_block_pool_n;
+
+m68k_block *m68k_block_alloc(void) {
+    m68k_block *b = g_block_pool;
+    if (b) {
+        g_block_pool = b->hash_next;
+        g_block_pool_n--;
+        memset(b, 0, sizeof(*b));
+        return b;
+    }
+    return (m68k_block *)calloc(1, sizeof(m68k_block));
+}
+
 void m68k_block_free(m68k_block *b) {
-    free(b);
+    if (!b) return;
+    if (g_block_pool_n < M68K_BLOCK_POOL_CAP) {
+        b->hash_next = g_block_pool;
+        g_block_pool = b;
+        g_block_pool_n++;
+    } else {
+        free(b);
+    }
 }
