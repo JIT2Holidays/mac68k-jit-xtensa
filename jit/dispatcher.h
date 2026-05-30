@@ -74,14 +74,40 @@ typedef struct m68k_dispatcher {
     /* Self-modifying-code tracking. The guest OS loads code segments into
      * RAM and reuses that RAM, so a cached block can outlive the code it
      * was compiled from. `code_pages` marks 256-byte pages that hold
-     * compiled code; a guest write to such a page queues it in
-     * `dirty_pages`, and the run loop drops the affected blocks between
-     * block executions (never while one is running). */
+     * compiled code — a cheap write fast-reject. A write to such a page
+     * queues its EXACT address in `dirty_addrs`; the run loop then drops
+     * only the blocks whose instruction range actually contains a queued
+     * address (never while one is running). Address-precise — not page-
+     * precise — invalidation is essential: the guest interleaves code and
+     * data within 256-byte pages, so page granularity would invalidate hot
+     * loop blocks on every adjacent data write and thrash recompilation. */
     u8   code_pages[8192];          /* bitmap: 65536 x 256-byte pages */
-    u16  dirty_pages[256];
+    u32  dirty_addrs[256];          /* exact guest addrs written to code pages */
     int  n_dirty;
     bool smc_overflow;              /* dirty queue full -> full flush */
+    /* Diagnostic: last SMC drop (write addr + dropped block's guest range). */
+    u32  dbg_smc_w, dbg_smc_pcs, dbg_smc_pce;
+
+    /* Hotspot gate. Only JIT-compile a block once its entry pc has been
+     * interpreted >= compile_threshold times; below that, interpret it.
+     * 0 = compile on first sight (legacy behavior; host default). On a
+     * small IRAM-bounded code cache this avoids compiling the flood of
+     * run-once code an OS streams through at boot (which would otherwise
+     * thrash compile+evict at ~100% miss). `hotness` is a per-guest-
+     * instruction counter array indexed by (pc>>1) & hotness_mask; it must
+     * be large enough to avoid aliasing across the guest address space, or
+     * it saturates and the gate disables itself. NULL when the gate is off.
+     * A collision only ever causes an early compile, never miscompilation. */
+    u32  compile_threshold;
+    u8  *hotness;
+    u32  hotness_mask;
 } m68k_dispatcher;
+
+/* Enable the hotspot gate with compile threshold `n` (0 = compile
+ * immediately, the default). Lazily allocates the `hotness` counter map
+ * (~2 MB; from PSRAM on the ESP32-S3). If the allocation fails the gate
+ * stays off. Call after m68k_dispatcher_init*. */
+void m68k_dispatcher_set_compile_threshold(m68k_dispatcher *d, u32 n);
 
 bool m68k_dispatcher_init(m68k_dispatcher *d, m68k_cpu *cpu);
 /* Extended init: pick an arena size (KB) and an eviction policy

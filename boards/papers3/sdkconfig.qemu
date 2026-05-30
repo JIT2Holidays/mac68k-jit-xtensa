@@ -1,0 +1,12 @@
+# QEMU overlay — layer ON TOP of sdkconfig.defaults for the JIT self-test:
+#   idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.qemu" \
+#          -DBOARD_QEMU_SELFTEST=1 build
+#
+# qemu-system-xtensa's esp32s3 machine has no octal PSRAM and no SD card, so
+# the stock PSRAM init aborts cpu_start before app_main runs. The self-test
+# uses only internal RAM (128 KB guest + a 96 KB IRAM JIT arena), so disable
+# external RAM here. Real-hardware builds keep PSRAM on (sdkconfig.defaults).
+CONFIG_SPIRAM=n
+
+# qemu wires the console to UART0 via -serial, not USB-Serial-JTAG.
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y

@@ -174,6 +174,7 @@ static struct {
     bool inserted[NUM_DRIVES];
     bool mounted[NUM_DRIVES];
     bool wprot[NUM_DRIVES];
+    sony_disk_backend backend[NUM_DRIVES];  /* streaming source; .read NULL = in-RAM */
 
     u32  mount_callback;     /* 68k routine, set by Sony OpenC */
     u32  param_addr_hi;      /* extension-trap hi-word latch   */
@@ -229,6 +230,19 @@ bool sony_insert_disk(mac_mem *m, const u8 *img, u32 len, bool wprot) {
     return sony_insert_disk_drive(m, 0, img, len, wprot);
 }
 
+bool sony_attach_backend(mac_mem *m, int d, const sony_disk_backend *be) {
+    (void)m;
+    if (d < 0 || d >= NUM_DRIVES || !be || !be->read) return false;
+    free(S.image[d]);
+    S.image[d] = NULL;            /* served on-demand; no in-RAM copy */
+    S.backend[d] = *be;
+    S.size[d] = be->size;
+    S.inserted[d] = true;
+    S.mounted[d] = false;
+    S.wprot[d] = be->wprot;
+    return true;
+}
+
 bool sony_patch_rom(mac_mem *m) {
     if (!m->rom || m->rom_size < SONY_DRIVER_BASE + sizeof(sony_driver) + 300)
         return false;
@@ -276,9 +290,31 @@ static u16 drive_transfer(bool is_write, u32 buffer, int d,
     bool eof = false;
     u32 L = S.size[d] - start;
     if (L >= count) L = count; else eof = true;
-    for (u32 i = 0; i < L; i++) {
-        if (is_write) S.image[d][start + i] = vget8(buffer + i);
-        else          vput8(buffer + i, S.image[d][start + i]);
+    if (S.backend[d].read) {
+        /* Streaming backend (e.g. SD card): copy through a small staging
+         * buffer in block-sized chunks rather than indexing an in-RAM
+         * image. start/L are 512-aligned (Sony I/O is block-granular). */
+        u8 tmp[1024];
+        for (u32 off = 0; off < L; ) {
+            u32 chunk = L - off;
+            if (chunk > sizeof tmp) chunk = sizeof tmp;
+            if (is_write) {
+                if (!S.backend[d].write) return mnvm_wPrErr;
+                for (u32 i = 0; i < chunk; i++) tmp[i] = vget8(buffer + off + i);
+                if (!S.backend[d].write(S.backend[d].ctx, start + off, tmp, chunk))
+                    return mnvm_miscErr;
+            } else {
+                if (!S.backend[d].read(S.backend[d].ctx, start + off, tmp, chunk))
+                    return mnvm_miscErr;
+                for (u32 i = 0; i < chunk; i++) vput8(buffer + off + i, tmp[i]);
+            }
+            off += chunk;
+        }
+    } else {
+        for (u32 i = 0; i < L; i++) {
+            if (is_write) S.image[d][start + i] = vget8(buffer + i);
+            else          vput8(buffer + i, S.image[d][start + i]);
+        }
     }
     if (act) *act = L;
     return eof ? mnvm_eofErr : mnvm_noErr;

@@ -1,0 +1,46 @@
+# mac68k-jit-xtensa — M5Stack PaperS3 target defaults.
+CONFIG_IDF_TARGET="esp32s3"
+
+# 16 MB flash, custom partition table (4 MB factory app).
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# 8 MB octal PSRAM. Route large heap allocations (the 4 MB guest RAM) to
+# PSRAM by keeping the "always internal" threshold tiny, while reserving a
+# little internal RAM for DMA-only allocations.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+
+# Run at the rated 240 MHz.
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# -O2 for the interpreter + JIT hot paths.
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# The JIT codecache lives in IRAM and is allocated MALLOC_CAP_EXEC; keep the
+# memory-protection feature off so executing from that heap is allowed.
+CONFIG_ESP_SYSTEM_MEMPROT_FEATURE=n
+
+# The dispatcher's run loop has no yield points — disable both watchdogs.
+CONFIG_ESP_INT_WDT=n
+CONFIG_ESP_TASK_WDT_EN=n
+
+# The whole emulator runs on the main task; give it a deep stack (guest
+# writes can recurse into the .Sony streaming backend's staging buffer).
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=32768
+
+# Console on the ESP32-S3 native USB-Serial-JTAG — the PaperS3 dev kit's
+# USB port (VID 303a:1001). UART0 logs would never reach the host over it.
+# (The qemu overlay flips this back to UART, which is what -serial wires up.)
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# FAT long filenames — the blobs use names like "System6.0.5.dsk" and
+# "InfiniteHD6.dsk" that are not 8.3-compliant.
+CONFIG_FATFS_LFN_HEAP=y
+CONFIG_FATFS_MAX_LFN=255

@@ -1,0 +1,6 @@
+# Partition table for the PaperS3 (16 MB flash). A 4 MB factory app leaves
+# plenty of headroom; the disk images live on the SD card, not in flash.
+# Name,   Type, SubType, Offset,   Size
+nvs,      data, nvs,     0x9000,   0x6000
+phy_init, data, phy,     0xf000,   0x1000
+factory,  app,  factory, 0x10000,  0x400000

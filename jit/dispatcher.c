@@ -29,6 +29,36 @@
 #if defined(ESP_PLATFORM)
 /* CALL0 trampoline into the windowed reference interpreter. */
 extern void m68k_step_call0(m68k_cpu *cpu);
+
+/* CALL0 -> windowed bridge for the HELPER_JIT_* fast helpers.
+ *
+ * Those helpers are ordinary windowed C functions (entry/retw). A JIT
+ * block runs under CALL0, so invoking them with a bare CALLX0 leaves the
+ * window un-rotated; the helper's RETW then mis-rotates on the way out and
+ * corrupts the block's live registers (notably R_CPU=a3), crashing a few
+ * calls later. This bridge performs a proper CALL8 instead — exactly like
+ * m68k_step_call0, but with the target taken from a8 so one bridge serves
+ * every fast helper. Convention set up by emit_jit_fast_helper:
+ *   a2 = cpu (the helper's sole argument)   a8 = helper function pointer
+ *   a0 = return address back into the JIT block
+ * CALL8 preserves the caller's a0..a7, so R_CPU(a3) and the register cache
+ * (a4..a7) survive; a8..a15 are reloaded by the post-call sequence.
+ *
+ * Emitted as raw file-scope assembly, NOT a `naked` C function: GCC's
+ * Xtensa backend still prepends `entry` to a naked function (the window
+ * ABI is not per-function), which would defeat the whole point. */
+__asm__(
+    ".text\n"
+    ".align 4\n"
+    ".global m68k_jit_helper_bridge\n"
+    ".type   m68k_jit_helper_bridge, @function\n"
+"m68k_jit_helper_bridge:\n"
+    "mov    a10, a2\n"   /* cpu -> windowed callee's a2 after CALL8 */
+    "callx8 a8\n"        /* helper(cpu) */
+    "jx     a0\n"        /* back into the JIT block */
+    ".size  m68k_jit_helper_bridge, .-m68k_jit_helper_bridge\n"
+);
+extern void m68k_jit_helper_bridge(void);
 #endif
 
 /* RAM bounds mask: bit-AND a guest address against this; result is zero
@@ -124,6 +154,7 @@ static u32 helper_addr(literal_id id, void *user) {
                 : 0u;
         case LITERAL_RAM_BOUNDS_BYTE: return ram_bounds_mask_byte(cpu);
         case LITERAL_ROM_BOUNDS_BYTE: return rom_bounds_mask_byte(cpu);
+        case ADDR_HELPER_BRIDGE: return (u32)(uintptr_t)&m68k_jit_helper_bridge;
         default:                return 0;
     }
 #else
@@ -228,10 +259,12 @@ static void smc_watch(void *ctx, u32 addr) {
      * to the dispatcher where smc_flush will drop the affected blocks.
      * No-op on host (chain epilogue not emitted there). */
     d->cpu->chain_budget = 0;
+    /* Record the EXACT written address (dedup), not just the page, so the
+     * flush can invalidate only blocks whose code actually covers it. */
     for (int i = 0; i < d->n_dirty; i++)
-        if (d->dirty_pages[i] == page) return;
-    if (d->n_dirty < (int)(sizeof(d->dirty_pages) / sizeof(d->dirty_pages[0])))
-        d->dirty_pages[d->n_dirty++] = (u16)page;
+        if (d->dirty_addrs[i] == addr) return;
+    if (d->n_dirty < (int)(sizeof(d->dirty_addrs) / sizeof(d->dirty_addrs[0])))
+        d->dirty_addrs[d->n_dirty++] = addr;
     else
         d->smc_overflow = true;
 }
@@ -254,6 +287,8 @@ static void smc_drop_range(m68k_dispatcher *d, u32 lo, u32 hi) {
             m68k_block *b = *pp;
             if (b->pc_start < hi && b->pc_end > lo) {
                 *pp = b->hash_next;
+                d->dbg_smc_w = lo; d->dbg_smc_pcs = b->pc_start;
+                d->dbg_smc_pce = b->pc_end;
                 m68k_block_free(b);
                 d->smc_invalidations++;
             } else {
@@ -274,10 +309,11 @@ static bool smc_flush(m68k_dispatcher *d) {
         memset(d->code_pages, 0, sizeof(d->code_pages));
         d->arena_resets++;
     } else {
-        for (int i = 0; i < d->n_dirty; i++) {
-            u32 base = (u32)d->dirty_pages[i] << 8;
-            smc_drop_range(d, base, base + 256u);
-        }
+        /* Drop only blocks whose [pc_start,pc_end) actually contains a
+         * written byte — adjacent data writes in a shared code page leave
+         * the loop's blocks cached (the whole point: no recompile thrash). */
+        for (int i = 0; i < d->n_dirty; i++)
+            smc_drop_range(d, d->dirty_addrs[i], d->dirty_addrs[i] + 1u);
     }
     d->n_dirty = 0;
     d->smc_overflow = false;
@@ -443,6 +479,8 @@ void m68k_dispatcher_shutdown(m68k_dispatcher *d) {
     free(d->arena);
 #endif
     d->arena = NULL;
+    free(d->hotness);
+    d->hotness = NULL;
 }
 
 /* --- block execution -------------------------------------------------- */
@@ -457,13 +495,18 @@ extern void m68k_enter_block(u8 *entry, m68k_cpu *cpu);
  * ~1 ms even on busy code paths. */
 #define M68K_JIT_CHAIN_BUDGET  16u
 
-static void enter_block(m68k_dispatcher *d, m68k_block *b) {
+static void enter_block(m68k_dispatcher *d, m68k_block *b, u32 start_off) {
     /* The block's epilogue may JX to predicted_next->entry directly
      * (chain) instead of returning here. Hand it the current block and
-     * a chain budget so the chain knows when to break out for housekeeping. */
+     * a chain budget so the chain knows when to break out for housekeeping.
+     *
+     * start_off is the entry offset the shared run loop picked: entry_off
+     * for a cold dispatch (full prologue), or the predecessor's
+     * predicted_next_entry (body_addr / chain_entry_addr) on a chain hit,
+     * to skip the redundant prologue ops — mirroring the host sim path. */
     d->cpu->current_block = b;
     d->cpu->chain_budget = M68K_JIT_CHAIN_BUDGET;
-    m68k_enter_block(b->code + b->entry_off, d->cpu);
+    m68k_enter_block(b->code + start_off, d->cpu);
 }
 #else
 typedef struct {
@@ -695,6 +738,21 @@ void m68k_dispatcher_set_prefetch(m68k_dispatcher *d, u8 mode, u8 depth) {
     d->prefetch_depth = depth ? depth : 2;
 }
 
+void m68k_dispatcher_set_compile_threshold(m68k_dispatcher *d, u32 n) {
+    /* One byte per guest instruction slot. 2 M slots (2 MB) covers the full
+     * 4 MB RAM pc-space (pc>>1 < 0x200000) with no aliasing — that's where
+     * the OS streams code; ROM pcs alias low but ROM code is hot and cache-
+     * resident anyway. Sized to stay within PSRAM alongside the 4 MB guest
+     * RAM. The gate disables itself if the allocation fails. */
+    if (n && !d->hotness) {
+        u32 slots = 0x200000u;             /* 2 M instruction addresses (2 MB) */
+        d->hotness = (u8 *)calloc(1, slots);
+        if (!d->hotness) { d->compile_threshold = 0; return; }
+        d->hotness_mask = slots - 1u;
+    }
+    d->compile_threshold = n;
+}
+
 void m68k_dispatcher_run_until(m68k_dispatcher *d, u64 until) {
     m68k_cpu *cpu = d->cpu;
     m68k_block *prev = NULL;
@@ -722,6 +780,21 @@ void m68k_dispatcher_run_until(m68k_dispatcher *d, u64 until) {
              * snapshot both counters and null `prev` if either moved. */
             u64 resets_before = d->arena_resets;
             u64 inv_before    = d->smc_invalidations;
+            /* Hotspot gate: interpret a not-yet-cached block until its
+             * entry pc has been seen `compile_threshold` times. Skips
+             * compiling run-once code (the bulk of an OS boot), which on a
+             * small code cache would thrash compile+evict at ~100% miss. */
+            if (d->compile_threshold && d->hotness && !d->no_cache &&
+                !find_block(d, pc)) {
+                u32 hi = (pc >> 1) & d->hotness_mask;
+                if (d->hotness[hi] < d->compile_threshold) {
+                    if (d->hotness[hi] != 0xFFu) d->hotness[hi]++;
+                    m68k_step(cpu);
+                    d->interp_fallbacks++;
+                    prev = NULL;
+                    continue;
+                }
+            }
             b = get_block(d, pc);
             d->chain_misses++;
             if (d->arena_resets != resets_before ||
@@ -752,8 +825,19 @@ void m68k_dispatcher_run_until(m68k_dispatcher *d, u64 until) {
                  *          (a14 holds the correct R_SR value). */
                 bool compat = (prev->cache_sig == b->cache_sig) &&
                               (!b->sr_loaded || prev->sr_loaded);
-                prev->predicted_next_entry = compat ? b->body_addr
-                                                    : b->chain_entry_addr;
+                (void)compat;
+                /* The native-chain JX enters the successor at its FULL
+                 * prologue, which reloads R_CPU + the guest-register cache
+                 * (a4..a7) + R_SR from the cpu state the predecessor's
+                 * epilogue just flushed. The M6.82 skip-prologue targets
+                 * (body_addr / chain_entry_addr) assumed those registers stay
+                 * live across the inter-block JX — true in the host sim (which
+                 * re-loads them in C) but NOT on real Xtensa, where the
+                 * chained block then ran on stale registers and the boot hung.
+                 * Full-prologue entry still skips the expensive dispatcher
+                 * round-trip (tick / poll / hash lookup); only a few register
+                 * reloads are re-done. */
+                prev->predicted_next_entry = b->entry_addr;
             }
         }
 
@@ -786,6 +870,20 @@ void m68k_dispatcher_run_until(m68k_dispatcher *d, u64 until) {
         } else {
             start_off = b->entry_off;
         }
+#if defined(ESP_PLATFORM)
+        /* On the ESP/Xtensa target, m68k_enter_block enters the block via a
+         * cold CALL0 and does NOT pre-load the guest-register cache (a4..a7)
+         * or R_SR (a14) — unlike the host sim's enter_block, which restores
+         * them in C for the skip-prologue case. So a *dispatcher* entry must
+         * always run the full prologue, which reloads that state from cpu.
+         * The skip-prologue targets (body_addr / chain_entry_addr held in
+         * predicted_next_entry) are valid ONLY on the native-chain JX in the
+         * block epilogue, where a4..a7/a14 are still live from the just-
+         * executed predecessor block. Entering them from here would run the
+         * body against stale registers (manifested as a guest loop counter
+         * that never converges). */
+        start_off = b->entry_off;
+#endif
         enter_block(d, b, start_off);
         d->blocks_executed++;
 

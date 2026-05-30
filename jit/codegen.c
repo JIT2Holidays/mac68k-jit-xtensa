@@ -342,6 +342,17 @@ static bool g_pc_lit_valid;
 static u32  g_pc_lit_val;
 static u32  g_pc_lit_off;
 static u32  g_pc_lit_entry_off;
+/* Literal-pool offset of the ESP call8 helper bridge address (see
+ * emit_jit_fast_helper / ADDR_HELPER_BRIDGE). Set per block. */
+static u32  g_bridge_lit_off;
+
+/* Byte-writable DRAM scratch the compiler emits into, then copies to the
+ * executable codecache slot with 32-bit stores. The codecache is IRAM on
+ * the ESP32-S3, where the post-emit branch back-patches (base[...] = byte)
+ * would fault on an 8-bit store. Grows to the largest block seen; never
+ * shrunk (single-threaded compile, so one buffer suffices). */
+static u8  *g_scratch;
+static u32  g_scratch_cap;
 static inline void sext_memo_invalidate(void) { g_sext_valid = false; }
 
 static void emit_sr_flush(xt_emit *e) {
@@ -350,6 +361,32 @@ static void emit_sr_flush(xt_emit *e) {
 static void emit_sr_reload(xt_emit *e) {
     xt_l16ui(e, R_SR, R_CPU, OFF_SR);
     g_sr_dirty = false;
+}
+
+/* Emit the call into a windowed HELPER_JIT_* fast helper. The caller has
+ * already set a2 = cpu (R_ARG) and any jit_arg1/2. On ESP/Xtensa these
+ * helpers are windowed C functions, so a bare CALLX0 would corrupt the
+ * register window on the helper's RETW; route through m68k_jit_helper_bridge
+ * (a CALL0->CALL8 shim) with the helper pointer in a8. On the host the sim
+ * intercepts the CALLX0 by token, so call the helper literal directly.
+ *
+ * IMPORTANT: this emits HELPER_CALLX_BYTES bytes — callers that pre-compute
+ * a beqz skip-distance over their bridge must size the call as
+ * HELPER_CALLX_BYTES (not a bare l32r+callx0). */
+#if defined(ESP_PLATFORM)
+#define HELPER_CALLX_BYTES 9u   /* l32r a8 + l32r R_HELP + callx0 */
+#else
+#define HELPER_CALLX_BYTES 6u   /* l32r R_HELP + callx0 */
+#endif
+static void emit_helper_callx(xt_emit *e, u32 helper_lit_off, u32 entry_off) {
+#if defined(ESP_PLATFORM)
+    emit_l32r_at(e, 8, helper_lit_off, entry_off + e->len);      /* a8 = helper */
+    emit_l32r_at(e, R_HELP, g_bridge_lit_off, entry_off + e->len);
+    xt_callx0(e, R_HELP);
+#else
+    emit_l32r_at(e, R_HELP, helper_lit_off, entry_off + e->len);
+    xt_callx0(e, R_HELP);
+#endif
 }
 
 /* The default helper-step bridge. When `is_last_op` is true (caller has
@@ -494,8 +531,7 @@ static void emit_jit_fast_helper(xt_emit *e, u8 a8_arg1_reg, i32 imm2,
         xt_s32i(e, 9, R_CPU, OFF_JIT_ARG2);
     }
     xt_mov (e, R_ARG, R_CPU);
-    emit_l32r_at(e, R_HELP, helper_lit_off, entry_off + e->len);
-    xt_callx0(e, R_HELP);
+    emit_helper_callx(e, helper_lit_off, entry_off);   /* windowed-safe call */
     /* M6.167 — terminal-no-fastpath arms (fline trap) skip both reloads. */
     if (!g_helper_terminal_no_fastpath) {
         if (g_helper_sr_mask & 2) emit_sr_reload(e);
@@ -521,7 +557,7 @@ static u32 emit_movem_fast_bridge_size(u32 list, const regcache *rc);
  * M6.158: tracks g_helper_sr_mask so callers that have set it to 0u
  * (skip flush AND reload) get the smaller bridge size. */
 static u32 emit_jit_fast_helper_size(const regcache *rc) {
-    u32 sz = 3u /*mov R_ARG*/ + 3u /*l32r*/ + 3u /*callx0*/;
+    u32 sz = 3u /*mov R_ARG*/ + HELPER_CALLX_BYTES;
     if (g_helper_arg_mask & 1) sz += 3u;            /* s32i arg1 */
     if (g_helper_arg_mask & 2) sz += 3u + 3u;       /* movi + s32i arg2 */
     if ((g_helper_sr_mask & 1) && g_sr_dirty) sz += 3u;  /* emit_sr_flush */
@@ -1805,11 +1841,23 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
     u32 lit_bytes = align_up_4((u32)LITERAL_COUNT * 4u);
     u32 total = lit_bytes + PROLOGUE_EPILOGUE + n_ops * BYTES_PER_OP;
     total = align_up_4(total);
-    u8 *base = codecache_alloc(cc, total);
-    if (!base) return NULL;
-    /* Word-wise clear — never a byte store: this buffer is IRAM-resident
-     * executable memory on the ESP32-S3, where 8-bit accesses fault with
-     * LoadStoreError. `total` is 4-aligned and so is `base`. */
+    u8 *iram = codecache_alloc(cc, total);
+    if (!iram) return NULL;
+    /* Emit into a byte-writable DRAM scratch, then copy the finished block
+     * into the executable slot `iram` with 32-bit stores at the end. The
+     * codecache is IRAM on the ESP32-S3, where the 64 post-emit branch
+     * back-patches (base[...] = (u8)..) would fault on an 8-bit store. This
+     * is safe to relocate: the emitted code is PC-relative and the literal
+     * pool holds only external (base-independent) addresses. */
+    if (total > g_scratch_cap) {
+        u8 *ns = (u8 *)realloc(g_scratch, total);
+        if (!ns) { codecache_free(cc, (u32)(iram - cc->base), total); return NULL; }
+        g_scratch = ns;
+        g_scratch_cap = total;
+    }
+    u8 *base = g_scratch;
+    /* Word-wise clear (matches the codecache's post-alloc memset; keeps the
+     * tail padding deterministic for the word-copy below). */
     for (u32 i = 0; i < total; i += 4) *(u32 *)(base + i) = 0;
 
     /* 3. Literal pool. */
@@ -1827,6 +1875,7 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
     g_pc_lit_valid = false;
     g_pc_lit_val = 0;
     g_pc_lit_off = lit_off[LITERAL_BCC_PC];
+    g_bridge_lit_off = lit_off[ADDR_HELPER_BRIDGE];
     g_pc_lit_entry_off = lit_bytes;
     {
         u16 last_op = op_word[n_ops - 1];
@@ -5147,7 +5196,7 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             emit_cache_flush(&e, &rc);
 
             /* --- Manual helper bridge (mirror M6.135 + 2-reg args) --- */
-            u32 mb228_bridge_size = 3u*5u;  /* s32i, s32i, mov, l32r, callx0 */
+            u32 mb228_bridge_size = 3u*3u + HELPER_CALLX_BYTES; /* s32i,s32i,mov + call */
             mb228_bridge_size += 3u;        /* emit_sr_reload */
             if (g_sr_dirty) mb228_bridge_size += 3u;  /* emit_sr_flush */
             xt_beqz (&e, 12, (i32)(6u + mb228_bridge_size));
@@ -5156,10 +5205,8 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             xt_s32i(&e, 8,  R_CPU, OFF_JIT_ARG1);   /* src addr */
             xt_s32i(&e, 15, R_CPU, OFF_JIT_ARG2);   /* dst addr */
             xt_mov (&e, R_ARG, R_CPU);
-            emit_l32r_at(&e, R_HELP,
-                         lit_off[HELPER_JIT_MOVE_B_ADDR_TO_ADDR_MMIO],
-                         entry_off + e.len);
-            xt_callx0(&e, R_HELP);
+            emit_helper_callx(&e, lit_off[HELPER_JIT_MOVE_B_ADDR_TO_ADDR_MMIO],
+                              entry_off);
             g_block_emitted_callx0 = true;
             emit_sr_reload(&e);
             /* No cache_reload — helper doesn't touch D/A. */
@@ -5705,7 +5752,7 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             emit_cache_flush(&e, &rc);
 
             /* --- Manual 2-reg helper bridge (M6.228 pattern). --- */
-            u32 m229_bridge_size = 3u*5u;           /* s32i, s32i, mov, l32r, callx0 */
+            u32 m229_bridge_size = 3u*3u + HELPER_CALLX_BYTES; /* s32i,s32i,mov + call */
             m229_bridge_size += 3u;                  /* emit_sr_reload */
             if (g_sr_dirty) m229_bridge_size += 3u;  /* emit_sr_flush */
             xt_beqz (&e, 12, (i32)(6u + m229_bridge_size));
@@ -5714,10 +5761,8 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             xt_s32i(&e, 8,  R_CPU, OFF_JIT_ARG1);
             xt_s32i(&e, 15, R_CPU, OFF_JIT_ARG2);
             xt_mov (&e, R_ARG, R_CPU);
-            emit_l32r_at(&e, R_HELP,
-                         lit_off[HELPER_JIT_MOVE_L_ADDR_TO_ADDR_MMIO],
-                         entry_off + e.len);
-            xt_callx0(&e, R_HELP);
+            emit_helper_callx(&e, lit_off[HELPER_JIT_MOVE_L_ADDR_TO_ADDR_MMIO],
+                              entry_off);
             g_block_emitted_callx0 = true;
             emit_sr_reload(&e);
             /* No cache_reload — helper doesn't touch D/A. */
@@ -5813,7 +5858,7 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             emit_cache_flush(&e, &rc);
 
             /* Manual 2-reg helper bridge (M6.228/M6.229 pattern). */
-            u32 m236_bridge_size = 3u*5u;
+            u32 m236_bridge_size = 3u*3u + HELPER_CALLX_BYTES;
             m236_bridge_size += 3u;
             if (g_sr_dirty) m236_bridge_size += 3u;
             xt_beqz (&e, 12, (i32)(6u + m236_bridge_size));
@@ -5822,10 +5867,8 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             xt_s32i(&e, 8,  R_CPU, OFF_JIT_ARG1);
             xt_s32i(&e, 15, R_CPU, OFF_JIT_ARG2);
             xt_mov (&e, R_ARG, R_CPU);
-            emit_l32r_at(&e, R_HELP,
-                         lit_off[HELPER_JIT_MOVE_L_ADDR_TO_ADDR_MMIO],
-                         entry_off + e.len);
-            xt_callx0(&e, R_HELP);
+            emit_helper_callx(&e, lit_off[HELPER_JIT_MOVE_L_ADDR_TO_ADDR_MMIO],
+                              entry_off);
             g_block_emitted_callx0 = true;
             emit_sr_reload(&e);
             u32 jm236_pos = e.len;
@@ -10213,7 +10256,7 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
              * Plus 3 each for sr_flush (if g_sr_dirty) and sr_reload.
              * No emit_cache_reload — tst_b_mmio preserves D/A regs.
              * M6.194 — add fused helper-Bcc tail size when fusing. */
-            u32 tst_bridge_size = 4u * 3u;  /* s32i, mov, l32r, callx0 */
+            u32 tst_bridge_size = 2u * 3u + HELPER_CALLX_BYTES;  /* s32i,mov + call */
             if (g_sr_dirty) tst_bridge_size += 3u;
             tst_bridge_size += 3u;          /* emit_sr_reload */
             u32 fuse_tail_sz = fuse ? fused_helper_bcc_tail_size(fuse_cc) : 0u;
@@ -10223,9 +10266,7 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             emit_sr_flush(&e);
             xt_s32i(&e, 8, R_CPU, OFF_JIT_ARG1);   /* arg1 = addr */
             xt_mov (&e, R_ARG, R_CPU);
-            emit_l32r_at(&e, R_HELP, lit_off[HELPER_JIT_TST_B_MMIO],
-                         entry_off + e.len);
-            xt_callx0(&e, R_HELP);
+            emit_helper_callx(&e, lit_off[HELPER_JIT_TST_B_MMIO], entry_off);
             g_block_emitted_callx0 = true;
             emit_sr_reload(&e);
             /* Note: NO emit_cache_reload — tst_b_mmio preserves D/A. */
@@ -11236,7 +11277,7 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
              * M6.119 — btst_b_mmio doesn't touch guest D/A regs (only
              * reads byte, sets Z); SKIP emit_cache_reload (saves 3 LX7
              * × active slots per fire). */
-            u32 btst_bridge_size = 3*7;  /* mov, l32r, callx0, sr_reload, 3 setup */
+            u32 btst_bridge_size = 3*5 + HELPER_CALLX_BYTES;  /* 5 ops + call */
             if (g_sr_dirty) btst_bridge_size += 3;
             xt_beqz(&e, 10, (i32)(6u + btst_bridge_size));
             /* --- Custom MMIO BTST helper bridge. --- */
@@ -11246,9 +11287,7 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             xt_movi(&e, 9, bit);
             xt_s32i(&e, 9, R_CPU, OFF_JIT_ARG2);   /* arg2 = bit position */
             xt_mov (&e, R_ARG, R_CPU);
-            emit_l32r_at(&e, R_HELP, lit_off[HELPER_JIT_BTST_B_MMIO],
-                         entry_off + e.len);
-            xt_callx0(&e, R_HELP);
+            emit_helper_callx(&e, lit_off[HELPER_JIT_BTST_B_MMIO], entry_off);
             g_block_emitted_callx0 = true;  /* M6.84 */
             emit_sr_reload(&e);
             /* Note: NO emit_cache_reload — btst_b_mmio preserves D/A. */
@@ -11393,7 +11432,7 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
              * M6.119 — ori_b_mmio doesn't touch guest D/A registers, so
              * SKIP emit_cache_reload (saves 3 LX7 × active slots per MMIO
              * fire). Only emit_sr_reload is needed (helper updates CCR). */
-            u32 mmio_bridge_size = 3*7;  /* mov, l32r, callx0, sr_reload, 3 setup */
+            u32 mmio_bridge_size = 3*5 + HELPER_CALLX_BYTES;  /* 5 ops + call */
             if (g_sr_dirty) mmio_bridge_size += 3;
             xt_beqz(&e, 10, (i32)(6u + mmio_bridge_size));
             /* --- Custom MMIO ORI.B helper bridge (replaces emit_helper_step). --- */
@@ -11403,9 +11442,7 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
             xt_movi(&e, 9, imm8);
             xt_s32i(&e, 9, R_CPU, OFF_JIT_ARG2);   /* arg2 = imm */
             xt_mov (&e, R_ARG, R_CPU);             /* a2 = cpu */
-            emit_l32r_at(&e, R_HELP, lit_off[HELPER_JIT_ORI_B_MMIO],
-                         entry_off + e.len);
-            xt_callx0(&e, R_HELP);
+            emit_helper_callx(&e, lit_off[HELPER_JIT_ORI_B_MMIO], entry_off);
             g_block_emitted_callx0 = true;  /* M6.84 */
             emit_sr_reload(&e);
             /* Note: NO emit_cache_reload — ori_b_mmio preserves D/A. */
@@ -12358,29 +12395,33 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
     xt_jx(&e, 0);
 
     if (e.overflow) {
-        codecache_free(cc, (u32)(base - cc->base), total);
+        codecache_free(cc, (u32)(iram - cc->base), total);
         return NULL;
     }
     xt_flush_pending(&e);
-    codecache_finalize(cc, base + entry_off, e.len);
 
     u32 actual = align_up_4(entry_off + e.len);
-    codecache_trim(cc, base, actual, total);
+    /* Relocate the finished block scratch -> executable slot, 32-bit stores
+     * only (IRAM is 32-bit-access-only on the ESP32-S3). `actual` and the
+     * scratch tail are 4-aligned/zero-padded by the clear above. */
+    for (u32 i = 0; i < actual; i += 4) *(u32 *)(iram + i) = *(u32 *)(base + i);
+    codecache_finalize(cc, iram + entry_off, e.len);
+    codecache_trim(cc, iram, actual, total);
 
     m68k_block *b = (m68k_block *)calloc(1, sizeof(*b));
     if (!b) {
-        codecache_free(cc, (u32)(base - cc->base), actual);
+        codecache_free(cc, (u32)(iram - cc->base), actual);
         return NULL;
     }
     b->pc_start = pc;
     b->pc_end = cur;
     b->n_ops = n_ops;
-    b->code = base;
+    b->code = iram;
     b->code_size = actual;
     b->entry_off = entry_off;
-    b->entry_addr = (void *)(base + entry_off);
-    b->body_addr = (void *)(base + body_off);
-    b->chain_entry_addr = (void *)(base + chain_entry_off);
+    b->entry_addr = (void *)(iram + entry_off);
+    b->body_addr = (void *)(iram + body_off);
+    b->chain_entry_addr = (void *)(iram + chain_entry_off);
     b->sr_loaded = (u8)(block_needs_sr_load ? 1 : 0);
     b->inline_ops = inline_ops;
     b->helper_ops = helper_ops;

@@ -92,6 +92,11 @@ typedef enum {
      * the MOVE.B inline arms that need RAM-only fast paths. */
     LITERAL_RAM_BOUNDS_BYTE,  /* ~(ram_size-1) — admits any byte addr in RAM */
     LITERAL_ROM_BOUNDS_BYTE,  /* ~(rom_size-1) — admits any byte addr in ROM */
+    /* ESP/Xtensa only: address of the call8 bridge (m68k_jit_helper_bridge)
+     * used to invoke the windowed HELPER_JIT_* fast helpers without
+     * corrupting the register window. Unused (0) on the host sim, which
+     * intercepts the CALLX0 by token and never executes a real call. */
+    ADDR_HELPER_BRIDGE,
     LITERAL_COUNT
 } literal_id;
 
