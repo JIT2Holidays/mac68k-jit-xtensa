@@ -3,13 +3,13 @@
  * Boots a Macintosh Plus on the ESP32-S3: the 68000 guest runs under the
  * Xtensa JIT, the ROM is loaded from the SD card, and the hard disks are
  * served on-demand straight off the FAT32 card (no in-RAM image copy) via
- * the .Sony streaming backend. The display is intentionally NOT driven
- * here — this is the CPU-core + HDD-simulation bring-up; the e-ink panel
- * code lands later. The framebuffer still lives in guest RAM, so a display
- * driver added later only has to scan it out.
+ * the .Sony streaming backend. A second core (see eink.c) drives the e-ink
+ * panel: a gray-scale boot splash, then a fast local refresh that scans out
+ * the guest framebuffer with the frame rate and effective 68k clock on top.
  *
  * SD card layout (FAT32):
  *   /MacPlus.ROM
+ *   /msnap.jpg               -> gray-scale boot splash
  *   /disks/System6.0.5.dsk   -> drive 1 (boot volume)
  *   /disks/InfiniteHD6.dsk   -> drive 2 (inserted after boot)
  */
@@ -25,6 +25,8 @@
 #include "board_papers3.h"
 #include "sd_disk.h"
 #include "uart_ctl.h"
+#include "eink.h"
+#include "touch.h"
 
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -45,11 +47,16 @@ extern const u8 macplus_rom_end[]   asm("_binary_MacPlus_ROM_end");
 
 /* --- tunables ---------------------------------------------------------- */
 
-/* Run the JIT (1) or the reference interpreter (0). The JIT is the point
- * of this project; the interpreter is the slower, always-correct fallback
- * for first bring-up on new silicon. */
+/* Run the JIT (1) or the reference interpreter (0). Currently defaulting to
+ * the interpreter; flip to 1 (or build -DBOARD_USE_JIT=1) for the JIT. */
 #ifndef BOARD_USE_JIT
-#define BOARD_USE_JIT 1
+#define BOARD_USE_JIT 0
+#endif
+
+/* Debug features (verbose heartbeat logging, etc.). Set 0 (or build with
+ * -DBOARD_DEBUG=0) for a quiet release build. */
+#ifndef BOARD_DEBUG
+#define BOARD_DEBUG 1
 #endif
 
 /* Build the SD-less interp-vs-JIT parity self-test instead of the real
@@ -446,12 +453,24 @@ void app_main(void) {
              (unsigned)BOARD_JIT_HOT_THRESHOLD);
 #endif
 
+    /* Bring up the e-ink panel on core 1: it shows the gray-scale splash
+     * (reading the SD card before the guest does), then scans out the guest
+     * framebuffer with fast local refreshes. Blocks only until the splash is
+     * drawn; the framebuffer loop keeps running on the second core. */
+    eink_start(&s_mem, &s_cpu, BOARD_USE_JIT ? "JIT" : "INT");
+
+    /* Touch -> Mac mouse: a GT911 polling task on core 1 maintains the cursor;
+     * we push it into the guest from this (CPU) thread below. */
+    touch_start();
+
     /* Run loop. We advance in cycle chunks so we can (a) hot-insert drive 2
      * after boot and (b) emit a periodic heartbeat. mac_mem_tick / VBL /
      * sony_service all run inside the engine's run_until. */
+#if BOARD_DEBUG
     int64_t t0 = esp_timer_get_time();
     int64_t last_log = t0;
     u64 last_cycles = 0;
+#endif
 
     while (!s_cpu.halted) {
         /* Small chunks while a timed click/key sequence is in flight so the
@@ -464,6 +483,7 @@ void app_main(void) {
         m68k_run_until(&s_cpu, next);
 #endif
         uart_ctl_poll(&s_cpu, &s_mem);   /* host commands + due input events */
+        touch_apply_mouse(&s_mem);       /* latest touch-pad cursor + button */
         /* Hot-insert the Infinite HD into drive 2 once the desktop is up. */
         if (!s_hd_open && s_cpu.cycles >= BOARD_HD_INSERT_CYCLE) {
             s_hd_open = true;   /* attempt once, regardless of outcome */
@@ -474,6 +494,7 @@ void app_main(void) {
                          BOARD_PATH_HD);
         }
 
+#if BOARD_DEBUG
         int64_t now = esp_timer_get_time();
         if (now - last_log >= 3000000) {        /* heartbeat every 3 s */
             int64_t win = now - last_log;       /* window wall-time (us) */
@@ -528,6 +549,7 @@ void app_main(void) {
             last_log = now;
             last_cycles = s_cpu.cycles;
         }
+#endif /* BOARD_DEBUG */
     }
 
     ESP_LOGW(TAG, "CPU halted at PC=0x%06" PRIX32 " (exit=%d)",

@@ -38,6 +38,10 @@ idf_component_register(
 target_compile_options(${COMPONENT_LIB} PRIVATE
     -Wall -Wextra -Wno-unused-parameter -Wno-error)
 
+# Build the hot emulator core at -O3 (the interpreter especially benefits;
+# overrides IDF's -O2 since the last -O flag on the command line wins).
+target_compile_options(${COMPONENT_LIB} PRIVATE -O3)
+
 # Populate the dispatcher's stats counters (app_main reads arena_cap etc.).
 target_compile_definitions(${COMPONENT_LIB} PRIVATE DEBUG=1)
 

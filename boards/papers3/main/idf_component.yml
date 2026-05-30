@@ -1,0 +1,8 @@
+# Managed component dependencies fetched by the ESP-IDF component manager at
+# build/reconfigure time (needs network on first build).
+#
+# The e-ink panel is driven directly via the ESP-IDF esp_lcd i80 driver plus a
+# bit-banged gate driver (main/epd_panel.c) — no external display library.
+dependencies:
+  # JPEG decoder for the gray-scale boot splash (/msnap.jpg).
+  espressif/esp_jpeg: "*"
