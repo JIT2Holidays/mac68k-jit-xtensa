@@ -168,14 +168,27 @@ void codecache_trim(codecache *cc, u8 *block, u32 actual, u32 reserved) {
 }
 
 #if defined(ESP_PLATFORM)
-/* ESP32-S3 IRAM is internal SRAM that is NOT routed through the L1 cache
- * (cache covers flash/PSRAM only). Writes via the data path are visible to
- * the instruction fetch path immediately. We still emit a memory barrier
- * so the compiler can't reorder later instruction fetches above the code-
- * writing stores. */
+/* ESP32-S3 IRAM is internal SRAM that is NOT routed through the L1 data/
+ * instruction cache (the cache covers flash/PSRAM only), so there is no
+ * cache line to write back or invalidate. BUT the Xtensa LX7 instruction-
+ * fetch unit prefetches ahead, and the ISA *requires* an ISYNC after
+ * instruction memory is modified and before those bytes are fetched —
+ * independent of caching. Without it, when the LRU code cache evicts a
+ * block and recompiles new code into a slot whose previous occupant was
+ * recently executed, the fetch pipeline can serve STALE prefetched bytes,
+ * and the CPU runs garbage → boot hangs.
+ *
+ * This never fires when the working set fits the arena (no eviction, no
+ * slot reuse) — which is exactly why the qemu self-test and the host build
+ * pass while the real System boot (working set > 96 KB arena) hangs.
+ *
+ * Sequence: __sync_synchronize() (memw) commits the code-writing stores
+ * to SRAM, then ISYNC flushes the instruction-fetch pipeline/prefetch so
+ * the next fetch from this range sees the new code. */
 void codecache_finalize(codecache *cc, u8 *block, u32 size) {
     (void)cc; (void)block; (void)size;
     __sync_synchronize();
+    __asm__ __volatile__("isync" ::: "memory");
 }
 #else
 void codecache_finalize(codecache *cc, u8 *block, u32 size) {

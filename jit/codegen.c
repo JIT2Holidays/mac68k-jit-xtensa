@@ -523,7 +523,22 @@ static void emit_jit_fast_helper(xt_emit *e, u8 a8_arg1_reg, i32 imm2,
      * write SR skip the reload (bit 1). The was_sr_dirty restore only
      * matters when we DID flush (otherwise g_sr_dirty wasn't cleared). */
     bool was_sr_dirty = g_sr_dirty;
+#if defined(ESP_PLATFORM)
+    /* M6.253 — the CALL8 helper bridge (emit_helper_callx) rotates the
+     * register window: it clobbers the caller's a8..a15, which includes
+     * R_SR (a14) and R_HELP (a13). R_SR must therefore be preserved across
+     * the bridge REGARDLESS of whether the helper itself reads/writes
+     * cpu->sr: flush it first (so a dirty R_SR isn't lost when a14 is
+     * overwritten) and reload it after. The g_helper_sr_mask flush/reload
+     * skip (M6.158) is valid ONLY on the host, where the sim intercepts the
+     * CALLX0 by token and a14 stays live — which is exactly why this bug
+     * (corrupt SR high byte after e.g. a MOVEM helper, leading to a bogus
+     * S-bit and a stale-SSP swap in m68k_exception) reproduced on silicon
+     * but never under the host sim. */
+    emit_sr_flush(e);   /* no-op when !g_sr_dirty */
+#else
     if (g_helper_sr_mask & 1) emit_sr_flush(e);
+#endif
     /* M6.162: skip arg setups when the helper doesn't read them. */
     if (g_helper_arg_mask & 1) xt_s32i(e, a8_arg1_reg, R_CPU, OFF_JIT_ARG1);
     if (g_helper_arg_mask & 2) {
@@ -534,12 +549,18 @@ static void emit_jit_fast_helper(xt_emit *e, u8 a8_arg1_reg, i32 imm2,
     emit_helper_callx(e, helper_lit_off, entry_off);   /* windowed-safe call */
     /* M6.167 — terminal-no-fastpath arms (fline trap) skip both reloads. */
     if (!g_helper_terminal_no_fastpath) {
+#if defined(ESP_PLATFORM)
+        emit_sr_reload(e);              /* a14 was clobbered — always reload */
+        emit_cache_reload(e, rc);
+        if (was_sr_dirty) g_sr_dirty = true;   /* fast path left R_SR dirty */
+#else
         if (g_helper_sr_mask & 2) emit_sr_reload(e);
         emit_cache_reload(e, rc);
         /* Only restore was_sr_dirty if the flush or reload cleared the
          * compile-time flag. With mask=0u both branches skipped —
          * g_sr_dirty is untouched and no restore is needed. */
         if ((g_helper_sr_mask & 3u) && was_sr_dirty) g_sr_dirty = true;
+#endif
     }
     /* For terminal_no_fastpath, leave g_sr_dirty = false (set by the
      * pre-bridge emit_sr_flush). Epilogue's emit_sr_flush will be a
@@ -560,10 +581,20 @@ static u32 emit_jit_fast_helper_size(const regcache *rc) {
     u32 sz = 3u /*mov R_ARG*/ + HELPER_CALLX_BYTES;
     if (g_helper_arg_mask & 1) sz += 3u;            /* s32i arg1 */
     if (g_helper_arg_mask & 2) sz += 3u + 3u;       /* movi + s32i arg2 */
+#if defined(ESP_PLATFORM)
+    /* M6.253 — R_SR always flushed (if dirty) and reloaded across the CALL8
+     * bridge on ESP (a14 is clobbered); see emit_jit_fast_helper. */
+    if (g_sr_dirty) sz += 3u;                       /* emit_sr_flush */
+#else
     if ((g_helper_sr_mask & 1) && g_sr_dirty) sz += 3u;  /* emit_sr_flush */
+#endif
     /* M6.167: terminal_no_fastpath skips both reload paths. */
     if (!g_helper_terminal_no_fastpath) {
+#if defined(ESP_PLATFORM)
+        sz += 3u;                                   /* emit_sr_reload (always) */
+#else
         if (g_helper_sr_mask & 2) sz += 3u;             /* emit_sr_reload */
+#endif
         if (rc) {
             for (int i = 0; i < rc->active; i++) {
                 int gi = rc->guest[i];

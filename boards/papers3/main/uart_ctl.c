@@ -2,8 +2,32 @@
 
 #include "uart_ctl.h"
 #include "mac_input.h"
+#include "mac_mem.h"
 #include <string.h>
 #include <stdio.h>
+#include <inttypes.h>
+
+/* Exception trace ring (defined in core/m68k_interp.c) — both the interp and
+ * the JIT route every exception/interrupt through m68k_exception, so this is
+ * a faithful record of the last 64 exceptions either engine took. */
+extern u32 m68k_exc_log[64][3];   /* {vector, faulting pc, cycle} */
+extern u32 m68k_exc_n;
+/* One-shot snapshot taken at the first wild-address (<0x1000) fault. */
+extern u32 m68k_exc_frozen[64][3];
+extern u32 m68k_exc_frozen_n;
+extern int m68k_exc_frozen_done;
+extern u32 m68k_exc_a7_frozen[64];
+extern u32 m68k_exc_frame_pc_frozen[64];
+/* Dispatcher block-trace ring + its wild-PC freeze (jit/dispatcher.c). */
+extern u32 m68k_blk_frozen[64][3];   /* {pc, chain|(pc_end<<1), cycle} */
+extern u32 m68k_blk_frozen_n;
+extern int m68k_blk_frozen_done;
+/* A7-wild catch (the block that first corrupted guest A7). */
+extern u32 m68k_a7w_pc, m68k_a7w_prev, m68k_a7w_new, m68k_a7w_sr, m68k_a7w_end;
+extern u32 m68k_a7w_cyc;
+extern int m68k_a7w_done;
+extern u32 m68k_srw_pc, m68k_srw_prev, m68k_srw_new, m68k_srw_end, m68k_srw_cyc;
+extern int m68k_srw_done;
 
 #include "driver/usb_serial_jtag.h"
 #include "driver/usb_serial_jtag_vfs.h"
@@ -68,6 +92,86 @@ static void exec_cmd(m68k_cpu *cpu, mac_mem *m, char *line) {
     int x, y, a, b;
     if (line[0] == 'd' && line[1] == 0) {
         dump_fb(m);
+    } else if (line[0] == 'e' && line[1] == 0) {
+        /* Exception/interrupt diagnostics: current CPU + VIA state, then the
+         * last 24 exceptions (vector / faulting PC / cycle). A vector that
+         * repeats every few entries is the loop we're stuck in. */
+        printf("CPU pc=0x%06" PRIX32 " sr=0x%04X pend_irq=%u cyc=%llu\n",
+               cpu->pc, cpu->sr, (unsigned)cpu->pending_irq,
+               (unsigned long long)cpu->cycles);
+        printf("VIA ifr=0x%02X ier=0x%02X  SCC irq_on=%d\n",
+               m->via.ifr, m->via.ier, (int)m->scc.irq_on);
+        u32 n = m68k_exc_n;
+        u32 start = (n > 24) ? n - 24 : 0;
+        printf("EXC total=%u (last %u):\n", (unsigned)n, (unsigned)(n - start));
+        for (u32 i = start; i < n; i++) {
+            u32 *e = m68k_exc_log[i & 63];
+            printf("  #%u vec=%-3u pc=0x%06" PRIX32 " cyc=%" PRIu32 "\n",
+                   (unsigned)i, (unsigned)e[0], e[1], e[2]);
+        }
+        /* The frozen ring captured the run-up to the first wild-address fault
+         * (the derail) — print it chronologically. */
+        if (m68k_exc_frozen_done) {
+            u32 fn = m68k_exc_frozen_n;
+            u32 fstart = (fn > 64) ? fn - 64 : 0;
+            printf("FROZEN at derail (first <0x1000 fault), exc#%u, run-up:\n",
+                   (unsigned)fn);
+            for (u32 i = fstart; i < fn; i++) {
+                u32 *e = m68k_exc_frozen[i & 63];
+                printf("  f#%u vec=%-3u pc=0x%06" PRIX32 " a7=0x%06" PRIX32
+                       " framePC=0x%06" PRIX32 " cyc=%" PRIu32 "\n",
+                       (unsigned)i, (unsigned)e[0], e[1],
+                       m68k_exc_a7_frozen[i & 63],
+                       m68k_exc_frame_pc_frozen[i & 63], e[2]);
+            }
+        } else {
+            printf("FROZEN: (not yet — no wild fault captured)\n");
+        }
+        if (m68k_a7w_done) {
+            printf("A7WILD: block pc=0x%06" PRIX32 " end=0x%06" PRIX32
+                   " A7 0x%06" PRIX32 "->0x%08" PRIX32 " sr=0x%04X cyc=%" PRIu32 "\n",
+                   m68k_a7w_pc, m68k_a7w_end, m68k_a7w_prev, m68k_a7w_new,
+                   (unsigned)(m68k_a7w_sr & 0xFFFF), m68k_a7w_cyc);
+        } else {
+            printf("A7WILD: (not captured)\n");
+        }
+        if (m68k_srw_done) {
+            printf("SRWILD: block pc=0x%06" PRIX32 " end=0x%06" PRIX32
+                   " SR 0x%04X->0x%04X cyc=%" PRIu32 "\n",
+                   m68k_srw_pc, m68k_srw_end,
+                   (unsigned)(m68k_srw_prev & 0xFFFF),
+                   (unsigned)(m68k_srw_new & 0xFFFF), m68k_srw_cyc);
+        } else {
+            printf("SRWILD: (not captured)\n");
+        }
+        if (m68k_blk_frozen_done) {
+            u32 bn = m68k_blk_frozen_n;
+            u32 bstart = (bn > 64) ? bn - 64 : 0;
+            printf("BLKTRACE at derail, last %u dispatcher entries:\n",
+                   (unsigned)(bn - bstart));
+            for (u32 i = bstart; i < bn; i++) {
+                u32 *e = m68k_blk_frozen[i & 63];
+                printf("  b#%u pc=0x%06" PRIX32 " end=0x%06" PRIX32 " %s cyc=%" PRIu32 "\n",
+                       (unsigned)i, e[0], e[1] >> 1,
+                       (e[1] & 1) ? "CHAIN" : "disp ", e[2]);
+            }
+        }
+        printf(":EXCEND\n");
+    } else if (sscanf(line, "r %x %d", &x, &a) == 2) {
+        /* Dump `a` bytes of guest RAM from address x (hex), as hex. */
+        if (a < 0) a = 0;
+        if (a > 512) a = 512;
+        u32 ad = (u32)x, rs = m->ram_size;
+        printf("RAM 0x%06" PRIX32 " (%d bytes):\n", ad, a);
+        char hex[3 * 16 + 1];
+        for (int off = 0; off < a; off += 16) {
+            int hl = 0;
+            for (int j = 0; j < 16 && off + j < a; j++)
+                hl += snprintf(hex + hl, sizeof hex - hl, "%02X ",
+                               m->ram[(ad + off + j) % rs]);
+            printf("  %06" PRIX32 ": %s\n", ad + off, hex);
+        }
+        printf(":RAMEND\n");
     } else if (sscanf(line, "m %d %d", &x, &y) == 2) {
         mac_set_mouse(m, (i16)x, (i16)y, false);
     } else if (sscanf(line, "b %d %d %d", &x, &y, &a) == 3) {

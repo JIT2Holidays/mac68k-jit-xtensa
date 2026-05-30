@@ -51,3 +51,17 @@ if(NOT DEFINED MAC68K_JIT_ARENA_KB)
     set(MAC68K_JIT_ARENA_KB 96)
 endif()
 target_compile_definitions(${COMPONENT_LIB} PRIVATE M68K_JIT_ARENA_KB=${MAC68K_JIT_ARENA_KB}u)
+
+# Debug: -DJIT_DBG_NOCHAIN=1 disables native block chaining so every block
+# returns to the dispatcher (exact per-block A7/PC tracing during bug hunts).
+if(DEFINED JIT_DBG_NOCHAIN)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE JIT_DBG_NOCHAIN=${JIT_DBG_NOCHAIN})
+endif()
+
+# Debug: -DJIT_DBG_TRACE=1 enables the exception/block/A7/SR post-mortem trace
+# rings read by the board's 'e' command. Off by default (per-block + per-
+# exception bookkeeping has a hot-path cost); the diagnostic globals are always
+# defined so uart_ctl.c links either way.
+if(DEFINED JIT_DBG_TRACE)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE JIT_DBG_TRACE=${JIT_DBG_TRACE})
+endif()

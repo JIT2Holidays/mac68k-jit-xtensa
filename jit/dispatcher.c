@@ -24,6 +24,34 @@
 #define HOST_RAM_BASE    0x60000000u
 #endif
 
+/* --- block-execution trace ring (diagnostic) -------------------------
+ * Records the guest PC entered at each dispatcher iteration, plus whether
+ * the entry was a native chain hit and the dispatcher's predicted-next PC.
+ * Frozen the instant the guest first enters a wild low address (< 0x1000 —
+ * the page-0/vector-table region it lands in after a bad branch/return), so
+ * the post-mortem shows the exact block that jumped into the weeds. Read via
+ * the board's 'e' command (paired with the m68k_exc_frozen ring). */
+u32 m68k_blk_trace[64][3];   /* {pc, chain_hit | (pred_pc<<1), cycle} */
+u32 m68k_blk_trace_n;
+u32 m68k_blk_frozen[64][3];
+u32 m68k_blk_frozen_n;
+int m68k_blk_frozen_done;
+
+/* A7-corruption catch: the block after which guest A7 first becomes wild
+ * (outside guest RAM). With JIT_DBG_NOCHAIN this is the exact culprit block;
+ * with chaining it is the chain root. Captured once. */
+u32 m68k_a7w_pc, m68k_a7w_prev, m68k_a7w_new, m68k_a7w_sr, m68k_a7w_end;
+u32 m68k_a7w_cyc;
+int m68k_a7w_done;
+
+/* SR-corruption catch: the block after which cpu->sr first holds bits that
+ * are impossible on a 68000 (valid mask 0xA71F = T|S|IMASK|CCR). A corrupted
+ * R_SR (host a14, clobbered by the CALL8 helper bridge and not reloaded) is
+ * the prime suspect for the A7 derail. */
+#define M68K_SR_VALID_MASK 0xA71Fu
+u32 m68k_srw_pc, m68k_srw_prev, m68k_srw_new, m68k_srw_end, m68k_srw_cyc;
+int m68k_srw_done;
+
 /* --- literal-pool resolver -------------------------------------------- */
 
 #if defined(ESP_PLATFORM)
@@ -505,7 +533,14 @@ static void enter_block(m68k_dispatcher *d, m68k_block *b, u32 start_off) {
      * predicted_next_entry (body_addr / chain_entry_addr) on a chain hit,
      * to skip the redundant prologue ops — mirroring the host sim path. */
     d->cpu->current_block = b;
+#if JIT_DBG_NOCHAIN
+    /* Debug: disable native chaining so every block returns to the dispatcher
+     * (exact per-block A7/PC tracing). Native-chain epilogue's `beqz budget`
+     * falls through to FALLBACK when budget==0. */
+    d->cpu->chain_budget = 0;
+#else
     d->cpu->chain_budget = M68K_JIT_CHAIN_BUDGET;
+#endif
     m68k_enter_block(b->code + start_off, d->cpu);
 }
 #else
@@ -849,6 +884,29 @@ void m68k_dispatcher_run_until(m68k_dispatcher *d, u64 until) {
             continue;
         }
 
+#if JIT_DBG_TRACE
+        /* Block-trace ring: record this dispatcher entry. (Chained blocks
+         * that JX within an epilogue don't pass through here, but a block
+         * that computes a bad target returns to the dispatcher — its bad
+         * pc shows up as the *next* entry, with the culprit just before.) */
+        {
+            u32 ti = m68k_blk_trace_n & 63;
+            m68k_blk_trace[ti][0] = pc;
+            m68k_blk_trace[ti][1] = (u32)(chain_hit ? 1u : 0u) | (b->pc_end << 1);
+            m68k_blk_trace[ti][2] = (u32)cpu->cycles;
+            m68k_blk_trace_n++;
+            if (!m68k_blk_frozen_done && pc < 0x1000u) {
+                for (int k = 0; k < 64; k++) {
+                    m68k_blk_frozen[k][0] = m68k_blk_trace[k][0];
+                    m68k_blk_frozen[k][1] = m68k_blk_trace[k][1];
+                    m68k_blk_frozen[k][2] = m68k_blk_trace[k][2];
+                }
+                m68k_blk_frozen_n = m68k_blk_trace_n;
+                m68k_blk_frozen_done = 1;
+            }
+        }
+#endif /* JIT_DBG_TRACE */
+
         /* M6.63 LRU tag — update on every dispatch, *not* on chain hits
          * inside the block (those don't pass through here). Means the
          * LRU eviction sees recent dispatcher entries; chained blocks
@@ -884,8 +942,49 @@ void m68k_dispatcher_run_until(m68k_dispatcher *d, u64 until) {
          * that never converges). */
         start_off = b->entry_off;
 #endif
+#if JIT_DBG_TRACE
+        u32 a7_pre = cpu->a[7];
+        u32 sr_pre = cpu->sr;
+#endif
         enter_block(d, b, start_off);
         d->blocks_executed++;
+
+#if JIT_DBG_TRACE
+        /* Catch the block that first puts impossible bits into cpu->sr. */
+        if (!m68k_srw_done && (cpu->sr & ~M68K_SR_VALID_MASK) != 0 &&
+            (sr_pre & ~M68K_SR_VALID_MASK) == 0) {
+            m68k_srw_pc   = pc;
+            m68k_srw_end  = b->pc_end;
+            m68k_srw_prev = sr_pre;
+            m68k_srw_new  = cpu->sr;
+            m68k_srw_cyc  = (u32)cpu->cycles;
+            m68k_srw_done = 1;
+        }
+
+        /* Catch the moment guest A7 first goes wild (outside RAM) — the
+         * block that just ran (or the chain rooted here) corrupted it. */
+        if (!m68k_a7w_done && cpu->a[7] >= cpu->mem->ram_size &&
+            a7_pre < cpu->mem->ram_size) {
+            m68k_a7w_pc   = pc;
+            m68k_a7w_end  = b->pc_end;
+            m68k_a7w_prev = a7_pre;
+            m68k_a7w_new  = cpu->a[7];
+            m68k_a7w_sr   = cpu->sr;
+            m68k_a7w_cyc  = (u32)cpu->cycles;
+            m68k_a7w_done = 1;
+            /* Snapshot the block trace here too (A7 goes wild a block or two
+             * before pc reaches 0), so b#trace shows the run-up. */
+            if (!m68k_blk_frozen_done) {
+                for (int k = 0; k < 64; k++) {
+                    m68k_blk_frozen[k][0] = m68k_blk_trace[k][0];
+                    m68k_blk_frozen[k][1] = m68k_blk_trace[k][1];
+                    m68k_blk_frozen[k][2] = m68k_blk_trace[k][2];
+                }
+                m68k_blk_frozen_n = m68k_blk_trace_n;
+                m68k_blk_frozen_done = 1;
+            }
+        }
+#endif /* JIT_DBG_TRACE */
 
         if (d->no_cache) { m68k_block_free(b); prev = NULL; }
         else             { prev = b; }

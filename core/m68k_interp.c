@@ -342,6 +342,25 @@ static bool cond_true(m68k_cpu *cpu, int cc) {
 u32 m68k_exc_log[64][3];   /* {vector, faulting pc, count-at} */
 u32 m68k_exc_n;
 
+/* One-shot post-mortem freeze: the instant the guest first takes an exception
+ * from a wild low address (< 0x1000 — i.e. it has jumped into the vector table
+ * / page 0 and is executing data as code, the signature of a runaway after a
+ * bad branch/return), snapshot the whole ring so the run-up to the derail is
+ * preserved even as the live ring wraps thousands of times in the resulting
+ * exception storm. Read via the board's 'e' command. */
+u32 m68k_exc_frozen[64][3];
+u32 m68k_exc_frozen_n;
+int m68k_exc_frozen_done;
+
+/* Companion ring: guest A7 (supervisor SP after the frame push) and the PC
+ * value actually written into the exception frame, so a derail caused by a
+ * corrupted/mis-flushed A7 (frame mislocated, or stacked PC != logged pc)
+ * is visible post-mortem. Indexed in lock-step with m68k_exc_log. */
+u32 m68k_exc_a7[64];        /* cpu->a[7] right after the frame push */
+u32 m68k_exc_frame_pc[64];  /* mac_read32(a7+2) — the stacked return PC */
+u32 m68k_exc_a7_frozen[64];
+u32 m68k_exc_frame_pc_frozen[64];
+
 /* Optional debug hook, called for every line-A (Toolbox trap). */
 void (*m68k_trap_hook)(m68k_cpu *cpu, u16 trap);
 
@@ -350,6 +369,19 @@ void m68k_exception(m68k_cpu *cpu, u32 vector) {
     m68k_exc_log[m68k_exc_n & 63][1] = cpu->pc;
     m68k_exc_log[m68k_exc_n & 63][2] = (u32)cpu->cycles;
     m68k_exc_n++;
+#if JIT_DBG_TRACE
+    if (!m68k_exc_frozen_done && cpu->pc < 0x1000u) {
+        for (int i = 0; i < 64; i++) {
+            m68k_exc_frozen[i][0] = m68k_exc_log[i][0];
+            m68k_exc_frozen[i][1] = m68k_exc_log[i][1];
+            m68k_exc_frozen[i][2] = m68k_exc_log[i][2];
+            m68k_exc_a7_frozen[i] = m68k_exc_a7[i];
+            m68k_exc_frame_pc_frozen[i] = m68k_exc_frame_pc[i];
+        }
+        m68k_exc_frozen_n = m68k_exc_n;
+        m68k_exc_frozen_done = 1;
+    }
+#endif
     bool was_super = m68k_is_super(cpu);
     u16 saved_sr = cpu->sr;
     cpu->sr |= SR_S;            /* enter supervisor */
@@ -360,6 +392,15 @@ void m68k_exception(m68k_cpu *cpu, u32 vector) {
     mac_write32(cpu->mem, cpu->a[7], cpu->pc);
     cpu->a[7] -= 2;
     mac_write16(cpu->mem, cpu->a[7], saved_sr);
+#if JIT_DBG_TRACE
+    /* Record the post-push SSP + the PC value as it actually landed in the
+     * frame (read back from guest RAM), for the wild-fault post-mortem. */
+    {
+        u32 li = (m68k_exc_n - 1) & 63;
+        m68k_exc_a7[li] = cpu->a[7];
+        m68k_exc_frame_pc[li] = mac_read32(cpu->mem, cpu->a[7] + 2u);
+    }
+#endif
     cpu->pc = mac_read32(cpu->mem, vector * 4u);
     cpu->cycles += 34;
 }
