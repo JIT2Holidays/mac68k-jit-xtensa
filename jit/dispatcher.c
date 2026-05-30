@@ -1090,9 +1090,21 @@ void m68k_dispatcher_set_compile_threshold(m68k_dispatcher *d, u32 n) {
     d->compile_threshold = n;
 }
 
+/* Refill the shared JIT literal table (cpu->jit_lit). Cheap (LITERAL_COUNT
+ * helper_addr() calls); done at each run_until entry so overlay-dependent
+ * literals (RAM/ROM bounds) reflect the current memory map. l32i in generated
+ * code loads from here. _Static_assert keeps jit_lit within l32i's reach. */
+_Static_assert(offsetof(m68k_cpu, jit_lit) + (LITERAL_COUNT - 1) * 4u <= 1020u,
+               "cpu->jit_lit out of l32i offset range");
+static void jit_refill_literals(m68k_dispatcher *d) {
+    for (u32 i = 0; i < LITERAL_COUNT; i++)
+        d->cpu->jit_lit[i] = helper_addr((literal_id)i, d->cpu);
+}
+
 void m68k_dispatcher_run_until(m68k_dispatcher *d, u64 until) {
     m68k_cpu *cpu = d->cpu;
     m68k_block *prev = NULL;
+    jit_refill_literals(d);
 
     while (cpu->cycles < until && !cpu->halted) {
         { PROF_T0(); mac_mem_tick(cpu->mem, cpu->cycles); PROF_ADD(prof_tick); }

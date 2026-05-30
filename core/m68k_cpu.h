@@ -73,6 +73,17 @@ typedef struct m68k_cpu {
      * dispatcher refills it. */
     u32 chain_budget;
 
+    /* JIT shared literal table. The session-invariant JIT literals (helper
+     * pointers, RAM/ROM base+bounds, the helper-bridge addr — everything
+     * except ADDR_CPU_BASE and the per-block branch PC) live here, loaded by
+     * generated code with `l32i R_CPU, off` instead of a per-block `l32r`.
+     * That removes the ~180-byte per-block literal pool: blocks shrink ~2x,
+     * halving the L2-rehydrate PSRAM copy and ~doubling L1 residency. The
+     * dispatcher refills it (cheap) so overlay-dependent bounds stay correct.
+     * Indexed by literal_id (jit/codegen.h); sized with headroom. Kept within
+     * 1020 bytes of the struct base so the l32i offset is in range. */
+    u32 jit_lit[48];
+
     struct mac_mem *mem;
 } m68k_cpu;
 

@@ -25,6 +25,14 @@
 #define OFF_JITRETPC ((u32)offsetof(m68k_cpu, jit_ret_pc))
 #define OFF_JIT_ARG1 ((u32)offsetof(m68k_cpu, jit_arg1))
 #define OFF_JIT_ARG2 ((u32)offsetof(m68k_cpu, jit_arg2))
+#define OFF_JITLIT   ((u32)offsetof(m68k_cpu, jit_lit))
+
+/* Shared-literal sentinel. A lit_off[] entry with this bit set is NOT a
+ * per-block pool offset; it names a session-invariant literal that lives in
+ * cpu->jit_lit[id] and is loaded with `l32i R_CPU, OFF_JITLIT + id*4` instead
+ * of a per-block `l32r`. (l32i and l32r are both 3 bytes, so block-size
+ * accounting is unchanged.) The low byte carries the literal_id. */
+#define LIT_CPU_SHARED  0x40000000u
 
 /* Xtensa registers reserved across a block. */
 #define R_ARG   2     /* CALLX0 first argument          */
@@ -62,6 +70,13 @@ static u32 align_up_4(u32 v) { return (v + 3u) & ~3u; }
 /* Encode an L32R loading the literal at byte offset `lit_off` into `at`,
  * where the L32R instruction itself sits at block offset `pc_off`. */
 static void emit_l32r_at(xt_emit *e, u8 at, u32 lit_off, u32 pc_off) {
+    /* Shared-literal: load from cpu->jit_lit[id] via R_CPU instead of a
+     * per-block pool l32r. Same 3-byte size; position-independent (R_CPU is a
+     * runtime pointer), so L2 rehydrate to any IRAM slot stays correct. */
+    if (lit_off & LIT_CPU_SHARED) {
+        xt_l32i(e, at, R_CPU, OFF_JITLIT + (lit_off & 0xFFu) * 4u);
+        return;
+    }
     u32 pc_aligned = (pc_off + 3u) & ~3u;
     assert(lit_off < pc_aligned);
     u32 dist = pc_aligned - lit_off;
@@ -1883,7 +1898,11 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
     if (n_ops == 0) return NULL;
 
     /* 2. Reserve a worst-case span from the codecache. */
-    u32 lit_bytes = align_up_4((u32)LITERAL_COUNT * 4u);
+    /* Per-block pool now holds only ADDR_CPU_BASE (offset 0 — loaded by the
+     * prologue before R_CPU is live, so it cannot come from cpu->jit_lit) and
+     * LITERAL_BCC_PC (offset 4 — a per-block value). All other literals are
+     * shared via cpu->jit_lit (see LIT_CPU_SHARED). */
+    u32 lit_bytes = align_up_4(2u * 4u);
     u32 total = lit_bytes + PROLOGUE_EPILOGUE + n_ops * BYTES_PER_OP;
     total = align_up_4(total);
     u8 *iram = codecache_alloc(cc, total);
@@ -1905,12 +1924,14 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
      * tail padding deterministic for the word-copy below). */
     for (u32 i = 0; i < total; i += 4) *(u32 *)(base + i) = 0;
 
-    /* 3. Literal pool. */
+    /* 3. Literal pool. Only two real per-block slots; the rest are shared
+     * (loaded from cpu->jit_lit via R_CPU at runtime). */
     u32 lit_off[LITERAL_COUNT];
-    for (u32 i = 0; i < LITERAL_COUNT; i++) {
-        lit_off[i] = i * 4u;
-        *(u32 *)(base + i * 4u) = helper_addr((literal_id)i, user);
-    }
+    for (u32 i = 0; i < LITERAL_COUNT; i++) lit_off[i] = LIT_CPU_SHARED | i;
+    lit_off[ADDR_CPU_BASE]  = 0u;            /* pooled: prologue loads R_CPU from here */
+    lit_off[LITERAL_BCC_PC] = 4u;            /* pooled: per-block branch target PC */
+    *(u32 *)(base + 0u) = helper_addr(ADDR_CPU_BASE, user);
+    *(u32 *)(base + 4u) = 0u;                /* BCC_PC filled per-block below */
     u32 entry_off = lit_bytes;
 
     /* 3b. Per-block PC literal. If the terminator is BRA.S or Bcc.S, store
