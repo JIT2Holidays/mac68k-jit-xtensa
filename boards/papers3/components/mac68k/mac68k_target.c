@@ -17,6 +17,38 @@ void *m68k_jit_arena_alloc(u32 bytes) {
     return p;
 }
 
+/* --- L2 code-byte cache backing store (PSRAM, DATA — never executed) -----
+ * The IRAM arena is far too small (~96-180KB) for the Mac boot's hot working
+ * set (~MBs of generated code), so blocks thrash compile->evict->recompile.
+ * The L2 store keeps each block's finished, relocatable machine-code bytes in
+ * PSRAM so an evicted block is RE-COPIED into a fresh IRAM slot (cheap) on
+ * re-dispatch instead of RE-COMPILED (expensive). It is a plain bump arena:
+ * the working set is published once; on overflow new blocks simply aren't
+ * L2-backed (they recompile as before). It deliberately SURVIVES code-cache
+ * arena resets — that is the whole point — and is only rewound on shutdown. */
+#ifndef BOARD_JIT_L2_BYTES
+#define BOARD_JIT_L2_BYTES (2u * 1024u * 1024u)
+#endif
+static u8 *s_l2_base;
+static u32 s_l2_cap;
+
+/* Allocate (once) the PSRAM block the dispatcher manages as an LRU byte cache.
+ * Returns the base and sets *cap; the dispatcher codecache_init's it and runs
+ * its own eviction so the L2 holds the current working set, not the whole
+ * boot footprint. Falls back to smaller sizes if PSRAM is tight. */
+void *m68k_jit_l2_arena(u32 *cap) {
+    if (!s_l2_base) {
+        u32 want = BOARD_JIT_L2_BYTES;
+        while (want >= 512u * 1024u) {
+            s_l2_base = heap_caps_malloc(want, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (s_l2_base) { s_l2_cap = want; break; }
+            want -= 512u * 1024u;
+        }
+    }
+    if (cap) *cap = s_l2_cap;
+    return s_l2_base;
+}
+
 /* Enter a compiled block.
  *
  * The block is CALL0 code; this function is windowed. The frame-padding

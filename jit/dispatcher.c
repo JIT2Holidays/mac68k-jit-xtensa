@@ -24,6 +24,21 @@
 #define HOST_RAM_BASE    0x60000000u
 #endif
 
+/* CCOUNT-based run-loop profiler (cheap: one rsr per probe). Default on;
+ * -DJIT_PROFILE=0 compiles it out. u32 deltas (CCOUNT wraps ~18s @240MHz —
+ * far longer than any single probed region) accumulate into u64 counters. */
+#ifndef JIT_PROFILE
+#define JIT_PROFILE 1
+#endif
+#if defined(ESP_PLATFORM) && JIT_PROFILE
+static inline u32 jit_ccount(void) { u32 v; __asm__ volatile("rsr.ccount %0":"=r"(v)); return v; }
+#define PROF_T0()        u32 _pt = jit_ccount()
+#define PROF_ADD(field)  do { d->field += (u32)(jit_ccount() - _pt); } while (0)
+#else
+#define PROF_T0()        ((void)0)
+#define PROF_ADD(field)  ((void)0)
+#endif
+
 /* --- block-execution trace ring (diagnostic) -------------------------
  * Records the guest PC entered at each dispatcher iteration, plus whether
  * the entry was a native chain hit and the dispatcher's predicted-next PC.
@@ -252,10 +267,66 @@ static m68k_block *find_block(m68k_dispatcher *d, u32 pc) {
     return NULL;
 }
 
+/* --- O(1) LRU list + reverse chain-edge bookkeeping ------------------- */
+static void lru_unlink(m68k_dispatcher *d, m68k_block *b) {
+    if (b->lru_prev) b->lru_prev->lru_next = b->lru_next;
+    else if (d->lru_head == b) d->lru_head = b->lru_next;
+    if (b->lru_next) b->lru_next->lru_prev = b->lru_prev;
+    else if (d->lru_tail == b) d->lru_tail = b->lru_prev;
+    b->lru_prev = b->lru_next = NULL;
+}
+static void lru_push_front(m68k_dispatcher *d, m68k_block *b) {
+    b->lru_prev = NULL;
+    b->lru_next = d->lru_head;
+    if (d->lru_head) d->lru_head->lru_prev = b;
+    d->lru_head = b;
+    if (!d->lru_tail) d->lru_tail = b;
+}
+static inline void lru_touch(m68k_dispatcher *d, m68k_block *b) {
+    if (d->lru_head == b) return;        /* already MRU */
+    lru_unlink(d, b);
+    lru_push_front(d, b);
+}
+/* Remove `p` from its current successor's pred_users list (if any). */
+static void pred_edge_unlink(m68k_block *p) {
+    if (p->pred_user_prev) p->pred_user_prev->pred_user_next = p->pred_user_next;
+    else if (p->predicted_next && p->predicted_next->pred_users == p)
+        p->predicted_next->pred_users = p->pred_user_next;
+    if (p->pred_user_next) p->pred_user_next->pred_user_prev = p->pred_user_prev;
+    p->pred_user_prev = p->pred_user_next = NULL;
+}
+/* Set p->predicted_next = b, maintaining the reverse-edge list. */
+static void pred_edge_set(m68k_block *p, m68k_block *b) {
+    if (p->predicted_next == b) return;
+    if (p->predicted_next) pred_edge_unlink(p);
+    p->predicted_next = b;
+    p->pred_user_prev = NULL;
+    p->pred_user_next = b->pred_users;
+    if (b->pred_users) b->pred_users->pred_user_prev = p;
+    b->pred_users = p;
+}
+/* Detach a block about to be freed: null every predictor pointing AT it
+ * (O(degree)), remove it from its own successor's reverse list, and unlink
+ * it from the LRU list. Leaves the hash unlink to the caller. */
+static void block_detach(m68k_dispatcher *d, m68k_block *b) {
+    for (m68k_block *u = b->pred_users; u; ) {
+        m68k_block *nu = u->pred_user_next;
+        u->predicted_next = NULL;
+        u->predicted_next_pc = 0xFFFFFFFFu;
+        u->predicted_next_entry = NULL;
+        u->pred_user_prev = u->pred_user_next = NULL;
+        u = nu;
+    }
+    b->pred_users = NULL;
+    pred_edge_unlink(b);
+    lru_unlink(d, b);
+}
+
 static void insert_block(m68k_dispatcher *d, m68k_block *b) {
     u32 bk = bucket_of(b->pc_start);
     b->hash_next = d->buckets[bk];
     d->buckets[bk] = b;
+    if (d->cc.mode == CC_MODE_LRU) lru_push_front(d, b);
 }
 
 static void free_all_blocks(m68k_dispatcher *d) {
@@ -267,6 +338,184 @@ static void free_all_blocks(m68k_dispatcher *d) {
             b = next;
         }
         d->buckets[i] = NULL;
+    }
+    /* Whole graph dropped — reset the LRU list heads (per-block lru/pred
+     * links live in the now-freed structs; no per-block teardown needed). */
+    d->lru_head = d->lru_tail = NULL;
+}
+
+/* --- L2 code-byte cache ----------------------------------------------
+ * The IRAM execute-arena is ~40x too small for the Mac boot's hot working
+ * set, so blocks thrash compile->evict->recompile (~73% of host cycles in
+ * the relocation phase). Since a finished block is position-independent
+ * (l32r/branches are PC-relative; the literal pool holds absolute VALUES
+ * copied verbatim), its bytes can be re-copied into ANY fresh IRAM slot and
+ * run correctly. The L2 store keeps those bytes in PSRAM so re-dispatch of an
+ * evicted block RE-COPIES (memcpy + isync) instead of RE-COMPILING. Keyed by
+ * pc_start; a content hash over the guest code guards against a self-modifying
+ * guest rehydrating stale machine code. */
+#if defined(ESP_PLATFORM)
+extern void *m68k_jit_l2_arena(u32 *cap);
+#else
+/* Host: a malloc-backed arena so the L2 path is exercised off-target. */
+static void *m68k_jit_l2_arena(u32 *cap) {
+    static u8 *base; static u32 c;
+    if (!base) { c = 8u*1024*1024; base = (u8 *)malloc(c); if (!base) c = 0; }
+    if (cap) *cap = c;
+    return base;
+}
+#endif
+
+/* An L2 entry + its code bytes are stored contiguously in one span of the L2
+ * codecache arena (PSRAM): [l2_entry][code_size bytes]. The arena is an LRU
+ * byte cache (codecache CC_MODE_LRU with l2_evict_cb), so it holds the current
+ * working set and evicts cold entries — bounding L2 to a fixed size rather than
+ * the whole boot's code footprint. */
+typedef struct l2_entry {
+    u32 pc_start, pc_end;
+    u32 content_hash;
+    u32 code_size;
+    u32 entry_off, body_off, chain_entry_off;
+    u32 cache_sig;
+    u32 n_ops, inline_ops, helper_ops;
+    u32 last_op_pc;
+    u16 last_op;
+    u8  sr_loaded;
+    u8 *bytes;                     /* = (u8*)e + sizeof(l2_entry)         */
+    u32 span_off, span_size;       /* this entry's span in d->l2cc        */
+    struct l2_entry *hash_next;
+    struct l2_entry *l2_lru_prev, *l2_lru_next;
+} l2_entry;
+
+static u32 l2_hash_guest(m68k_cpu *cpu, u32 lo, u32 hi) {
+    u32 h = 2166136261u;
+    for (u32 a = lo; a < hi; a += 2)
+        h = (h ^ (u32)mac_read16(cpu->mem, a)) * 16777619u;
+    return h;
+}
+
+/* --- L2 recency list (MRU = head, coldest victim = tail) -------------- */
+static void l2_lru_unlink(m68k_dispatcher *d, l2_entry *e) {
+    if (e->l2_lru_prev) e->l2_lru_prev->l2_lru_next = e->l2_lru_next;
+    else if (d->l2_lru_head == e) d->l2_lru_head = e->l2_lru_next;
+    if (e->l2_lru_next) e->l2_lru_next->l2_lru_prev = e->l2_lru_prev;
+    else if (d->l2_lru_tail == e) d->l2_lru_tail = e->l2_lru_prev;
+    e->l2_lru_prev = e->l2_lru_next = NULL;
+}
+static void l2_lru_push_front(m68k_dispatcher *d, l2_entry *e) {
+    e->l2_lru_prev = NULL; e->l2_lru_next = d->l2_lru_head;
+    if (d->l2_lru_head) d->l2_lru_head->l2_lru_prev = e;
+    d->l2_lru_head = e;
+    if (!d->l2_lru_tail) d->l2_lru_tail = e;
+}
+static void l2_hash_unlink(m68k_dispatcher *d, l2_entry *e) {
+    l2_entry **pp = &d->l2_buckets[bucket_of(e->pc_start)];
+    while (*pp && *pp != e) pp = &(*pp)->hash_next;
+    if (*pp) *pp = e->hash_next;
+}
+
+static l2_entry *l2_find(m68k_dispatcher *d, u32 pc) {
+    if (!d->l2_on) return NULL;
+    for (l2_entry *e = d->l2_buckets[bucket_of(pc)]; e; e = e->hash_next)
+        if (e->pc_start == pc) return e;
+    return NULL;
+}
+
+/* codecache evict callback for the L2 arena: drop the coldest L2 entry,
+ * return its freed span size so codecache_alloc can retry. */
+static u32 l2_evict_cb(void *ctx) {
+    m68k_dispatcher *d = (m68k_dispatcher *)ctx;
+    l2_entry *victim = d->l2_lru_tail;
+    if (!victim) return 0;
+    u32 off = victim->span_off, sz = victim->span_size;
+    l2_hash_unlink(d, victim);
+    l2_lru_unlink(d, victim);
+    d->l2_evicts++;
+    codecache_free(&d->l2cc, off, sz);   /* entry struct lives in this span */
+    return sz;
+}
+
+/* Store a freshly-compiled block's bytes + metadata into L2 (once). The bytes
+ * are read from the IRAM slot with 32-bit loads (IRAM is 32-bit-access-only). */
+static void l2_publish(m68k_dispatcher *d, m68k_block *b) {
+    if (!d->l2_on) return;
+    if (l2_find(d, b->pc_start)) return;            /* already cached */
+    u32 span = (u32)sizeof(l2_entry) + b->code_size;
+    u8 *p = codecache_alloc(&d->l2cc, span);        /* may evict via l2_evict_cb */
+    if (!p) { d->l2_full++; return; }
+    l2_entry *e = (l2_entry *)p;
+    e->bytes = p + sizeof(l2_entry);
+    e->span_off = (u32)(p - d->l2cc.base);
+    e->span_size = span;
+    for (u32 i = 0; i < b->code_size; i += 4)
+        *(u32 *)(e->bytes + i) = *(u32 *)(b->code + i);
+    e->pc_start = b->pc_start; e->pc_end = b->pc_end;
+    e->content_hash = b->content_hash;
+    e->code_size = b->code_size;
+    e->entry_off = b->entry_off;
+    e->body_off = (u32)((const u8 *)b->body_addr - b->code);
+    e->chain_entry_off = (u32)((const u8 *)b->chain_entry_addr - b->code);
+    e->cache_sig = b->cache_sig;
+    e->n_ops = b->n_ops; e->inline_ops = b->inline_ops; e->helper_ops = b->helper_ops;
+    e->last_op = b->last_op; e->last_op_pc = b->last_op_pc;
+    e->sr_loaded = b->sr_loaded;
+    u32 bk = bucket_of(b->pc_start);
+    e->hash_next = d->l2_buckets[bk];
+    d->l2_buckets[bk] = e;
+    l2_lru_push_front(d, e);
+    d->l2_publishes++;
+}
+
+/* Try to re-instantiate the block at `pc` from L2 into a fresh IRAM slot,
+ * skipping compilation. Returns the new (un-inserted) block, or NULL on miss/
+ * stale/no-space. */
+static m68k_block *l2_rehydrate(m68k_dispatcher *d, u32 pc) {
+    l2_entry *e = l2_find(d, pc);
+    if (!e) return NULL;
+    /* Staleness guard: if the guest rewrote this code, the hash differs. */
+    if (l2_hash_guest(d->cpu, e->pc_start, e->pc_end) != e->content_hash) {
+        d->l2_stale++;
+        l2_hash_unlink(d, e); l2_lru_unlink(d, e);
+        codecache_free(&d->l2cc, e->span_off, e->span_size);
+        return NULL;                                /* caller recompiles fresh */
+    }
+    l2_lru_unlink(d, e); l2_lru_push_front(d, e);   /* mark recently used */
+    u8 *iram = codecache_alloc(&d->cc, e->code_size);   /* may evict (L2-safe) */
+    if (!iram) return NULL;
+    for (u32 i = 0; i < e->code_size; i += 4)
+        *(u32 *)(iram + i) = *(u32 *)(e->bytes + i);
+    codecache_finalize(&d->cc, iram + e->entry_off, e->code_size - e->entry_off);
+    m68k_block *b = (m68k_block *)calloc(1, sizeof(*b));
+    if (!b) { codecache_free(&d->cc, (u32)(iram - d->cc.base), e->code_size); return NULL; }
+    b->pc_start = e->pc_start; b->pc_end = e->pc_end; b->n_ops = e->n_ops;
+    b->code = iram; b->code_size = e->code_size; b->entry_off = e->entry_off;
+    b->entry_addr = (void *)(iram + e->entry_off);
+    b->body_addr  = (void *)(iram + e->body_off);
+    b->chain_entry_addr = (void *)(iram + e->chain_entry_off);
+    b->sr_loaded = e->sr_loaded; b->cache_sig = e->cache_sig;
+    b->inline_ops = e->inline_ops; b->helper_ops = e->helper_ops;
+    b->last_op = e->last_op; b->last_op_pc = e->last_op_pc;
+    b->content_hash = e->content_hash;
+    b->predicted_next = NULL; b->predicted_next_pc = 0xFFFFFFFFu; b->predicted_next_entry = NULL;
+    b->last_used_cycle = d->cpu->cycles;
+    b->hash_next = NULL;
+    d->l2_rehydrates++;
+    return b;
+}
+
+/* Drop the L2 entry for a guest pc (true self-modifying code). */
+static void l2_drop(m68k_dispatcher *d, u32 pc) {
+    if (!d->l2_on) return;
+    l2_entry **pp = &d->l2_buckets[bucket_of(pc)];
+    while (*pp) {
+        l2_entry *e = *pp;
+        if (e->pc_start == pc) {
+            *pp = e->hash_next;
+            l2_lru_unlink(d, e);
+            codecache_free(&d->l2cc, e->span_off, e->span_size);
+        } else {
+            pp = &e->hash_next;
+        }
     }
 }
 
@@ -308,6 +557,30 @@ static void smc_mark_block(m68k_dispatcher *d, m68k_block *b) {
 }
 
 /* Drop every cached block overlapping [lo, hi). */
+/* Zero the hotspot-gate counters for every PC slot a [lo,hi) guest range
+ * covers when a block is dropped, forcing it to re-earn `compile_threshold`
+ * interpreter passes before re-compiling.
+ *
+ * KEPT ON even with the L2 byte-cache: it is the admission throttle that bounds
+ * the L1<->L2 churn. Measured: with it OFF, a tiny L1 (~600 blocks) vs a huge
+ * working set means EVERY miss rehydrates (~70k/window) and the rehydrate
+ * (memcpy + alloc + isync + calloc) becomes the bottleneck (~0.6 MHz). With it
+ * ON, sporadically-used blocks stay interpreted and only genuinely-hot blocks
+ * (re-proven >= threshold between evictions) rehydrate (~7k/window) — ~3x
+ * faster. (Rehydrate is cheap PER EVENT, but not free at 10x the volume.) */
+#ifndef JIT_RESET_HOTNESS_ON_EVICT
+#define JIT_RESET_HOTNESS_ON_EVICT 1
+#endif
+static inline void hotness_reset_range(m68k_dispatcher *d, u32 lo, u32 hi) {
+#if JIT_RESET_HOTNESS_ON_EVICT
+    if (!d->hotness) return;
+    for (u32 a = lo; a < hi; a += 2)
+        d->hotness[(a >> 1) & d->hotness_mask] = 0;
+#else
+    (void)d; (void)lo; (void)hi;
+#endif
+}
+
 static void smc_drop_range(m68k_dispatcher *d, u32 lo, u32 hi) {
     for (u32 i = 0; i < M68K_JIT_BLOCK_BUCKETS; i++) {
         m68k_block **pp = &d->buckets[i];
@@ -317,6 +590,9 @@ static void smc_drop_range(m68k_dispatcher *d, u32 lo, u32 hi) {
                 *pp = b->hash_next;
                 d->dbg_smc_w = lo; d->dbg_smc_pcs = b->pc_start;
                 d->dbg_smc_pce = b->pc_end;
+                hotness_reset_range(d, b->pc_start, b->pc_end);
+                l2_drop(d, b->pc_start);   /* guest rewrote code — L2 copy is stale */
+                block_detach(d, b);        /* unlink LRU + reverse chain edges */
                 m68k_block_free(b);
                 d->smc_invalidations++;
             } else {
@@ -346,12 +622,15 @@ static bool smc_flush(m68k_dispatcher *d) {
     d->n_dirty = 0;
     d->smc_overflow = false;
 
-    /* Predicted-next pointers may now dangle — clear them all. */
+    /* Predicted-next pointers may now dangle — clear them all, including the
+     * reverse-edge (pred_users) links so block_detach stays consistent. */
     for (u32 i = 0; i < M68K_JIT_BLOCK_BUCKETS; i++)
         for (m68k_block *b = d->buckets[i]; b; b = b->hash_next) {
             b->predicted_next = NULL;
             b->predicted_next_pc = 0xFFFFFFFFu;
             b->predicted_next_entry = NULL;
+            b->pred_users = NULL;
+            b->pred_user_next = b->pred_user_prev = NULL;
         }
     return true;
 }
@@ -368,43 +647,28 @@ static bool smc_flush(m68k_dispatcher *d) {
  * only happen when the arena fills, and only one per failed alloc. */
 static u32 lru_evict_cb(void *ctx) {
     m68k_dispatcher *d = (m68k_dispatcher *)ctx;
-    m68k_block *coldest = NULL;
-    m68k_block **coldest_pp = NULL;
-    u64 coldest_tag = (u64)-1;
-    for (u32 i = 0; i < M68K_JIT_BLOCK_BUCKETS; i++) {
-        m68k_block **pp = &d->buckets[i];
-        while (*pp) {
-            m68k_block *b = *pp;
-            if (b->last_used_cycle < coldest_tag) {
-                coldest_tag = b->last_used_cycle;
-                coldest = b;
-                coldest_pp = pp;
-            }
-            pp = &b->hash_next;
-        }
-    }
-    if (!coldest) return 0;
-    /* Unlink from the hash bucket. */
-    *coldest_pp = coldest->hash_next;
-    /* Other blocks may still point to it via predicted_next — invalidate
-     * the whole predictor since we don't track reverse-edges. Cheaper
-     * to clear all than to find which point at the victim. */
-    for (u32 i = 0; i < M68K_JIT_BLOCK_BUCKETS; i++)
-        for (m68k_block *b = d->buckets[i]; b; b = b->hash_next) {
-            if (b->predicted_next == coldest) {
-                b->predicted_next = NULL;
-                b->predicted_next_pc = 0xFFFFFFFFu;
-                b->predicted_next_entry = NULL;
-            }
-        }
+    PROF_T0();
+    /* O(1) victim: the LRU tail (coldest dispatcher entry). */
+    m68k_block *coldest = d->lru_tail;
+    if (!coldest) { PROF_ADD(prof_evict); return 0; }
+    /* Unlink from its hash bucket. */
+    m68k_block **pp = &d->buckets[bucket_of(coldest->pc_start)];
+    while (*pp && *pp != coldest) pp = &(*pp)->hash_next;
+    if (*pp) *pp = coldest->hash_next;
+    /* O(degree): null only the predictors that point AT the victim, and
+     * remove it from the LRU + reverse-edge lists. (Was two O(N_blocks)
+     * bucket sweeps — the dominant relocation-phase cost once recompiles
+     * became cheap L2 rehydrates.) */
+    block_detach(d, coldest);
     u32 offset = (u32)((u8 *)coldest->code - d->cc.base);
     u32 size = coldest->code_size;
     d->smc_invalidations++;
+    d->lru_evictions++;
+    hotness_reset_range(d, coldest->pc_start, coldest->pc_end);
+    /* Do NOT drop the L2 byte copy — re-dispatch must rehydrate, not recompile. */
     m68k_block_free(coldest);
-    /* Return the span to the codecache free list — but codecache_free
-     * is a no-op in LRU mode for everyone except this caller path, so
-     * we inline its effect by calling it directly. */
     codecache_free(&d->cc, offset, size);
+    PROF_ADD(prof_evict);
     return size;
 }
 
@@ -422,6 +686,7 @@ static void fifo_evict_range_cb(void *ctx, u32 start, u32 end) {
             if (boff < end && boff + b->code_size > start) {
                 *pp = b->hash_next;
                 d->smc_invalidations++;
+                block_detach(d, b);          /* unlink LRU + reverse edges */
                 m68k_block_free(b);
                 dropped_any = 1;
             } else {
@@ -430,12 +695,14 @@ static void fifo_evict_range_cb(void *ctx, u32 start, u32 end) {
         }
     }
     if (dropped_any) {
-        /* predicted_next links may now dangle; clear them all. */
+        /* predicted_next links may now dangle; clear them all (+ reverse edges). */
         for (u32 i = 0; i < M68K_JIT_BLOCK_BUCKETS; i++)
             for (m68k_block *b = d->buckets[i]; b; b = b->hash_next) {
                 b->predicted_next = NULL;
                 b->predicted_next_pc = 0xFFFFFFFFu;
                 b->predicted_next_entry = NULL;
+                b->pred_users = NULL;
+                b->pred_user_next = b->pred_user_prev = NULL;
             }
     }
 }
@@ -461,6 +728,20 @@ bool m68k_dispatcher_init_ex(m68k_dispatcher *d, m68k_cpu *cpu,
     } else if (evict_mode == CC_MODE_FIFO) {
         d->cc.evict_range = fifo_evict_range_cb;
         d->cc.evict_ctx = d;
+    }
+    /* L2 byte-cache: a PSRAM backing store, managed as its own LRU byte arena
+     * so evicted L1 blocks re-copy into IRAM instead of recompiling, and the
+     * L2 itself evicts cold entries to stay within a fixed size. Harmless if
+     * the PSRAM alloc fails (l2_on stays false → recompile as before). */
+    {
+        u32 l2cap = 0;
+        void *l2base = m68k_jit_l2_arena(&l2cap);
+        if (l2base && l2cap >= 64u * 1024u) {
+            codecache_init(&d->l2cc, (u8 *)l2base, l2cap, CC_MODE_LRU);
+            d->l2cc.evict = l2_evict_cb;
+            d->l2cc.evict_ctx = d;
+            d->l2_on = true;
+        }
     }
     return true;
 }
@@ -503,6 +784,12 @@ void m68k_dispatcher_shutdown(m68k_dispatcher *d) {
         mac_write_watch_ctx = NULL;
     }
     free_all_blocks(d);
+    if (d->l2_on) {
+        memset(d->l2_buckets, 0, sizeof(d->l2_buckets));
+        d->l2_lru_head = d->l2_lru_tail = NULL;
+        codecache_reset(&d->l2cc);   /* rewind the L2 arena (board keeps the PSRAM block) */
+        d->l2_on = false;
+    }
 #if !defined(ESP_PLATFORM)
     free(d->arena);
 #endif
@@ -705,16 +992,24 @@ static m68k_block *get_block_impl(m68k_dispatcher *d, u32 pc,
             return b;
         }
     }
-    m68k_block *b = m68k_compile_block(&d->cc, d->cpu, pc, helper_addr, d->cpu);
+    /* L2 fast path: re-instantiate an evicted block from its PSRAM byte copy
+     * (cheap memcpy + isync) instead of recompiling (expensive). */
+    bool rehy = false;
+    m68k_block *b = NULL;
+    if (!d->no_cache) { b = l2_rehydrate(d, pc); rehy = (b != NULL); }
+    if (!b) b = m68k_compile_block(&d->cc, d->cpu, pc, helper_addr, d->cpu);
     if (!b && !prefetching) {
         /* Arena full: wipe everything and retry once into a fresh
          * arena. Only on demand-driven calls — prefetch silently
          * gives up rather than risk evicting the block we just
-         * compiled to satisfy the actual dispatcher entry. */
+         * compiled to satisfy the actual dispatcher entry. The L2 store
+         * survives the reset, so prefer a (cheap) rehydrate on the retry. */
         free_all_blocks(d);
         codecache_reset(&d->cc);
         d->arena_resets++;
-        b = m68k_compile_block(&d->cc, d->cpu, pc, helper_addr, d->cpu);
+        b = l2_rehydrate(d, pc);
+        rehy = (b != NULL);
+        if (!b) b = m68k_compile_block(&d->cc, d->cpu, pc, helper_addr, d->cpu);
     }
     if (b) {
         if (d->no_cache) {
@@ -722,10 +1017,13 @@ static m68k_block *get_block_impl(m68k_dispatcher *d, u32 pc,
         } else {
             insert_block(d, b);
             smc_mark_block(d, b);
+            if (!rehy) l2_publish(d, b);   /* store bytes for cheap re-instantiation */
         }
-        d->blocks_compiled++;
-        d->inline_ops_total += b->inline_ops;
-        d->helper_ops_total += b->helper_ops;
+        if (!rehy) {
+            d->blocks_compiled++;
+            d->inline_ops_total += b->inline_ops;
+            d->helper_ops_total += b->helper_ops;
+        }
         if (prefetching) d->prefetch_compiles++;
     }
 
@@ -780,7 +1078,11 @@ void m68k_dispatcher_set_compile_threshold(m68k_dispatcher *d, u32 n) {
      * resident anyway. Sized to stay within PSRAM alongside the 4 MB guest
      * RAM. The gate disables itself if the allocation fails. */
     if (n && !d->hotness) {
-        u32 slots = 0x200000u;             /* 2 M instruction addresses (2 MB) */
+        /* 1 MB (was 2 MB) to leave PSRAM headroom for the L2 byte-cache.
+         * pc>>1 for 4 MB RAM spans 0..0x1FFFFF, so a 1 MB map aliases at the
+         * 2 MB guest-address boundary — tolerable now that a premature compile
+         * from an alias is cheap (it publishes to L2 once, then rehydrates). */
+        u32 slots = 0x100000u;             /* 1 M instruction slots (1 MB) */
         d->hotness = (u8 *)calloc(1, slots);
         if (!d->hotness) { d->compile_threshold = 0; return; }
         d->hotness_mask = slots - 1u;
@@ -793,7 +1095,7 @@ void m68k_dispatcher_run_until(m68k_dispatcher *d, u64 until) {
     m68k_block *prev = NULL;
 
     while (cpu->cycles < until && !cpu->halted) {
-        mac_mem_tick(cpu->mem, cpu->cycles);
+        { PROF_T0(); mac_mem_tick(cpu->mem, cpu->cycles); PROF_ADD(prof_tick); }
         if (m68k_poll_interrupts(cpu)) { prev = NULL; continue; }
         if (sony_service(cpu)) { prev = NULL; continue; }
         if (cpu->stopped) { cpu->cycles += 64; continue; }
@@ -824,18 +1126,25 @@ void m68k_dispatcher_run_until(m68k_dispatcher *d, u64 until) {
                 u32 hi = (pc >> 1) & d->hotness_mask;
                 if (d->hotness[hi] < d->compile_threshold) {
                     if (d->hotness[hi] != 0xFFu) d->hotness[hi]++;
-                    m68k_step(cpu);
+                    { PROF_T0(); m68k_step(cpu); PROF_ADD(prof_interp); }
                     d->interp_fallbacks++;
                     prev = NULL;
                     continue;
                 }
+                /* Gate passed for an uncached pc → a fresh compile follows.
+                 * If hotness is already at/over the cap (0xFF) the gate did
+                 * NOT interpret-first — the prime suspect for rewrite-thrash:
+                 * a previously-hot pc whose code was rewritten recompiles
+                 * immediately because hotness was never reset. */
+                if (d->hotness[hi] >= 0xFFu) d->hot_bypass++;
+                else                         d->hot_gated++;
             }
-            b = get_block(d, pc);
+            { PROF_T0(); b = get_block(d, pc); PROF_ADD(prof_compile); }
             d->chain_misses++;
             if (d->arena_resets != resets_before ||
                 d->smc_invalidations != inv_before) prev = NULL;
             if (prev && !d->no_cache) {
-                prev->predicted_next = b;
+                pred_edge_set(prev, b);   /* maintains the reverse-edge list */
                 prev->predicted_next_pc = pc;
                 /* M6.62 / M6.82 — pick the chain JX target along three tiers:
                  *
@@ -915,6 +1224,7 @@ void m68k_dispatcher_run_until(m68k_dispatcher *d, u64 until) {
          * entered must be on a chain rooted at a hot dispatcher entry,
          * which keeps the root hot — eviction follows the root. */
         b->last_used_cycle = cpu->cycles;
+        if (d->cc.mode == CC_MODE_LRU) lru_touch(d, b);
 
         /* M6.82 — on chain hits, start the sim at the precomputed
          * predicted_next_entry (body_addr or chain_entry_addr) so the
@@ -946,7 +1256,7 @@ void m68k_dispatcher_run_until(m68k_dispatcher *d, u64 until) {
         u32 a7_pre = cpu->a[7];
         u32 sr_pre = cpu->sr;
 #endif
-        enter_block(d, b, start_off);
+        { PROF_T0(); enter_block(d, b, start_off); PROF_ADD(prof_exec); }
         d->blocks_executed++;
 
 #if JIT_DBG_TRACE

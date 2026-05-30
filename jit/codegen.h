@@ -171,7 +171,24 @@ typedef struct m68k_block {
     u16                last_op;
     u32                last_op_pc;
 
+    /* FNV-1a hash of the guest code bytes [pc_start,pc_end). The L2 byte-cache
+     * keys on pc_start and validates with this hash so a self-modifying guest
+     * can't rehydrate stale machine code. Computed once at compile. */
+    u32                content_hash;
+
     struct m68k_block *hash_next;   /* bucket chain */
+
+    /* O(1) LRU eviction (CC_MODE_LRU): intrusive most-recently-used list.
+     * head = MRU, tail = coldest victim. */
+    struct m68k_block *lru_prev;
+    struct m68k_block *lru_next;
+    /* Reverse chain edges: the list of blocks whose predicted_next == this
+     * block, so eviction can null exactly those predictors in O(degree)
+     * instead of scanning every cached block. A block appears in at most one
+     * such list (its single predicted_next successor's). */
+    struct m68k_block *pred_users;      /* head: who points AT me */
+    struct m68k_block *pred_user_next;  /* next predecessor of the SAME successor */
+    struct m68k_block *pred_user_prev;
 } m68k_block;
 
 /* Compile one basic block starting at `pc`. Returns NULL on failure (the

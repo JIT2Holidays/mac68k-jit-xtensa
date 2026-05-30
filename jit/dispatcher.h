@@ -31,6 +31,8 @@ typedef struct m68k_dispatcher {
     u32        arena_cap;
 
     m68k_block *buckets[M68K_JIT_BLOCK_BUCKETS];
+    m68k_block *lru_head;   /* MRU end (most recently dispatched)       */
+    m68k_block *lru_tail;   /* LRU end (coldest — the O(1) evict victim) */
 
     /* Stats. */
     u64 blocks_compiled;
@@ -45,6 +47,22 @@ typedef struct m68k_dispatcher {
     u64 interp_fallbacks;   /* ops run via m68k_step when compile failed */
     u64 arena_resets;
     u64 smc_invalidations;
+    u64 lru_evictions;        /* subset of smc_invalidations bumped by LRU/FIFO
+                               * eviction (vs true guest-write SMC drops) — lets
+                               * the heartbeat separate eviction thrash from
+                               * self-modifying-code invalidation. */
+    u64 hot_bypass;           /* get_block dispatches where hotness was already
+                               * >= threshold (gate did NOT interpret-first) */
+    u64 hot_gated;            /* get_block dispatches that reached threshold the
+                               * legit way (interpreted then promoted) */
+    /* Host-CPU-cycle (CCOUNT) accounting of where wall-time goes in the run
+     * loop, to localize the relocation-phase slowdown. prof_compile INCLUDES
+     * prof_evict (eviction happens inside the compile's codecache_alloc). */
+    u64 prof_tick;            /* mac_mem_tick (VIA/timers/VBL/sound)   */
+    u64 prof_compile;         /* get_block (compile or L2-rehydrate)   */
+    u64 prof_exec;            /* enter_block (native JIT execution)    */
+    u64 prof_interp;          /* m68k_step (hotspot-gate interpretation) */
+    u64 prof_evict;           /* lru_evict_cb (subset of prof_compile) */
 
     /* Host-only JIT-cost accounting (xtensa_sim). xt_instrs is the number
      * of native Xtensa instructions the generated code ran (≈ LX7 cycles
@@ -101,6 +119,20 @@ typedef struct m68k_dispatcher {
     u32  compile_threshold;
     u8  *hotness;
     u32  hotness_mask;
+
+    /* L2 code-byte cache (see dispatcher.c). A block is compiled ONCE; its
+     * relocatable machine-code bytes live in PSRAM (l2_entry). On eviction the
+     * IRAM copy is dropped but the bytes survive, so a re-dispatch RE-COPIES
+     * (cheap) instead of RE-COMPILING (expensive). NULL buckets = L2 off. */
+    struct l2_entry *l2_buckets[M68K_JIT_BLOCK_BUCKETS];
+    codecache l2cc;        /* PSRAM byte arena for L2 (LRU, own evict cb)      */
+    struct l2_entry *l2_lru_head, *l2_lru_tail;  /* L2 recency list            */
+    bool  l2_on;
+    u64   l2_rehydrates;   /* blocks re-instantiated from L2 (compile avoided) */
+    u64   l2_publishes;    /* distinct blocks stored into L2                   */
+    u64   l2_evicts;       /* L2 entries evicted to make room (LRU)            */
+    u64   l2_stale;        /* L2 hits rejected by content-hash (guest SMC)     */
+    u64   l2_full;         /* publishes skipped because even eviction couldn't fit */
 } m68k_dispatcher;
 
 /* Enable the hotspot gate with compile threshold `n` (0 = compile

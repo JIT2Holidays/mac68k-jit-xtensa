@@ -12472,6 +12472,15 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
     b->last_used_cycle = cpu->cycles;
     b->last_op = op_word[n_ops - 1];
     b->last_op_pc = op_pc[n_ops - 1];
+    /* FNV-1a over the guest code words [pc,cur) — the L2 byte-cache's
+     * staleness check. Consecutive words so the dispatcher can recompute it
+     * cheaply from current guest memory at rehydrate time. */
+    {
+        u32 h = 2166136261u;
+        for (u32 a = pc; a < cur; a += 2)
+            h = (h ^ (u32)mac_read16(cpu->mem, a)) * 16777619u;
+        b->content_hash = h;
+    }
     b->hash_next = NULL;
     return b;
 }

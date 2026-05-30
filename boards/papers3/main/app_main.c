@@ -45,6 +45,7 @@ static const char *TAG = "mac68k";
 extern const u8 macplus_rom_start[] asm("_binary_MacPlus_ROM_start");
 extern const u8 macplus_rom_end[]   asm("_binary_MacPlus_ROM_end");
 
+
 /* --- tunables ---------------------------------------------------------- */
 
 /* Run the JIT (1) or the reference interpreter (0). Currently defaulting to
@@ -448,9 +449,24 @@ void app_main(void) {
         goto park;
     }
     m68k_dispatcher_set_compile_threshold(&s_disp, BOARD_JIT_HOT_THRESHOLD);
-    ESP_LOGI(TAG, "JIT arena=%u KB evict=%d hot-threshold=%u",
+    /* Speculative prefetch: after a demand compile, also compile (and publish
+     * to L2) statically-reachable successors, so execution arriving there finds
+     * them in L1/L2 — a cheap rehydrate or chain hit instead of a first-compile,
+     * and it skips the successor's hotspot-gate interpret tax. 0=none, 1=static
+     * (both Bcc arms), 2=chain (only unambiguous successors, to depth). */
+#ifndef BOARD_JIT_PREFETCH
+#define BOARD_JIT_PREFETCH 0
+#endif
+#ifndef BOARD_JIT_PREFETCH_DEPTH
+#define BOARD_JIT_PREFETCH_DEPTH 4
+#endif
+#if BOARD_JIT_PREFETCH
+    m68k_dispatcher_set_prefetch(&s_disp, BOARD_JIT_PREFETCH, BOARD_JIT_PREFETCH_DEPTH);
+#endif
+    ESP_LOGI(TAG, "JIT arena=%u KB evict=%d hot-threshold=%u prefetch=%d/%d",
              (unsigned)(s_disp.arena_cap / 1024), BOARD_JIT_EVICT,
-             (unsigned)BOARD_JIT_HOT_THRESHOLD);
+             (unsigned)BOARD_JIT_HOT_THRESHOLD,
+             (int)BOARD_JIT_PREFETCH, (int)BOARD_JIT_PREFETCH_DEPTH);
 #endif
 
     /* Bring up the e-ink panel on core 1: it shows the gray-scale splash
@@ -508,30 +524,69 @@ void app_main(void) {
             u64 d_instrs = s_cpu.instrs - p_instrs;
 #if BOARD_USE_JIT
             static u64 p_bc, p_bx, p_rst, p_smc, p_fb;
+            static u64 p_evict, p_byp, p_gat;
+            static u64 p_ptick, p_pcomp, p_pexec, p_pint, p_pevict;
+            static u64 p_l2r, p_l2p, p_l2e;
+            /* Compute ALL per-window deltas up front (before updating prev). */
+            u64 d_blk = s_disp.blocks_compiled - p_bc;
+            u64 d_bx  = s_disp.blocks_executed - p_bx;
+            u64 d_rst = s_disp.arena_resets - p_rst;
+            u64 d_smc = s_disp.smc_invalidations - p_smc;
+            u64 d_fb  = s_disp.interp_fallbacks - p_fb;
+            u64 d_evict = s_disp.lru_evictions - p_evict;
+            u64 d_l2r = s_disp.l2_rehydrates - p_l2r;
+            u64 d_l2p = s_disp.l2_publishes - p_l2p;
+            u64 d_l2e = s_disp.l2_evicts - p_l2e;
+            double whz = 240.0 * (double)win;            /* host cycles this window */
+            double d_tick=s_disp.prof_tick-p_ptick, d_comp=s_disp.prof_compile-p_pcomp,
+                   d_exec=s_disp.prof_exec-p_pexec, d_int=s_disp.prof_interp-p_pint,
+                   d_ev=s_disp.prof_evict-p_pevict;
+            double pc_comp=100.0*d_comp/whz, pc_ev=100.0*d_ev/whz, pc_exec=100.0*d_exec/whz,
+                   pc_int=100.0*d_int/whz, pc_tick=100.0*d_tick/whz;
             ESP_LOGI(TAG, "t=%llds cyc=%llu pc=0x%06" PRIX32 " %.3f MHz | "
                      "blk %llu/%llu rst %llu smc %llu fb %llu steps %llu | "
-                     "sd %llurd %llutxn %lluKB %lldms(%.0f%%)",
+                     "sd %llurd %lluKB %lldms",
                      (long long)((now - t0) / 1000000),
                      (unsigned long long)s_cpu.cycles, s_cpu.pc, mhz,
-                     (unsigned long long)(s_disp.blocks_compiled - p_bc),
-                     (unsigned long long)(s_disp.blocks_executed - p_bx),
-                     (unsigned long long)(s_disp.arena_resets - p_rst),
-                     (unsigned long long)(s_disp.smc_invalidations - p_smc),
-                     (unsigned long long)(s_disp.interp_fallbacks - p_fb),
-                     (unsigned long long)d_instrs,
+                     (unsigned long long)d_blk, (unsigned long long)d_bx,
+                     (unsigned long long)d_rst, (unsigned long long)d_smc,
+                     (unsigned long long)d_fb, (unsigned long long)d_instrs,
                      (unsigned long long)(c_calls - p_calls),
-                     (unsigned long long)(c_txn - p_txn),
                      (unsigned long long)((c_bytes - p_bytes) / 1024),
-                     (long long)((c_us - p_us) / 1000),
-                     100.0 * (double)(c_us - p_us) / (double)win);
-            p_bc = s_disp.blocks_compiled; p_bx = s_disp.blocks_executed;
-            p_rst = s_disp.arena_resets;   p_smc = s_disp.smc_invalidations;
-            p_fb = s_disp.interp_fallbacks;
-            ESP_LOGI(TAG, "   smc-sample: write=0x%06" PRIX32
-                     " dropped blk[0x%06" PRIX32 "..0x%06" PRIX32 "] (in=%d)",
-                     s_disp.dbg_smc_w, s_disp.dbg_smc_pcs, s_disp.dbg_smc_pce,
-                     (s_disp.dbg_smc_w >= s_disp.dbg_smc_pcs &&
-                      s_disp.dbg_smc_w <  s_disp.dbg_smc_pce));
+                     (long long)((c_us - p_us) / 1000));
+            ESP_LOGI(TAG, "   cpu%%: compile %.0f(evict %.0f) exec %.0f interp %.0f tick %.0f | "
+                     "L2 rehy %llu pub %llu evic %llu live %llu",
+                     pc_comp, pc_ev, pc_exec, pc_int, pc_tick,
+                     (unsigned long long)d_l2r, (unsigned long long)d_l2p,
+                     (unsigned long long)d_l2e,
+                     (unsigned long long)(s_disp.l2_publishes - s_disp.l2_evicts));
+            /* WORST-PERIOD tracker — boot time is dominated by the SLOWEST
+             * windows; peak MHz is meaningless. Latch the lowest-MHz window's
+             * full profile (after a short warm-up past the cold ROM phase) and
+             * report it every heartbeat. THIS is the optimization target. */
+            static double g_worst_mhz = 1e9; static u64 g_worst_t, g_worst_cyc;
+            static double gw_comp, gw_ev, gw_exec, gw_int, gw_tick;
+            static u64 gw_blk, gw_fb, gw_rehy, gw_evict;
+            if (s_cpu.cycles > 30000000ull && mhz < g_worst_mhz) {
+                g_worst_mhz = mhz; g_worst_t = (now - t0)/1000000; g_worst_cyc = s_cpu.cycles;
+                gw_comp=pc_comp; gw_ev=pc_ev; gw_exec=pc_exec; gw_int=pc_int; gw_tick=pc_tick;
+                gw_blk=d_blk; gw_fb=d_fb; gw_rehy=d_l2r; gw_evict=d_evict;
+            }
+            ESP_LOGI(TAG, "   WORST %.3f MHz @t=%llus cyc=%lluM | compile %.0f(evict %.0f) "
+                     "exec %.0f interp %.0f tick %.0f | blk %llu fb %llu rehy %llu evic %llu",
+                     g_worst_mhz, (unsigned long long)g_worst_t,
+                     (unsigned long long)(g_worst_cyc/1000000),
+                     gw_comp, gw_ev, gw_exec, gw_int, gw_tick,
+                     (unsigned long long)gw_blk, (unsigned long long)gw_fb,
+                     (unsigned long long)gw_rehy, (unsigned long long)gw_evict);
+            /* Update prev-counters for next window. */
+            p_bc=s_disp.blocks_compiled; p_bx=s_disp.blocks_executed;
+            p_rst=s_disp.arena_resets; p_smc=s_disp.smc_invalidations; p_fb=s_disp.interp_fallbacks;
+            p_evict=s_disp.lru_evictions; p_byp=s_disp.hot_bypass; p_gat=s_disp.hot_gated;
+            p_ptick=s_disp.prof_tick; p_pcomp=s_disp.prof_compile; p_pexec=s_disp.prof_exec;
+            p_pint=s_disp.prof_interp; p_pevict=s_disp.prof_evict;
+            p_l2r=s_disp.l2_rehydrates; p_l2p=s_disp.l2_publishes; p_l2e=s_disp.l2_evicts;
+            (void)p_byp; (void)p_gat;
 #else
             ESP_LOGI(TAG, "t=%llds cyc=%llu pc=0x%06" PRIX32 " %.3f MHz | "
                      "steps %llu | sd %llurd %llutxn %lluKB %lldms(%.0f%%)",
