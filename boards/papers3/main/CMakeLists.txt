@@ -1,37 +1,26 @@
 # Repo root = this file's dir up three levels (main -> papers3 -> boards -> repo).
 get_filename_component(MAC68K_ROOT "${CMAKE_CURRENT_LIST_DIR}/../../.." ABSOLUTE)
 
+# E-paper driver. Default = the custom internal-SRAM 1bpp driver (epd_panel.c +
+# eink.c), purpose-built for this emulator (21 KB internal-SRAM fb, fast localized
+# refresh, ~10 MHz emu during motion). The FastEPD glue (eink_fastepd.cpp) is
+# always compiled and FastEPD is always a requirement, so toggling the
+# -DBOARD_USE_FASTEPD compile option never changes the component graph; when the
+# option is OFF the glue is an empty TU and FastEPD is GC'd from the image.
 idf_component_register(
     SRCS
-        "app_main.c"
-        "sd_disk.c"
-        "uart_ctl.c"
-        "eink.c"
-        "epd_panel.c"
-        "eink_fastepd.cpp"
-        "battery.c"
-        "touch.c"
+        "app_main.c" "sd_disk.c" "uart_ctl.c"
+        "eink.c" "epd_panel.c" "eink_fastepd.cpp"
+        "battery.c" "touch.c"
     INCLUDE_DIRS "."
     PRIV_REQUIRES
-        mac68k
-        esp_timer
-        fatfs
-        sdmmc
-        esp_driver_sdspi
-        esp_driver_spi
-        esp_driver_usb_serial_jtag
-        esp_driver_gpio
-        # Battery voltage (ADC1) + charge-status GPIO (battery.c).
-        esp_adc
-        # GT911 capacitive touch -> Mac mouse (touch.c).
-        esp_driver_i2c
-        # E-ink panel: LCD i80 bus driver + bit-banged gate (epd_panel.c).
-        esp_lcd
-        # JPEG splash decoder (managed component, see idf_component.yml).
-        esp_jpeg
-        # FastEPD e-paper driver (third_party/FastEPD submodule) — replaces the
-        # custom epd_panel.c. C++ component; used via a C++ glue TU.
-        FastEPD
+        mac68k esp_timer fatfs sdmmc
+        esp_driver_sdspi esp_driver_spi esp_driver_usb_serial_jtag esp_driver_gpio
+        esp_adc            # battery (battery.c)
+        esp_driver_i2c     # GT911 touch (touch.c)
+        esp_lcd            # e-ink i80 bus (epd_panel.c / FastEPD)
+        esp_jpeg           # JPEG splash (managed component)
+        FastEPD            # optional driver, -DBOARD_USE_FASTEPD=1 (eink_fastepd.cpp)
     # Bake the 128 KB Mac Plus ROM into the firmware image so it loads from
     # internal flash (no SD read, always present). Exposed as the symbols
     # _binary_MacPlus_ROM_start / _binary_MacPlus_ROM_end.
@@ -48,7 +37,7 @@ foreach(opt
         BOARD_JIT_PREFETCH BOARD_JIT_PREFETCH_DEPTH BOARD_JIT_COMPILE_BUDGET BOARD_NO_EINK BOARD_NO_TOUCH
         BOARD_HD_INSERT_CYCLE BOARD_EINK_ROT_CW BOARD_EINK_DRIVE_FIELDS BOARD_EINK_MAX_FPS
         BOARD_EINK_HOLD_DRIVE BOARD_EINK_HOLD_STATIC_STOP
-        BOARD_FASTEPD_SPIKE
+        BOARD_USE_FASTEPD
         BOARD_TOUCH_FLIP_X BOARD_TOUCH_FLIP_Y BOARD_TOUCH_SENS_X10
         BOARD_SD_CLK BOARD_SD_MOSI BOARD_SD_MISO BOARD_SD_CS)
     if(DEFINED ${opt})

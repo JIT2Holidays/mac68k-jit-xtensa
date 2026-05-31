@@ -582,11 +582,13 @@ void app_main(void) {
      * (reading the SD card before the guest does), then scans out the guest
      * framebuffer with fast local refreshes. Blocks only until the splash is
      * drawn; the framebuffer loop keeps running on the second core. */
-#if defined(BOARD_FASTEPD_SPIKE) && BOARD_FASTEPD_SPIKE
-    /* Step-2 spike: bring up the FastEPD path instead of the legacy eink driver,
-     * so FastEPD (not epd_panel.c) owns the i80 bus. The old eink_task is not
-     * started, so there is no double bus claim. */
-    eink_fastepd_bringup();
+#if defined(BOARD_USE_FASTEPD) && BOARD_USE_FASTEPD
+    /* Optional FastEPD driver (-DBOARD_USE_FASTEPD=1): FastEPD owns the i80 bus
+     * and renders the guest fb via its native partial/full updates. The legacy
+     * eink_task is not started, so there is no double bus claim. NOTE: heavier
+     * on the PSRAM bus than the default driver (full-panel diff) — see
+     * eink_fastepd.cpp / the migration notes. */
+    eink_fastepd_start(&s_mem, &s_cpu, BOARD_USE_JIT ? "JIT" : "INT");
 #elif !defined(BOARD_NO_EINK) || !BOARD_NO_EINK
     eink_start(&s_mem, &s_cpu, BOARD_USE_JIT ? "JIT" : "INT");
 #endif

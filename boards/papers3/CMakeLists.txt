@@ -4,8 +4,12 @@ cmake_minimum_required(VERSION 3.16)
 get_filename_component(MAC68K_ROOT "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
 
 set(EXTRA_COMPONENT_DIRS "${CMAKE_CURRENT_LIST_DIR}/components")
-# FastEPD e-paper driver (submodule). Point at the component dir itself, not the
-# third_party/ parent (which also holds the non-IDF minivmac submodule).
+# FastEPD e-paper driver (submodule) — always registered so toggling the
+# -DBOARD_USE_FASTEPD compile option never changes the component dependency
+# graph (which IDF caches and gets stale on an existing build dir). When the
+# option is OFF, the glue TU (eink_fastepd.cpp) is empty and the linker
+# garbage-collects all FastEPD code from the image. Point at the component dir
+# itself, not the third_party/ parent (which also holds the non-IDF minivmac).
 list(APPEND EXTRA_COMPONENT_DIRS "${MAC68K_ROOT}/third_party/FastEPD")
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
