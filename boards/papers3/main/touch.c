@@ -8,6 +8,7 @@
 #include "board_papers3.h"
 #include "mac_mem.h"
 #include "mac_input.h"
+#include "eink.h"        /* eink_request_global_refresh() — status-bar tap */
 
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
@@ -131,6 +132,12 @@ static inline bool in_button(int x, int y) {
     return dx * dx + dy * dy <= BOARD_BTN_R * BOARD_BTN_R;
 }
 
+/* Status bar = the bottom edge of the visible canvas (eink.c draws it in the
+ * last STAT_BAND=GLYPH_W*TEXT_SCALE+8=24 px; use a slightly taller, touch-
+ * friendly zone). A tap here requests a full panel refresh. */
+#define STATUSBAR_TOUCH_PX 48
+static inline bool in_statusbar(int y) { return y >= VIS_H - STATUSBAR_TOUCH_PX; }
+
 static void touch_task(void *arg) {
     (void)arg;
     if (!gt911_init()) vTaskDelete(NULL);
@@ -139,18 +146,23 @@ static void touch_task(void *arg) {
     const float sens = BOARD_TOUCH_SENS_X10 / 10.0f;
     bool have_pad = false;
     int prev_px = 0, prev_py = 0;
+    bool sb_prev = false;            /* status-bar touch latch (edge-triggered) */
 
     for (;;) {
         int vx[5], vy[5];
         int n = gt911_points(vx, vy, 5);
 
         if (n >= 0) {                 /* fresh sample (n==0 means lifted) */
-            bool btn = false;
+            bool btn = false, sb = false;
             int pad = -1;
             for (int i = 0; i < n; i++) {
                 if (in_button(vx[i], vy[i])) btn = true;
+                else if (in_statusbar(vy[i])) sb = true;   /* not a pad finger */
                 else if (pad < 0) pad = i;   /* first pad finger drives motion */
             }
+            /* Edge-trigger one global refresh per status-bar tap. */
+            if (sb && !sb_prev) eink_request_global_refresh();
+            sb_prev = sb;
             if (pad >= 0) {
                 if (have_pad) {
                     cx += (vx[pad] - prev_px) * sens;
