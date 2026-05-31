@@ -1,7 +1,7 @@
 #ifndef M68K_CPU_H
 #define M68K_CPU_H
 
-#include "m68k_types.h"
+#include "m68k_types.h"   /* defines M68K_HOT (IRAM on ESP, no-op on host) */
 
 /* Condition code register bits (low byte of SR). */
 #define CCR_C 0x01u
@@ -83,6 +83,14 @@ typedef struct m68k_cpu {
      * Indexed by literal_id (jit/codegen.h); sized with headroom. Kept within
      * 1020 bytes of the struct base so the l32i offset is in range. */
     u32 jit_lit[48];
+
+    /* Instruction-fetch page cache: the host pointer for the 4 KB guest-code
+     * page containing the PC, so sequential fetches skip the region decode.
+     * Reads live memory, so it's self-modifying-code-safe; invalidated only by
+     * an overlay change (re-checked via fetch_overlay). fetch_page = ~0 = empty. */
+    u32 fetch_page;
+    const u8 *fetch_host;
+    bool fetch_overlay;
 
     struct mac_mem *mem;
 } m68k_cpu;

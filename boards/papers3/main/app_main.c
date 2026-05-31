@@ -87,9 +87,12 @@ extern const u8 macplus_rom_end[]   asm("_binary_MacPlus_ROM_end");
 
 /* JIT code-cache arena (IRAM, executable). Far smaller than the host's
  * 1 MB default — IRAM is scarce — so we run with LRU eviction and let cold
- * blocks recompile. Override with -DBOARD_JIT_ARENA_KB=<n>. */
+ * blocks recompile (cheap L2 rehydrate from PSRAM). 60 KB is the most that
+ * coexists with the e-ink driver's ~129 KB of internal-SRAM display state
+ * (they share the unified SRAM that backs IRAM); larger fails JIT init.
+ * Override with -DBOARD_JIT_ARENA_KB=<n>. */
 #ifndef BOARD_JIT_ARENA_KB
-#define BOARD_JIT_ARENA_KB 96u
+#define BOARD_JIT_ARENA_KB 60u
 #endif
 
 /* Code-cache eviction policy: CC_MODE_BUMP=0, CC_MODE_LRU=1, CC_MODE_FIFO=2,
@@ -128,6 +131,79 @@ static bool           s_hd_open;
 
 /* The guest's debug serial port goes to the UART console. */
 static void serial_sink(void *ctx, u8 b) { (void)ctx; putchar((int)b); }
+
+/* --- accurate worst-case throughput sampler ---------------------------
+ * The 3 s heartbeat AVERAGES its window, so brief sub-second throughput dips
+ * (a burst of compile/evict/rehydrate) are hidden — yet those are the true
+ * worst case (and what the e-ink MHz readout, sampled every 0.5 s, shows).
+ * A periodic esp_timer fires from its own high-priority task context, so it
+ * preempts the run loop and samples cpu->cycles mid-chunk, capturing the real
+ * instantaneous effective clock. This is the metric the perf goal targets. */
+#define WORST_SAMPLE_US 200000ll          /* 200 ms — finer than the e-ink's 0.5 s */
+static volatile double   g_inst_min_mhz = 1e30;   /* CPU-bound worst (SD-I/O excluded) */
+static volatile uint64_t g_inst_min_at_cyc;
+static volatile uint32_t g_inst_min_pc;
+/* CPU-bound AVERAGE: total compute-bound guest cycles / compute-bound wall us,
+ * over all SD-excluded windows. This is the ">10 MHz compute-bound average"
+ * metric, summed rather than per-window-averaged so it weights by time. */
+static volatile uint64_t g_cb_cyc;     /* guest cycles in compute-bound windows */
+static volatile int64_t  g_cb_us;      /* compute-bound wall us                 */
+/* What the dispatcher was doing during the worst CPU-bound window (deltas). */
+static volatile u32 g_w_blk, g_w_smc, g_w_rehy, g_w_fb, g_w_evict;
+static volatile u64 g_w_tick, g_w_exec, g_w_interp;  /* host-cyc deltas in worst window */
+static esp_timer_handle_t s_worst_timer;
+static void worst_sampler_cb(void *arg) {
+    (void)arg;
+    static int64_t  last_us, last_sd_us;
+    static uint64_t last_cyc;
+    static u64 p_blk, p_smc, p_rehy, p_fb, p_evict;
+    static u64 p_ptk, p_pex, p_pin;
+    int64_t  now = esp_timer_get_time();
+    uint64_t cyc = s_cpu.cycles;          /* cross-core read; benign tear */
+    uint64_t sc, st, sb; int64_t sd_us;
+    sd_disk_stats(&sc, &st, &sb, &sd_us); /* cumulative SD-read wall time (us) */
+    if (last_us && cyc > 30000000ull) {
+        /* Per the goal, SD-I/O stalls don't count (both engines wait on the SPI
+         * bus equally). sd_disk_stats only credits SD time on read COMPLETION,
+         * so a window with an in-progress read looks compute-slow but isn't.
+         * So SKIP any window with non-trivial SD activity (>5% of wall) — only
+         * cleanly compute-bound windows count toward the CPU/JIT worst case. */
+        int64_t dt = now - last_us;
+        int64_t dsd = sd_us - last_sd_us;
+        if (dsd * 20 < dt) {                  /* < 5% SD → compute-bound window */
+            double mhz = (double)(cyc - last_cyc) / (double)(dt - dsd);
+            g_cb_cyc += (cyc - last_cyc);     /* accumulate for the avg metric */
+            g_cb_us  += (dt - dsd);
+            if (mhz < g_inst_min_mhz) {
+                g_inst_min_mhz = mhz; g_inst_min_at_cyc = cyc; g_inst_min_pc = s_cpu.pc;
+#if BOARD_USE_JIT
+                g_w_blk  = (u32)(s_disp.blocks_compiled  - p_blk);
+                g_w_smc  = (u32)((s_disp.smc_invalidations - s_disp.lru_evictions) - p_smc);
+                g_w_rehy = (u32)(s_disp.l2_rehydrates    - p_rehy);
+                g_w_fb   = (u32)(s_disp.interp_fallbacks - p_fb);
+                g_w_evict= (u32)(s_disp.lru_evictions    - p_evict);
+                g_w_tick  = s_disp.prof_tick   - p_ptk;
+                g_w_exec  = s_disp.prof_exec   - p_pex;
+                g_w_interp= s_disp.prof_interp - p_pin;
+#endif
+            }
+        }
+    }
+#if BOARD_USE_JIT
+    p_blk = s_disp.blocks_compiled;
+    p_smc = s_disp.smc_invalidations - s_disp.lru_evictions;
+    p_rehy = s_disp.l2_rehydrates; p_fb = s_disp.interp_fallbacks;
+    p_evict = s_disp.lru_evictions;
+    p_ptk = s_disp.prof_tick; p_pex = s_disp.prof_exec; p_pin = s_disp.prof_interp;
+#endif
+    last_us = now; last_cyc = cyc; last_sd_us = sd_us;
+}
+static void worst_sampler_start(void) {
+    const esp_timer_create_args_t a = { .callback = worst_sampler_cb,
+                                        .name = "worstmhz" };
+    if (esp_timer_create(&a, &s_worst_timer) == ESP_OK)
+        esp_timer_start_periodic(s_worst_timer, WORST_SAMPLE_US);
+}
 
 /* --- qemu self-test ---------------------------------------------------
  * Built when -DBOARD_QEMU_SELFTEST=1. Runs the built-in 68000 demo under
@@ -463,6 +539,18 @@ void app_main(void) {
 #if BOARD_JIT_PREFETCH
     m68k_dispatcher_set_prefetch(&s_disp, BOARD_JIT_PREFETCH, BOARD_JIT_PREFETCH_DEPTH);
 #endif
+    /* Compile/rehydrate budget per ~2M-cycle run_until chunk. Caps JIT
+     * overhead during code bursts so the worst-case effective clock stays
+     * above interpreter speed (also: during eviction thrash, interpreting a
+     * low-reuse block is cheaper than rehydrating it). 0 = unlimited. */
+    /* Token-bucket throttle: refill 1 compile token per N guest cycles
+     * (0 = off). 256 keeps the worst case at/above interpreter speed (the JIT
+     * falls back to batched interp during bursts it can't amortize) without
+     * throttling steady-state. */
+#ifndef BOARD_JIT_COMPILE_BUDGET
+#define BOARD_JIT_COMPILE_BUDGET 256u
+#endif
+    m68k_dispatcher_set_compile_budget(&s_disp, BOARD_JIT_COMPILE_BUDGET);
     ESP_LOGI(TAG, "JIT arena=%u KB evict=%d hot-threshold=%u prefetch=%d/%d",
              (unsigned)(s_disp.arena_cap / 1024), BOARD_JIT_EVICT,
              (unsigned)BOARD_JIT_HOT_THRESHOLD,
@@ -473,11 +561,18 @@ void app_main(void) {
      * (reading the SD card before the guest does), then scans out the guest
      * framebuffer with fast local refreshes. Blocks only until the splash is
      * drawn; the framebuffer loop keeps running on the second core. */
+#if !defined(BOARD_NO_EINK) || !BOARD_NO_EINK
     eink_start(&s_mem, &s_cpu, BOARD_USE_JIT ? "JIT" : "INT");
+#endif
 
     /* Touch -> Mac mouse: a GT911 polling task on core 1 maintains the cursor;
      * we push it into the guest from this (CPU) thread below. */
+#if !defined(BOARD_NO_TOUCH) || !BOARD_NO_TOUCH
     touch_start();
+#endif
+
+    /* Accurate worst-case throughput sampler (200 ms, preempting). */
+    worst_sampler_start();
 
     /* Run loop. We advance in cycle chunks so we can (a) hot-insert drive 2
      * after boot and (b) emit a periodic heartbeat. mac_mem_tick / VBL /
@@ -608,6 +703,20 @@ void app_main(void) {
                      (long long)((c_us - p_us) / 1000),
                      100.0 * (double)(c_us - p_us) / (double)win);
 #endif
+            /* TRUE worst-case: the min instantaneous (200 ms) effective clock
+             * seen by the preempting sampler — the real metric, not the 3 s
+             * window average. */
+            {
+                double wsum = (double)(g_w_tick + g_w_exec + g_w_interp);
+                if (wsum < 1.0) wsum = 1.0;
+                double cbavg = g_cb_us ? (double)g_cb_cyc / (double)g_cb_us : 0.0;
+                ESP_LOGI(TAG, "   CB-AVG %.3f MHz | INST-WORST %.3f MHz @cyc=%lluM pc=0x%06" PRIX32 " | during: blk %u smc %u rehy %u fb %u evict %u | host%%: tick=%.0f exec=%.0f interp=%.0f",
+                         cbavg, g_inst_min_mhz, (unsigned long long)(g_inst_min_at_cyc / 1000000),
+                         g_inst_min_pc, (unsigned)g_w_blk, (unsigned)g_w_smc, (unsigned)g_w_rehy,
+                         (unsigned)g_w_fb, (unsigned)g_w_evict,
+                         100.0*(double)g_w_tick/wsum, 100.0*(double)g_w_exec/wsum,
+                         100.0*(double)g_w_interp/wsum);
+            }
             p_calls = c_calls; p_txn = c_txn; p_bytes = c_bytes; p_us = c_us;
             p_instrs = s_cpu.instrs;
             last_log = now;

@@ -31,6 +31,7 @@ void mac_mem_init(mac_mem *m, u32 ram_size) {
     memset(m, 0, sizeof(*m));
     if (ram_size == 0) ram_size = MAC_RAM_SIZE_DEFAULT;
     m->ram_size = ram_size;
+    m->ram_mask = ((ram_size & (ram_size - 1u)) == 0) ? ram_size - 1u : 0u;
     m->ram = (u8 *)calloc(1, ram_size);
     m->overlay = true;
     m->fb_base = ram_size - MAC_FB_OFFSET;
@@ -88,6 +89,7 @@ bool mac_load_rom(mac_mem *m, const u8 *rom, u32 len) {
     if (!m->rom) return false;
     memcpy(m->rom, rom, len);
     m->rom_size = len;
+    m->rom_mask = ((len & (len - 1u)) == 0) ? len - 1u : 0u;
     /* Replace the ROM's .Sony floppy driver with the mini vMac stub so
      * disk I/O is served as logical sectors (see core/sony.c). */
     sony_patch_rom(m);
@@ -334,23 +336,34 @@ static void scsi_write(mac_mem *m, u32 addr, u8 v) {
 
 /* --- address decode ---------------------------------------------------- */
 
+/* Mirror an address into RAM/ROM. Power-of-two sizes (always, for real Mac
+ * RAM/ROM) use a 1-cycle AND; the modulo fallback covers exotic sizes. These
+ * are on the hottest path (every fetch + every data access), so the divide
+ * that used to be here cost ~30 cycles × several accesses per instruction. */
+static inline u32 ram_off(const mac_mem *m, u32 a) {
+    return m->ram_mask ? (a & m->ram_mask) : (a % m->ram_size);
+}
+static inline u32 rom_off(const mac_mem *m, u32 a) {
+    return m->rom_mask ? (a & m->rom_mask) : (a % m->rom_size);
+}
+
 /* Return a RAM/ROM pointer for plain-memory addresses, or NULL for MMIO. */
-static u8 *mem_ptr(mac_mem *m, u32 addr) {
+M68K_HOT static u8 *mem_ptr(mac_mem *m, u32 addr) {
     if (m->overlay) {
         /* Boot overlay: ROM at 0 and 0x400000, RAM windowed at 0x600000. */
         if (addr < 0x100000u)
-            return m->rom ? m->rom + (addr % m->rom_size) : NULL;
+            return m->rom ? m->rom + rom_off(m, addr) : NULL;
         if (addr >= MAC_ROM_BASE && addr < MAC_ROM_BASE + 0x100000u)
-            return m->rom ? m->rom + ((addr - MAC_ROM_BASE) % m->rom_size) : NULL;
+            return m->rom ? m->rom + rom_off(m, addr - MAC_ROM_BASE) : NULL;
         if (addr >= MAC_OVL_RAM_BASE && addr < MAC_OVL_RAM_BASE + 0x100000u)
-            return m->ram_size ? m->ram + ((addr - MAC_OVL_RAM_BASE) % m->ram_size)
+            return m->ram_size ? m->ram + ram_off(m, addr - MAC_OVL_RAM_BASE)
                                : NULL;
         return NULL;
     }
     if (addr < MAC_ROM_BASE)
-        return m->ram_size ? m->ram + (addr % m->ram_size) : NULL;
+        return m->ram_size ? m->ram + ram_off(m, addr) : NULL;
     if (addr >= MAC_ROM_BASE && addr < MAC_ROM_BASE + 0x100000u)
-        return m->rom ? m->rom + ((addr - MAC_ROM_BASE) % m->rom_size) : NULL;
+        return m->rom ? m->rom + rom_off(m, addr - MAC_ROM_BASE) : NULL;
     return NULL;
 }
 
@@ -370,11 +383,12 @@ static int region_of(u32 addr) {
 
 /* --- 8-bit access ------------------------------------------------------ */
 
-u8 mac_read8(mac_mem *m, u32 addr) {
+M68K_HOT u8 mac_read8(mac_mem *m, u32 addr) {
     addr &= 0xFFFFFFu;
     m->reads++;
     u8 *p = mem_ptr(m, addr);
     if (p) return *p;
+    m->mmio_ops++;
     u8 val = 0;
     switch (region_of(addr)) {
         case RGN_VIA:    val = via_read(m, addr);  break;
@@ -394,7 +408,7 @@ u8 mac_read8(mac_mem *m, u32 addr) {
     return val;
 }
 
-void mac_write8(mac_mem *m, u32 addr, u8 v) {
+M68K_HOT void mac_write8(mac_mem *m, u32 addr, u8 v) {
     addr &= 0xFFFFFFu;
     m->writes++;
     if (mac_mmio_log && !mem_ptr(m, addr)) mac_mmio_log(m, addr, v, 1, 1);
@@ -402,13 +416,13 @@ void mac_write8(mac_mem *m, u32 addr, u8 v) {
     if (m->overlay) {
         if (addr >= MAC_OVL_RAM_BASE && addr < MAC_OVL_RAM_BASE + 0x100000u
             && m->ram_size) {
-            u32 ra = (addr - MAC_OVL_RAM_BASE) % m->ram_size;
+            u32 ra = ram_off(m, addr - MAC_OVL_RAM_BASE);
             m->ram[ra] = v;
             if (mac_write_watch) mac_write_watch(mac_write_watch_ctx, ra);
             return;
         }
     } else if (addr < MAC_ROM_BASE && m->ram_size) {
-        m->ram[addr % m->ram_size] = v;
+        m->ram[ram_off(m, addr)] = v;
         if (mac_write_watch) mac_write_watch(mac_write_watch_ctx, addr);
         return;
     }
@@ -437,18 +451,18 @@ void mac_write8(mac_mem *m, u32 addr, u8 v) {
 
 /* --- 16/32-bit access (big-endian) ------------------------------------- */
 
-u16 mac_read16(mac_mem *m, u32 addr) {
+M68K_HOT u16 mac_read16(mac_mem *m, u32 addr) {
     addr &= 0xFFFFFFu;
     u8 *p = mem_ptr(m, addr);
     if (p) { m->reads += 2; return (u16)(((u16)p[0] << 8) | p[1]); }
     return (u16)(((u16)mac_read8(m, addr) << 8) | mac_read8(m, addr + 1));
 }
 
-u32 mac_read32(mac_mem *m, u32 addr) {
+M68K_HOT u32 mac_read32(mac_mem *m, u32 addr) {
     return ((u32)mac_read16(m, addr) << 16) | mac_read16(m, addr + 2);
 }
 
-void mac_write16(mac_mem *m, u32 addr, u16 v) {
+M68K_HOT void mac_write16(mac_mem *m, u32 addr, u16 v) {
     addr &= 0xFFFFFFu;
     /* The patched .Sony driver pokes the extension trap with word writes. */
     if (addr >= SONY_EXTN_BASE && addr < SONY_EXTN_BASE + 0x20u) {
@@ -459,7 +473,7 @@ void mac_write16(mac_mem *m, u32 addr, u16 v) {
     mac_write8(m, addr + 1, (u8)(v & 0xFF));
 }
 
-void mac_write32(mac_mem *m, u32 addr, u32 v) {
+M68K_HOT void mac_write32(mac_mem *m, u32 addr, u32 v) {
     mac_write16(m, addr,     (u16)(v >> 16));
     mac_write16(m, addr + 2, (u16)(v & 0xFFFF));
 }

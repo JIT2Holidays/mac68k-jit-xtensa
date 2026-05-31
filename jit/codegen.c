@@ -1873,14 +1873,21 @@ m68k_block *m68k_compile_block(codecache *cc, m68k_cpu *cpu, u32 pc,
      * — enough to fail the Mac Plus ROM's timing self-tests and leave
      * the live boot at a blank framebuffer.
      *
-     * Workaround: cap ROM blocks at 1 op so the dispatcher polls every
-     * instruction, matching the interpreter's granularity. RAM (OS,
-     * apps, benches) keeps full block size — its code paths are not
-     * cycle-tight in the same way. */
+     * Workaround: cap ROM blocks so the dispatcher polls IRQs often enough.
+     * The bound that matters is IRQ latency in *instructions* = block_cap ×
+     * chain_budget; a 1-op cap with the default 16-block chain budget gives a
+     * 16-instruction latency. But a 1-op block flushes and reloads the entire
+     * guest-register cache + R_SR on EVERY instruction (the successor's
+     * prologue re-reads what this epilogue just wrote), so memory-write-heavy
+     * ROM POST loops (e.g. the RAM-sizing movem.l fill at 0x400E82) run slower
+     * than the interpreter, which keeps that state in host registers. We keep
+     * the SAME 16-instruction IRQ latency but amortize the flush across an
+     * 8-op block: the dispatcher drops the chain budget to 2 for ROM-rooted
+     * chains (8 × 2 = 16), see enter_block(). RAM keeps full block size. */
     bool tight_irq = (pc >= MAC_ROM_BASE) ||
                      (cpu->mem && cpu->mem->overlay && cpu->mem->rom &&
                       pc < cpu->mem->rom_size);
-    u32 block_cap = tight_irq ? 1u : M68K_MAX_OPS_PER_BLOCK;
+    u32 block_cap = tight_irq ? M68K_ROM_BLOCK_CAP : M68K_MAX_OPS_PER_BLOCK;
     CG_T(_cgt);
     u16 op_word[M68K_MAX_OPS_PER_BLOCK];
     u32 op_pc  [M68K_MAX_OPS_PER_BLOCK];

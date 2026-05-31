@@ -104,6 +104,13 @@ typedef u32 (*jit_helper_addr_fn)(literal_id id, void *user);
 
 #define M68K_JIT_BLOCK_BUCKETS 2048u
 #define M68K_MAX_OPS_PER_BLOCK 64u
+/* Boot-ROM block op cap. ROM POST is IRQ-latency sensitive; the dispatcher
+ * bounds latency as block_cap × chain_budget instructions. Paired with a
+ * chain budget of 2 for ROM-rooted chains (see enter_block) this keeps the
+ * 16-instruction latency a 1-op cap gave while amortizing the per-block
+ * register-cache flush over 8 ops — see m68k_compile_block. */
+#define M68K_ROM_BLOCK_CAP     8u
+#define M68K_JIT_ROM_CHAIN_BUDGET 2u
 
 typedef struct m68k_block {
     u32  pc_start;

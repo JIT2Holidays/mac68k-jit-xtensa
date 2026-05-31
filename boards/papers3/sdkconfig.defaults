@@ -44,3 +44,7 @@ CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 # "InfiniteHD6.dsk" that are not 8.3-compliant.
 CONFIG_FATFS_LFN_HEAP=y
 CONFIG_FATFS_MAX_LFN=255
+
+# Larger instruction cache: the 68k interpreter's hot decode/dispatch path
+# exceeds 16 KB and thrashes the I-cache when run from flash. 32 KB cuts misses.
+CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y

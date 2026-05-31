@@ -49,6 +49,7 @@ void m68k_sync_sp(m68k_cpu *cpu, bool was_super) {
 
 void m68k_reset(m68k_cpu *cpu, struct mac_mem *mem) {
     memset(cpu, 0, sizeof(*cpu));
+    cpu->fetch_page = 0xFFFFFFFFu;   /* empty fetch-page cache */
     cpu->mem = mem;
     if (mem) mem->cpu = cpu;
     cpu->sr = 0x2700;           /* supervisor, interrupts masked at 7 */
@@ -62,13 +63,37 @@ void m68k_reset(m68k_cpu *cpu, struct mac_mem *mem) {
 
 /* ---- instruction stream fetch ---------------------------------------- */
 
+/* Resolve+cache the code page for `pc` (24-bit). Returns the host pointer to
+ * `pc`, or NULL if it's not plain RAM/ROM (code never executes from MMIO). */
+static inline const u8 *fetch_resolve(m68k_cpu *cpu, u32 pc) {
+    const u8 *hp = mac_ptr_fast(cpu->mem, pc);
+    if (hp) {
+        cpu->fetch_page    = pc & ~0xFFFu;
+        cpu->fetch_host    = hp - (pc & 0xFFFu);
+        cpu->fetch_overlay = cpu->mem->overlay;
+    }
+    return hp;
+}
 static inline u16 fetch16(m68k_cpu *cpu) {
-    u16 w = mac_read16(cpu->mem, cpu->pc);
+    u32 pc = cpu->pc & 0xFFFFFFu;
+    const u8 *p;
+    if ((pc & ~0xFFFu) == cpu->fetch_page && cpu->fetch_overlay == cpu->mem->overlay)
+        p = cpu->fetch_host + (pc & 0xFFFu);          /* page hit: direct, no decode */
+    else if ((p = fetch_resolve(cpu, pc)) == NULL) {  /* MMIO (unusual for code) */
+        u16 w = mac_read16_fast(cpu->mem, cpu->pc); cpu->pc += 2; return w;
+    }
     cpu->pc += 2;
-    return w;
+    return (u16)(((u16)p[0] << 8) | p[1]);
 }
 static inline u32 fetch32(m68k_cpu *cpu) {
-    u32 v = mac_read32(cpu->mem, cpu->pc);
+    u32 pc = cpu->pc & 0xFFFFFFu;
+    if ((pc & 0xFFFu) <= 0xFFCu &&                    /* 4 bytes within one page */
+        (pc & ~0xFFFu) == cpu->fetch_page && cpu->fetch_overlay == cpu->mem->overlay) {
+        const u8 *p = cpu->fetch_host + (pc & 0xFFFu);
+        cpu->pc += 4;
+        return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3];
+    }
+    u32 v = mac_read32_fast(cpu->mem, cpu->pc);
     cpu->pc += 4;
     return v;
 }
@@ -86,7 +111,7 @@ typedef struct {
 
 /* Resolve the brief-format index displacement used by modes (d8,An,Xn)
  * and (d8,PC,Xn). */
-static u32 brief_index(m68k_cpu *cpu, u32 base) {
+__attribute__((always_inline)) static inline u32 brief_index(m68k_cpu *cpu, u32 base) {
     u16 ext = fetch16(cpu);
     int ireg = (ext >> 12) & 7;
     u32 ival = (ext & 0x8000) ? cpu->a[ireg] : cpu->d[ireg];
@@ -97,7 +122,7 @@ static u32 brief_index(m68k_cpu *cpu, u32 base) {
 
 /* Decode an effective address. Consumes extension words and applies the
  * (An)+ / -(An) side effects. `sz` is the operand size in bytes. */
-static ea_t ea_decode(m68k_cpu *cpu, int mode, int reg, int sz) {
+__attribute__((always_inline)) static inline ea_t ea_decode(m68k_cpu *cpu, int mode, int reg, int sz) {
     ea_t e;
     e.kind = EA_MEM; e.reg = reg; e.addr = 0; e.imm = 0;
     switch (mode) {
@@ -154,19 +179,19 @@ static ea_t ea_decode(m68k_cpu *cpu, int mode, int reg, int sz) {
     return e;
 }
 
-static u32 ea_read(m68k_cpu *cpu, const ea_t *e, int sz) {
+__attribute__((always_inline)) static inline u32 ea_read(m68k_cpu *cpu, const ea_t *e, int sz) {
     switch (e->kind) {
         case EA_DREG: return cpu->d[e->reg] & size_mask(sz);
         case EA_AREG: return cpu->a[e->reg] & size_mask(sz);
         case EA_IMM:  return e->imm & size_mask(sz);
         default:
-            if (sz == 1) return mac_read8(cpu->mem, e->addr);
-            if (sz == 2) return mac_read16(cpu->mem, e->addr);
-            return mac_read32(cpu->mem, e->addr);
+            if (sz == 1) return mac_read8_fast(cpu->mem, e->addr);
+            if (sz == 2) return mac_read16_fast(cpu->mem, e->addr);
+            return mac_read32_fast(cpu->mem, e->addr);
     }
 }
 
-static void ea_write(m68k_cpu *cpu, const ea_t *e, int sz, u32 v) {
+__attribute__((always_inline)) static inline void ea_write(m68k_cpu *cpu, const ea_t *e, int sz, u32 v) {
     switch (e->kind) {
         case EA_DREG: {
             u32 m = size_mask(sz);
@@ -179,9 +204,9 @@ static void ea_write(m68k_cpu *cpu, const ea_t *e, int sz, u32 v) {
         case EA_IMM:
             return;                       /* not writable */
         default:
-            if (sz == 1)      mac_write8(cpu->mem, e->addr, (u8)v);
-            else if (sz == 2) mac_write16(cpu->mem, e->addr, (u16)v);
-            else              mac_write32(cpu->mem, e->addr, v);
+            if (sz == 1)      mac_write8_fast(cpu->mem, e->addr, (u8)v);
+            else if (sz == 2) mac_write16_fast(cpu->mem, e->addr, (u16)v);
+            else              mac_write32_fast(cpu->mem, e->addr, v);
             return;
     }
 }
@@ -207,14 +232,14 @@ static void set_nz(m68k_cpu *cpu, int sz, u32 res) {
 }
 
 /* Logic ops: N,Z from result; V,C cleared; X untouched. */
-static void set_flags_logic(m68k_cpu *cpu, int sz, u32 res) {
+__attribute__((always_inline)) static inline void set_flags_logic(m68k_cpu *cpu, int sz, u32 res) {
     u8 c = m68k_get_ccr(cpu) & CCR_X;
     if ((res & size_mask(sz)) == 0) c |= CCR_Z;
     if (res & size_msb(sz)) c |= CCR_N;
     m68k_set_ccr(cpu, c);
 }
 
-static void set_flags_add(m68k_cpu *cpu, int sz, u32 s, u32 d, u32 r) {
+__attribute__((always_inline)) static inline void set_flags_add(m68k_cpu *cpu, int sz, u32 s, u32 d, u32 r) {
     u32 mask = size_mask(sz), msb = size_msb(sz);
     s &= mask; d &= mask; r &= mask;
     u8 c = 0;
@@ -226,7 +251,7 @@ static void set_flags_add(m68k_cpu *cpu, int sz, u32 s, u32 d, u32 r) {
     m68k_set_ccr(cpu, c);
 }
 
-static void set_flags_sub(m68k_cpu *cpu, int sz, u32 s, u32 d, u32 r) {
+__attribute__((always_inline)) static inline void set_flags_sub(m68k_cpu *cpu, int sz, u32 s, u32 d, u32 r) {
     u32 mask = size_mask(sz), msb = size_msb(sz);
     s &= mask; d &= mask; r &= mask;
     u8 c = 0;
@@ -238,7 +263,7 @@ static void set_flags_sub(m68k_cpu *cpu, int sz, u32 s, u32 d, u32 r) {
 }
 
 /* CMP: like SUB but leaves X alone and discards the result. */
-static void set_flags_cmp(m68k_cpu *cpu, int sz, u32 s, u32 d, u32 r) {
+__attribute__((always_inline)) static inline void set_flags_cmp(m68k_cpu *cpu, int sz, u32 s, u32 d, u32 r) {
     u32 mask = size_mask(sz), msb = size_msb(sz);
     s &= mask; d &= mask; r &= mask;
     u8 c = m68k_get_ccr(cpu) & CCR_X;
@@ -312,7 +337,7 @@ static u8 bcd_nbcd(m68k_cpu *cpu, u8 dst) {
 
 /* ---- condition codes -------------------------------------------------- */
 
-static bool cond_true(m68k_cpu *cpu, int cc) {
+__attribute__((always_inline)) static inline bool cond_true(m68k_cpu *cpu, int cc) {
     u8 f = m68k_get_ccr(cpu);
     bool C = f & CCR_C, V = f & CCR_V, Z = f & CCR_Z, N = f & CCR_N;
     switch (cc) {
@@ -1230,11 +1255,9 @@ void m68k_jit_move_l_postinc_to_dn_mmio(m68k_cpu *cpu) {
     m68k_set_ccr(cpu, ccr);
 }
 
-void m68k_step(m68k_cpu *cpu) {
+M68K_HOT void m68k_step(m68k_cpu *cpu) {
     /* Once the CPU has halted (e.g. the guest wrote the debug exit port),
-     * further steps are no-ops. This keeps a JIT block — which may contain
-     * instructions after the halting one — from diverging from the
-     * interpreter's run loop, which stops the instant `halted` is set. */
+     * further steps are no-ops. */
     if (cpu->halted) return;
     cpu->instrs++;
     u32 op_pc = cpu->pc;
@@ -2162,6 +2185,16 @@ m68k_decoded m68k_decode_at(m68k_cpu *cpu, u32 pc) {
 
 /* ---- run loop --------------------------------------------------------- */
 
+/* Guest cycles to run between peripheral service points. mac_mem_tick /
+ * poll / sony cost ~as much as a whole instruction, so calling them per
+ * instruction was ~20-30% pure overhead. The VIA timers and VBL accumulate by
+ * ELAPSED cycles (mac_mem_tick uses cycles - last_cycle and a catch-up loop),
+ * so servicing every N cycles is exact; the only cost is bounding IRQ delivery
+ * latency to ~N guest cycles, which the guest tolerates (well under the JIT's
+ * 16-block chain budget). */
+#ifndef M68K_TICK_BATCH
+#define M68K_TICK_BATCH 256u
+#endif
 void m68k_run_until(m68k_cpu *cpu, u64 until) {
     while (cpu->cycles < until && !cpu->halted) {
         mac_mem_tick(cpu->mem, cpu->cycles);
@@ -2175,6 +2208,13 @@ void m68k_run_until(m68k_cpu *cpu, u64 until) {
             cpu->cycles += 64;
             continue;
         }
-        m68k_step(cpu);
+        /* Run a batch of instructions before re-servicing peripherals. No
+         * external IRQ can be raised mid-batch (only mac_mem_tick/sony, which
+         * run at batch boundaries), so this is safe. */
+        u64 batch_end = cpu->cycles + M68K_TICK_BATCH;
+        if (batch_end > until) batch_end = until;
+        do {
+            m68k_step(cpu);
+        } while (cpu->cycles < batch_end && !cpu->halted && !cpu->stopped);
     }
 }

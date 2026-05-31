@@ -164,6 +164,12 @@ typedef struct mac_mem {
     u32  ram_size;
     u8  *rom;
     u32  rom_size;
+    /* size-1 when the size is a power of two (always, for real Mac RAM/ROM), so
+     * address mirroring is a 1-cycle AND instead of a ~30-cycle runtime modulo
+     * on every memory access. 0 = not power-of-two, fall back to %. */
+    u32  ram_mask;
+    u32  rom_mask;
+    u64  mmio_ops;     /* diagnostic: count of MMIO (non-RAM/ROM) accesses */
     bool overlay;
 
     via6522  via;
@@ -225,6 +231,84 @@ u32 mac_read32(mac_mem *m, u32 addr);
 void mac_write8 (mac_mem *m, u32 addr, u8  v);
 void mac_write16(mac_mem *m, u32 addr, u16 v);
 void mac_write32(mac_mem *m, u32 addr, u32 v);
+
+/* Inline fast-path accessors for the interpreter's hot loop: resolve the
+ * RAM/ROM host pointer inline (the overwhelmingly common case) and read/write
+ * directly, falling back to the out-of-line MMIO-aware functions only when the
+ * address isn't plain memory. This removes a function call + the region decode
+ * from every opcode fetch, operand fetch and data access. */
+static inline u8 *mac_ptr_fast(const mac_mem *m, u32 addr) {
+    if (!m->overlay) {
+        if (addr < MAC_ROM_BASE)
+            return m->ram_size ? m->ram + (m->ram_mask ? (addr & m->ram_mask)
+                                                        : (addr % m->ram_size)) : 0;
+        if (addr < MAC_ROM_BASE + 0x100000u)
+            return m->rom ? m->rom + (m->rom_mask ? ((addr - MAC_ROM_BASE) & m->rom_mask)
+                                                   : ((addr - MAC_ROM_BASE) % m->rom_size)) : 0;
+        return 0;   /* MMIO */
+    }
+    if (addr < 0x100000u)
+        return m->rom ? m->rom + (m->rom_mask ? (addr & m->rom_mask)
+                                              : (addr % m->rom_size)) : 0;
+    if (addr >= MAC_OVL_RAM_BASE && addr < MAC_OVL_RAM_BASE + 0x100000u && m->ram_size)
+        return m->ram + (m->ram_mask ? ((addr - MAC_OVL_RAM_BASE) & m->ram_mask)
+                                     : ((addr - MAC_OVL_RAM_BASE) % m->ram_size));
+    if (addr >= MAC_ROM_BASE && addr < MAC_ROM_BASE + 0x100000u)
+        return m->rom ? m->rom + (m->rom_mask ? ((addr - MAC_ROM_BASE) & m->rom_mask)
+                                              : ((addr - MAC_ROM_BASE) % m->rom_size)) : 0;
+    return 0;
+}
+static inline u16 mac_read16_fast(mac_mem *m, u32 addr) {
+    addr &= 0xFFFFFFu;
+    const u8 *p = mac_ptr_fast(m, addr);
+    if (p) return (u16)(((u16)p[0] << 8) | p[1]);
+    return mac_read16(m, addr);
+}
+static inline u32 mac_read32_fast(mac_mem *m, u32 addr) {
+    addr &= 0xFFFFFFu;
+    const u8 *p = mac_ptr_fast(m, addr);
+    if (p) return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3];
+    return mac_read32(m, addr);
+}
+static inline u8 mac_read8_fast(mac_mem *m, u32 addr) {
+    addr &= 0xFFFFFFu;
+    const u8 *p = mac_ptr_fast(m, addr);
+    if (p) return *p;
+    return mac_read8(m, addr);
+}
+/* Writable-RAM host pointer, or NULL (ROM / MMIO / write-watcher active). The
+ * write-watcher (JIT SMC tracking) must see every RAM write, so when it's
+ * registered (JIT builds) we force the slow path; on the interpreter build it's
+ * NULL and the branch predicts away. */
+extern void (*mac_write_watch)(void *ctx, u32 addr);
+static inline u8 *mac_ram_wptr(const mac_mem *m, u32 addr) {
+    if (mac_write_watch) return 0;
+    if (!m->overlay)
+        return (addr < MAC_ROM_BASE && m->ram_size)
+                   ? m->ram + (m->ram_mask ? (addr & m->ram_mask) : (addr % m->ram_size)) : 0;
+    if (addr >= MAC_OVL_RAM_BASE && addr < MAC_OVL_RAM_BASE + 0x100000u && m->ram_size)
+        return m->ram + (m->ram_mask ? ((addr - MAC_OVL_RAM_BASE) & m->ram_mask)
+                                     : ((addr - MAC_OVL_RAM_BASE) % m->ram_size));
+    return 0;
+}
+static inline void mac_write16_fast(mac_mem *m, u32 addr, u16 v) {
+    addr &= 0xFFFFFFu;
+    u8 *p = mac_ram_wptr(m, addr);
+    if (p) { p[0] = (u8)(v >> 8); p[1] = (u8)v; return; }
+    mac_write16(m, addr, v);
+}
+static inline void mac_write32_fast(mac_mem *m, u32 addr, u32 v) {
+    addr &= 0xFFFFFFu;
+    u8 *p = mac_ram_wptr(m, addr);
+    if (p) { p[0]=(u8)(v>>24); p[1]=(u8)(v>>16); p[2]=(u8)(v>>8); p[3]=(u8)v; return; }
+    mac_write32(m, addr, v);
+}
+static inline void mac_write8_fast(mac_mem *m, u32 addr, u8 v) {
+    addr &= 0xFFFFFFu;
+    u8 *p = mac_ram_wptr(m, addr);
+    if (p) { *p = v; return; }
+    mac_write8(m, addr, v);
+}
 
 void mac_mem_tick(mac_mem *m, u64 cycles);
 

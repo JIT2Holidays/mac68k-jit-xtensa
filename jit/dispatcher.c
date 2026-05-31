@@ -826,7 +826,18 @@ static void enter_block(m68k_dispatcher *d, m68k_block *b, u32 start_off) {
      * falls through to FALLBACK when budget==0. */
     d->cpu->chain_budget = 0;
 #else
-    d->cpu->chain_budget = M68K_JIT_CHAIN_BUDGET;
+    /* ROM-rooted chains use a smaller budget: ROM blocks are capped at
+     * M68K_ROM_BLOCK_CAP (8) ops for IRQ-latency, so a budget of 2 keeps the
+     * worst-case latency at the SAME 16 instructions a 1-op/16-budget cap gave,
+     * while letting each block amortize its register-cache flush over 8 ops.
+     * Mirror codegen's tight_irq test exactly (incl. the low-mem boot overlay)
+     * so every capped block also gets the reduced budget. */
+    m68k_cpu *bc = d->cpu;
+    bool rom_block = (b->pc_start >= MAC_ROM_BASE) ||
+                     (bc->mem && bc->mem->overlay && bc->mem->rom &&
+                      b->pc_start < bc->mem->rom_size);
+    d->cpu->chain_budget = rom_block ? M68K_JIT_ROM_CHAIN_BUDGET
+                                     : M68K_JIT_CHAIN_BUDGET;
 #endif
     m68k_enter_block(b->code + start_off, d->cpu);
 }
@@ -1024,6 +1035,9 @@ static m68k_block *get_block_impl(m68k_dispatcher *d, u32 pc,
             d->inline_ops_total += b->inline_ops;
             d->helper_ops_total += b->helper_ops;
         }
+        /* Charge this compile/rehydrate one token (a find_block hit returned
+         * earlier and is free — it costs no JIT overhead). */
+        if (d->token_div) d->compile_tokens--;
         if (prefetching) d->prefetch_compiles++;
     }
 
@@ -1071,6 +1085,14 @@ void m68k_dispatcher_set_prefetch(m68k_dispatcher *d, u8 mode, u8 depth) {
     d->prefetch_depth = depth ? depth : 2;
 }
 
+void m68k_dispatcher_set_compile_budget(m68k_dispatcher *d, u32 token_div) {
+    d->token_div = token_div;                 /* guest cycles per compile token */
+    d->token_max = 32;                        /* burst allowance (small → tiny pre-throttle dip) */
+    d->compile_tokens = d->token_max;
+    d->token_acc = 0;
+    d->token_last_cyc = d->cpu ? d->cpu->cycles : 0;
+}
+
 void m68k_dispatcher_set_compile_threshold(m68k_dispatcher *d, u32 n) {
     /* One byte per guest instruction slot. 2 M slots (2 MB) covers the full
      * 4 MB RAM pc-space (pc>>1 < 0x200000) with no aliasing — that's where
@@ -1105,12 +1127,26 @@ void m68k_dispatcher_run_until(m68k_dispatcher *d, u64 until) {
     m68k_cpu *cpu = d->cpu;
     m68k_block *prev = NULL;
     jit_refill_literals(d);
+    d->token_last_cyc = cpu->cycles;             /* token bucket resyncs at chunk entry */
 
     while (cpu->cycles < until && !cpu->halted) {
         { PROF_T0(); mac_mem_tick(cpu->mem, cpu->cycles); PROF_ADD(prof_tick); }
         if (m68k_poll_interrupts(cpu)) { prev = NULL; continue; }
         if (sony_service(cpu)) { prev = NULL; continue; }
         if (cpu->stopped) { cpu->cycles += 64; continue; }
+
+        /* Refill the compile token bucket by guest cycles advanced since last
+         * iteration (see the struct comment). Cheap: the while-loop body runs
+         * only when a full token's worth of cycles has accrued. */
+        if (d->token_div) {
+            d->token_acc += (u32)(cpu->cycles - d->token_last_cyc);
+            d->token_last_cyc = cpu->cycles;
+            while (d->token_acc >= d->token_div) {
+                d->token_acc -= d->token_div;
+                if (d->compile_tokens < d->token_max) d->compile_tokens++;
+                else { d->token_acc %= d->token_div; break; }
+            }
+        }
 
         u32 pc = cpu->pc;
         m68k_block *b;
@@ -1137,8 +1173,25 @@ void m68k_dispatcher_run_until(m68k_dispatcher *d, u64 until) {
                 !find_block(d, pc)) {
                 u32 hi = (pc >> 1) & d->hotness_mask;
                 if (d->hotness[hi] < d->compile_threshold) {
+                    /* Cold block (not yet hot enough to compile): interpret a
+                     * small BATCH via m68k_run_until — which services its own
+                     * tick/poll/sony in a tight loop at full INTERP SPEED —
+                     * rather than single-stepping through the whole dispatcher
+                     * (find_block + tick + poll + sony per instruction), which
+                     * is far slower and was the JIT's compute-bound worst case
+                     * during new-code bursts. One hotness tick per batch: run-
+                     * once code stays interpreted (never compiles); a genuinely
+                     * hot loop earns `threshold` ticks and graduates to compile.
+                     * Result: the JIT's interpretation is never slower than the
+                     * pure interpreter. */
                     if (d->hotness[hi] != 0xFFu) d->hotness[hi]++;
-                    { PROF_T0(); m68k_step(cpu); PROF_ADD(prof_interp); }
+                    /* Batch large enough to amortize the per-batch dispatcher
+                     * overhead (find_block + gate + tick/poll/sony) so this
+                     * matches the pure interpreter's single m68k_run_until
+                     * speed; a 256-cycle batch left it ~30% slower. */
+                    u64 tgt = cpu->cycles + 4096u;
+                    if (tgt > until) tgt = until;
+                    { PROF_T0(); m68k_run_until(cpu, tgt); PROF_ADD(prof_interp); }
                     d->interp_fallbacks++;
                     prev = NULL;
                     continue;
@@ -1150,6 +1203,32 @@ void m68k_dispatcher_run_until(m68k_dispatcher *d, u64 until) {
                  * immediately because hotness was never reset. */
                 if (d->hotness[hi] >= 0xFFu) d->hot_bypass++;
                 else                         d->hot_gated++;
+                /* Budget throttle: this is an uncached pc (find_block was NULL
+                 * in the gate condition) that passed the hotness gate, so
+                 * get_block would compile or L2-rehydrate it. If the per-chunk
+                 * budget is spent, the chunk is a code burst (or eviction
+                 * thrash) where JIT overhead exceeds interpretation — finish it
+                 * in BATCHED pure interpretation (m68k_run_until services its
+                 * own tick/poll/sony in a tight loop, so it runs at full interp
+                 * speed, unlike the per-instruction gate fallback). This bounds
+                 * the worst case at interpreter speed and is actually faster
+                 * than rehydrating low-reuse blocks during thrash. Budget
+                 * refills next chunk, so the JIT resumes once the burst passes. */
+                if (d->token_div && d->compile_tokens <= 0) {
+                    /* Out of compile tokens: interpret a bounded batch (fast —
+                     * m68k_run_until services its own tick/poll/sony tightly),
+                     * then loop back to re-check. The batch advances guest
+                     * cycles, which refills the bucket; if the burst is over
+                     * the JIT resumes, if not we batch again. Bounded (not to
+                     * `until`) so a brief steady-state exhaustion doesn't
+                     * interpret a whole 2M-cycle chunk. */
+                    u64 tgt = cpu->cycles + 16384u;
+                    if (tgt > until) tgt = until;
+                    { PROF_T0(); m68k_run_until(cpu, tgt); PROF_ADD(prof_interp); }
+                    d->interp_fallbacks++;
+                    prev = NULL;
+                    continue;
+                }
             }
             { PROF_T0(); b = get_block(d, pc); PROF_ADD(prof_compile); }
             d->chain_misses++;

@@ -120,6 +120,20 @@ typedef struct m68k_dispatcher {
     u8  *hotness;
     u32  hotness_mask;
 
+    /* Compile/rehydrate throttle — a GUEST-CYCLE token bucket. Each compile or
+     * rehydrate spends one token; tokens refill at 1 per `token_div` guest
+     * cycles (capped at `token_max`). It self-regulates: in steady state guest
+     * cycles advance fast (~13 MHz) so tokens replenish and compiles flow
+     * freely; during a code burst or eviction thrash guest progress stalls, so
+     * tokens drain and the dispatcher falls back to BATCHED interpretation —
+     * which is faster than rehydrating low-reuse blocks and keeps the
+     * worst-case effective clock at/above interpreter speed. token_div 0 = off. */
+    i32  compile_tokens;       /* available now (can go to 0) */
+    u32  token_acc;            /* guest cycles accumulated toward next token */
+    u32  token_div;            /* guest cycles per token (0 = throttle off) */
+    i32  token_max;            /* token cap (burst allowance) */
+    u64  token_last_cyc;       /* cpu->cycles at last refill */
+
     /* L2 code-byte cache (see dispatcher.c). A block is compiled ONCE; its
      * relocatable machine-code bytes live in PSRAM (l2_entry). On eviction the
      * IRAM copy is dropped but the bytes survive, so a re-dispatch RE-COPIES
@@ -157,6 +171,10 @@ enum {
  * Cheap to flip at runtime — only affects what get_block does
  * post-compile. Passing `depth = 0` is treated as the default (2). */
 void m68k_dispatcher_set_prefetch(m68k_dispatcher *d, u8 mode, u8 depth);
+
+/* Cap compiles+rehydrates per run_until chunk (0 = unlimited). Bounds JIT
+ * overhead during code bursts so the worst-case throughput stays >= interp. */
+void m68k_dispatcher_set_compile_budget(m68k_dispatcher *d, u32 per_chunk);
 void m68k_dispatcher_shutdown(m68k_dispatcher *d);
 
 /* Run compiled blocks until cpu->cycles >= until or the CPU halts. */

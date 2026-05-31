@@ -14,4 +14,13 @@ typedef int16_t  i16;
 typedef int32_t  i32;
 typedef int64_t  i64;
 
+/* Place the interpreter's hottest functions in IRAM on the ESP32-S3 so they
+ * never pay a flash I-cache miss. No-op on the host build. */
+#if defined(ESP_PLATFORM)
+#include "esp_attr.h"
+#define M68K_HOT IRAM_ATTR
+#else
+#define M68K_HOT
+#endif
+
 #endif
