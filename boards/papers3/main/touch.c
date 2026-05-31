@@ -177,8 +177,10 @@ static void touch_task(void *arg) {
 }
 
 void touch_start(void) {
-    /* Higher priority than the e-ink task (4) so touch polls promptly even
-     * while a panel refresh is busy-spinning on DMA. */
+    /* Below the e-ink task (EINK_TASK_PRIO), which is the highest application
+     * priority so it can hold a steady 30 fps. The panel task yields its
+     * inter-frame slack (~9 ms of every 33 ms) via vTaskDelayUntil, so this
+     * 66 Hz poll still runs promptly between fields. */
     xTaskCreatePinnedToCore(touch_task, "touch", 4096, NULL, 6, NULL, 1);
 }
 
