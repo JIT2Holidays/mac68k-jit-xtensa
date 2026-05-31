@@ -177,11 +177,12 @@ static void touch_task(void *arg) {
 }
 
 void touch_start(void) {
-    /* Below the e-ink task (EINK_TASK_PRIO), which is the highest application
-     * priority so it can hold a steady 30 fps. The panel task yields its
-     * inter-frame slack (~9 ms of every 33 ms) via vTaskDelayUntil, so this
-     * 66 Hz poll still runs promptly between fields. */
-    xTaskCreatePinnedToCore(touch_task, "touch", 4096, NULL, 6, NULL, 1);
+    /* One step ABOVE the e-ink task (EINK_TASK_PRIO == 10) so the cursor stays
+     * crisp: this is a sub-2 ms I2C poll at 66 Hz, so preempting an 18-28 ms
+     * panel field briefly does NOT break e-ink's 30 fps (it still gets ~29 of
+     * every 33 ms), but it stops the field from delaying touch by a whole frame.
+     * Both sit well below the esp_timer task (prio 22). Core 1, same as e-ink. */
+    xTaskCreatePinnedToCore(touch_task, "touch", 4096, NULL, 11, NULL, 1);
 }
 
 void touch_apply_mouse(mac_mem *m) {

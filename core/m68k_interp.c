@@ -569,13 +569,15 @@ static void do_bitop(m68k_cpu *cpu, int which, int bit, ea_t *e, int mode) {
 /* ---- MOVEM ------------------------------------------------------------ */
 
 /* MOVEM is the bulk of the boot RAM test (the movem.l sweep at 0x400E82, which
- * was the lowest compute-bound window). Inline it into the one call site and use
- * the _fast RAM accessors so each longword skips the out-of-line call + region
- * decode. (.l accesses also take the aligned native-word + bswap path in the
- * accessors.) The residual cost is the PSRAM bandwidth of the sweep itself. A
- * resolve-host-base-pointer-once variant was tried and did not beat this within
- * the run-to-run noise of the one-time boot window — not worth the complexity. */
-__attribute__((always_inline)) static inline void do_movem(m68k_cpu *cpu, u16 op) {
+ * was the lowest compute-bound window). Use the _fast RAM accessors so each
+ * longword skips the out-of-line call + region decode (.l accesses also take the
+ * aligned native-word + bswap path); that per-longword win is what moved the
+ * window 1.56 -> ~3.1 MHz. This is deliberately NOT force-inlined: inlining it
+ * into the M68K_HOT (IRAM) m68k_step bloated the interp hot path enough to
+ * starve the JIT build's 60 KB executable arena (they share the unified SRAM),
+ * and the once-per-MOVEM call it saves is negligible next to the per-longword
+ * accessor cost. The residual is the PSRAM bandwidth of the sweep itself. */
+static void do_movem(m68k_cpu *cpu, u16 op) {
     int dir = (op >> 10) & 1;          /* 0: reg->mem, 1: mem->reg */
     int sz  = (op & 0x40) ? 4 : 2;
     int mode = (op >> 3) & 7;

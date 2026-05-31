@@ -518,10 +518,30 @@ void app_main(void) {
              s_cpu.pc, s_cpu.a[7], BOARD_USE_JIT ? "JIT" : "interp");
 
 #if BOARD_USE_JIT
+    /* TODO(JIT-arena): the JIT build currently HALTS here — the 60 KB executable
+     * (MALLOC_CAP_EXEC) arena no longer fits. The ~129 KB all-internal e-ink
+     * state (.bss) + the IRAM-resident interp hot path (M68K_HOT) leave < 60 KB
+     * of contiguous EXEC-capable SRAM. The diagnostic below prints the exact
+     * largest/total EXEC free so the gap is measurable. Options, roughly in order
+     * of preference (none done yet — interp build is the working target for now):
+     *   1. De-IRAM the interp fallback in JIT builds: m68k_step is only a rare
+     *      fallback when the JIT is active, so it need not be M68K_HOT here — but
+     *      KEEP mac_read/write* in IRAM (the JIT helpers call them). Needs a
+     *      separate attr (e.g. M68K_HOT_INTERP) gated on BOARD_USE_JIT reaching
+     *      core/. Frees the most IRAM and keeps the 60 KB arena + its thin
+     *      JIT-worst > interp-worst margin (1.43 vs 1.27).
+     *   2. Shrink the e-ink internal .bss (guest-res buffers) to free DIRAM.
+     *   3. Shrink the arena (risks pushing JIT worst-case below interp — last
+     *      resort; re-verify the margin if taken).
+     *   4. On failure, fall back to the interp engine instead of halting. */
+    ESP_LOGI(TAG, "EXEC heap before JIT init: largest=%u total=%u (need %u)",
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_EXEC | MALLOC_CAP_32BIT | MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_EXEC | MALLOC_CAP_32BIT | MALLOC_CAP_INTERNAL),
+             (unsigned)(BOARD_JIT_ARENA_KB * 1024u));
     if (!m68k_dispatcher_init_ex(&s_disp, &s_cpu,
                                  BOARD_JIT_ARENA_KB, BOARD_JIT_EVICT)) {
-        ESP_LOGE(TAG, "JIT init failed (arena=%u KB) — is IRAM exhausted?",
-                 BOARD_JIT_ARENA_KB);
+        ESP_LOGE(TAG, "JIT init failed (arena=%u KB) — is IRAM exhausted? "
+                 "see TODO(JIT-arena) above", BOARD_JIT_ARENA_KB);
         goto park;
     }
     m68k_dispatcher_set_compile_threshold(&s_disp, BOARD_JIT_HOT_THRESHOLD);
@@ -584,9 +604,15 @@ void app_main(void) {
 #endif
 
     while (!s_cpu.halted) {
-        /* Small chunks while a timed click/key sequence is in flight so the
-         * press/release land spaced in guest time; large chunks otherwise. */
-        u64 chunk = uart_ctl_busy() ? 100000ull : 2000000ull;
+        /* Cursor/input latency is one chunk: the touch position and due input
+         * events are only pushed to the guest at each chunk boundary. At ~10 MHz
+         * a 2,000,000-cycle chunk is ~190 ms of staleness — sluggish. Cap it at
+         * ~150k (~14 ms @10 MHz, ~10 ms @JIT 14 MHz) so the mouse tracks at ~60-
+         * 100 Hz wall-time. Per-chunk host work (touch_apply + uart_ctl_poll) is
+         * cheap, so the throughput cost of returning more often is negligible.
+         * Timed click/key sequences use an even finer chunk so press/release land
+         * spaced in guest time. */
+        u64 chunk = uart_ctl_busy() ? 100000ull : 150000ull;
         u64 next = s_cpu.cycles + chunk;
 #if BOARD_USE_JIT
         m68k_dispatcher_run_until(&s_disp, next);
