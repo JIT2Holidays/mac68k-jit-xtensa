@@ -28,6 +28,9 @@ idf_component_register(
         esp_lcd
         # JPEG splash decoder (managed component, see idf_component.yml).
         esp_jpeg
+        # FastEPD e-paper driver (third_party/FastEPD submodule) — replaces the
+        # custom epd_panel.c. C++ component; used via a C++ glue TU.
+        FastEPD
     # Bake the 128 KB Mac Plus ROM into the firmware image so it loads from
     # internal flash (no SD read, always present). Exposed as the symbols
     # _binary_MacPlus_ROM_start / _binary_MacPlus_ROM_end.
