@@ -3,4 +3,5 @@
 	url = git@github.com:minivmac/minivmac.git
 [submodule "third_party/FastEPD"]
 	path = third_party/FastEPD
-	url = https://github.com/bitbank2/FastEPD.git
+	url = git@github.com:JIT2Holidays/FastEPD.git
+	branch = papers3

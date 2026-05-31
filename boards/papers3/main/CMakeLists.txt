@@ -8,6 +8,7 @@ idf_component_register(
         "uart_ctl.c"
         "eink.c"
         "epd_panel.c"
+        "eink_fastepd.cpp"
         "battery.c"
         "touch.c"
     INCLUDE_DIRS "."
@@ -47,6 +48,7 @@ foreach(opt
         BOARD_JIT_PREFETCH BOARD_JIT_PREFETCH_DEPTH BOARD_JIT_COMPILE_BUDGET BOARD_NO_EINK BOARD_NO_TOUCH
         BOARD_HD_INSERT_CYCLE BOARD_EINK_ROT_CW BOARD_EINK_DRIVE_FIELDS BOARD_EINK_MAX_FPS
         BOARD_EINK_HOLD_DRIVE BOARD_EINK_HOLD_STATIC_STOP
+        BOARD_FASTEPD_SPIKE
         BOARD_TOUCH_FLIP_X BOARD_TOUCH_FLIP_Y BOARD_TOUCH_SENS_X10
         BOARD_SD_CLK BOARD_SD_MOSI BOARD_SD_MISO BOARD_SD_CS)
     if(DEFINED ${opt})

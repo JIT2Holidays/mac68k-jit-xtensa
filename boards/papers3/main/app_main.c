@@ -26,6 +26,7 @@
 #include "sd_disk.h"
 #include "uart_ctl.h"
 #include "eink.h"
+#include "eink_fastepd.h"
 #include "touch.h"
 
 #include "esp_log.h"
@@ -581,7 +582,12 @@ void app_main(void) {
      * (reading the SD card before the guest does), then scans out the guest
      * framebuffer with fast local refreshes. Blocks only until the splash is
      * drawn; the framebuffer loop keeps running on the second core. */
-#if !defined(BOARD_NO_EINK) || !BOARD_NO_EINK
+#if defined(BOARD_FASTEPD_SPIKE) && BOARD_FASTEPD_SPIKE
+    /* Step-2 spike: bring up the FastEPD path instead of the legacy eink driver,
+     * so FastEPD (not epd_panel.c) owns the i80 bus. The old eink_task is not
+     * started, so there is no double bus claim. */
+    eink_fastepd_bringup();
+#elif !defined(BOARD_NO_EINK) || !BOARD_NO_EINK
     eink_start(&s_mem, &s_cpu, BOARD_USE_JIT ? "JIT" : "INT");
 #endif
 
