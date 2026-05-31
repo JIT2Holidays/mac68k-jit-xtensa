@@ -5,9 +5,9 @@
 /dependencies.lock
 /managed_components/
 
-# Closed e-ink display sources — obtained separately, never committed.
+# Closed e-paper (msg) display sources — obtained separately, never committed.
 # See GET_EPD.md.
-/main/epd_panel.c
-/main/epd_panel.h
-/main/eink.c
-/main/eink.h
+/main/msg_panel.c
+/main/msg_panel.h
+/main/msg.c
+/main/msg.h

@@ -1,8 +1,8 @@
 # Repo root = this file's dir up three levels (main -> papers3 -> boards -> repo).
 get_filename_component(MAC68K_ROOT "${CMAKE_CURRENT_LIST_DIR}/../../.." ABSOLUTE)
 
-# E-paper driver. Default = the custom internal-SRAM 1bpp driver (epd_panel.c +
-# eink.c), purpose-built for this emulator (21 KB internal-SRAM fb, fast localized
+# E-paper driver. Default = the custom internal-SRAM 1bpp driver (msg_panel.c +
+# msg.c), purpose-built for this emulator (21 KB internal-SRAM fb, fast localized
 # refresh, ~10 MHz emu during motion). The FastEPD glue (eink_fastepd.cpp) is
 # always compiled and FastEPD is always a requirement, so toggling the
 # -DBOARD_USE_FASTEPD compile option never changes the component graph; when the
@@ -10,7 +10,7 @@ get_filename_component(MAC68K_ROOT "${CMAKE_CURRENT_LIST_DIR}/../../.." ABSOLUTE
 idf_component_register(
     SRCS
         "app_main.c" "sd_disk.c" "uart_ctl.c"
-        "eink.c" "epd_panel.c" "eink_fastepd.cpp"
+        "msg.c" "msg_panel.c" "eink_fastepd.cpp"
         "battery.c" "touch.c"
     INCLUDE_DIRS "."
     PRIV_REQUIRES
@@ -18,7 +18,7 @@ idf_component_register(
         esp_driver_sdspi esp_driver_spi esp_driver_usb_serial_jtag esp_driver_gpio
         esp_adc            # battery (battery.c)
         esp_driver_i2c     # GT911 touch (touch.c)
-        esp_lcd            # e-ink i80 bus (epd_panel.c / FastEPD)
+        esp_lcd            # e-ink i80 bus (msg_panel.c / FastEPD)
         esp_jpeg           # JPEG splash (managed component)
         FastEPD            # optional driver, -DBOARD_USE_FASTEPD=1 (eink_fastepd.cpp)
     # Bake the 128 KB Mac Plus ROM into the firmware image so it loads from

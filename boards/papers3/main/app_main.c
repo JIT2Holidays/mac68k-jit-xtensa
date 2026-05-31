@@ -25,7 +25,7 @@
 #include "board_papers3.h"
 #include "sd_disk.h"
 #include "uart_ctl.h"
-#include "eink.h"
+#include "msg.h"
 #include "eink_fastepd.h"
 #include "touch.h"
 
@@ -590,7 +590,7 @@ void app_main(void) {
      * eink_fastepd.cpp / the migration notes. */
     eink_fastepd_start(&s_mem, &s_cpu, BOARD_USE_JIT ? "JIT" : "INT");
 #elif !defined(BOARD_NO_EINK) || !BOARD_NO_EINK
-    eink_start(&s_mem, &s_cpu, BOARD_USE_JIT ? "JIT" : "INT");
+    msg_start(&s_mem, &s_cpu, BOARD_USE_JIT ? "JIT" : "INT");
 #endif
 
     /* Touch -> Mac mouse: a GT911 polling task on core 1 maintains the cursor;

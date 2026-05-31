@@ -8,7 +8,7 @@
 #include "board_papers3.h"
 #include "mac_mem.h"
 #include "mac_input.h"
-#include "eink.h"        /* eink_request_global_refresh() — status-bar tap */
+#include "msg.h"        /* msg_request_refresh() — status-bar tap */
 
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
@@ -161,7 +161,7 @@ static void touch_task(void *arg) {
                 else if (pad < 0) pad = i;   /* first pad finger drives motion */
             }
             /* Edge-trigger one global refresh per status-bar tap. */
-            if (sb && !sb_prev) eink_request_global_refresh();
+            if (sb && !sb_prev) msg_request_refresh();
             sb_prev = sb;
             if (pad >= 0) {
                 if (have_pad) {
