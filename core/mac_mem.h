@@ -267,7 +267,14 @@ static inline u16 mac_read16_fast(mac_mem *m, u32 addr) {
 static inline u32 mac_read32_fast(mac_mem *m, u32 addr) {
     addr &= 0xFFFFFFu;
     const u8 *p = mac_ptr_fast(m, addr);
-    if (p) return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3];
+    if (p) {
+        /* Aligned (the common case — e.g. the movem.l RAM-test sweep): one
+         * native word load + bswap instead of 4 byte loads + shifts. Xtensa
+         * traps on unaligned l32i, so guard. */
+        if (((uintptr_t)p & 3u) == 0)
+            return __builtin_bswap32(*(const u32 *)p);
+        return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3];
+    }
     return mac_read32(m, addr);
 }
 static inline u8 mac_read8_fast(mac_mem *m, u32 addr) {
@@ -300,7 +307,10 @@ static inline void mac_write16_fast(mac_mem *m, u32 addr, u16 v) {
 static inline void mac_write32_fast(mac_mem *m, u32 addr, u32 v) {
     addr &= 0xFFFFFFu;
     u8 *p = mac_ram_wptr(m, addr);
-    if (p) { p[0]=(u8)(v>>24); p[1]=(u8)(v>>16); p[2]=(u8)(v>>8); p[3]=(u8)v; return; }
+    if (p) {
+        if (((uintptr_t)p & 3u) == 0) { *(u32 *)p = __builtin_bswap32(v); return; }
+        p[0]=(u8)(v>>24); p[1]=(u8)(v>>16); p[2]=(u8)(v>>8); p[3]=(u8)v; return;
+    }
     mac_write32(m, addr, v);
 }
 static inline void mac_write8_fast(mac_mem *m, u32 addr, u8 v) {

@@ -571,7 +571,10 @@ static void do_bitop(m68k_cpu *cpu, int which, int bit, ea_t *e, int mode) {
 /* MOVEM is the bulk of the boot RAM test (the movem.l sweep at 0x400E82, which
  * was the lowest compute-bound window). Inline it into the one call site and use
  * the _fast RAM accessors so each longword skips the out-of-line call + region
- * decode; the residual cost is the PSRAM bandwidth of the sweep itself. */
+ * decode. (.l accesses also take the aligned native-word + bswap path in the
+ * accessors.) The residual cost is the PSRAM bandwidth of the sweep itself. A
+ * resolve-host-base-pointer-once variant was tried and did not beat this within
+ * the run-to-run noise of the one-time boot window — not worth the complexity. */
 __attribute__((always_inline)) static inline void do_movem(m68k_cpu *cpu, u16 op) {
     int dir = (op >> 10) & 1;          /* 0: reg->mem, 1: mem->reg */
     int sz  = (op & 0x40) ? 4 : 2;
