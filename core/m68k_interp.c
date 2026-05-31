@@ -568,7 +568,11 @@ static void do_bitop(m68k_cpu *cpu, int which, int bit, ea_t *e, int mode) {
 
 /* ---- MOVEM ------------------------------------------------------------ */
 
-static void do_movem(m68k_cpu *cpu, u16 op) {
+/* MOVEM is the bulk of the boot RAM test (the movem.l sweep at 0x400E82, which
+ * was the lowest compute-bound window). Inline it into the one call site and use
+ * the _fast RAM accessors so each longword skips the out-of-line call + region
+ * decode; the residual cost is the PSRAM bandwidth of the sweep itself. */
+__attribute__((always_inline)) static inline void do_movem(m68k_cpu *cpu, u16 op) {
     int dir = (op >> 10) & 1;          /* 0: reg->mem, 1: mem->reg */
     int sz  = (op & 0x40) ? 4 : 2;
     int mode = (op >> 3) & 7;
@@ -583,8 +587,8 @@ static void do_movem(m68k_cpu *cpu, u16 op) {
                 int idx = 15 - i;
                 u32 val = (idx < 8) ? cpu->d[idx] : cpu->a[idx - 8];
                 addr -= (u32)sz;
-                if (sz == 2) mac_write16(cpu->mem, addr, (u16)val);
-                else         mac_write32(cpu->mem, addr, val);
+                if (sz == 2) mac_write16_fast(cpu->mem, addr, (u16)val);
+                else         mac_write32_fast(cpu->mem, addr, val);
             }
         }
         cpu->a[reg] = addr;
@@ -597,8 +601,8 @@ static void do_movem(m68k_cpu *cpu, u16 op) {
         for (int i = 0; i < 16; i++) {
             if (list & (1 << i)) {
                 u32 val = (i < 8) ? cpu->d[i] : cpu->a[i - 8];
-                if (sz == 2) mac_write16(cpu->mem, addr, (u16)val);
-                else         mac_write32(cpu->mem, addr, val);
+                if (sz == 2) mac_write16_fast(cpu->mem, addr, (u16)val);
+                else         mac_write32_fast(cpu->mem, addr, val);
                 addr += (u32)sz;
             }
         }
@@ -606,8 +610,8 @@ static void do_movem(m68k_cpu *cpu, u16 op) {
         for (int i = 0; i < 16; i++) {
             if (list & (1 << i)) {
                 u32 val = (sz == 2)
-                    ? (u32)(i32)(i16)mac_read16(cpu->mem, addr)
-                    : mac_read32(cpu->mem, addr);
+                    ? (u32)(i32)(i16)mac_read16_fast(cpu->mem, addr)
+                    : mac_read32_fast(cpu->mem, addr);
                 if (i < 8) cpu->d[i] = val;
                 else       cpu->a[i - 8] = val;
                 addr += (u32)sz;
